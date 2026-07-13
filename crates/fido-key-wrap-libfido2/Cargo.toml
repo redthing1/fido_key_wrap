@@ -1,0 +1,22 @@
+[package]
+name = "fido-key-wrap-libfido2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+links = "fido2"
+
+[dependencies]
+getrandom.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[build-dependencies]
+pkg-config = "0.3.33"
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

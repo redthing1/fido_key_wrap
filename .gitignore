@@ -1,0 +1,10 @@
+/target/
+/temp/
+.DS_Store
+/AGENTS.md
+/.idea/
+/.vscode/
+*.fkw
+*.fkd
+*.fkw-lock
+.fkw-*.tmp
