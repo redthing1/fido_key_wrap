@@ -5,9 +5,6 @@ use zeroize::Zeroizing;
 
 use crate::{Error, FidoPolicy, Result};
 
-const MAX_PIN_BYTES: usize = 63;
-const MAX_PASSPHRASE_BYTES: usize = 1024;
-
 /// application interaction failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum InteractionError {
@@ -27,6 +24,9 @@ pub enum InteractionError {
 pub struct Pin(Zeroizing<String>);
 
 impl Pin {
+    /// maximum encoded pin length accepted by the interaction boundary.
+    pub const MAX_BYTES: usize = 63;
+
     /// stores a bounded nonempty pin in zeroizing storage.
     ///
     /// # errors
@@ -35,7 +35,7 @@ impl Pin {
     /// value.
     pub fn new(value: String) -> Result<Self> {
         let value = Zeroizing::new(value);
-        if value.is_empty() || value.len() > MAX_PIN_BYTES || value.as_bytes().contains(&0) {
+        if value.is_empty() || value.len() > Self::MAX_BYTES || value.as_bytes().contains(&0) {
             return Err(Error::InvalidPin);
         }
         Ok(Self(value))
@@ -57,6 +57,9 @@ impl fmt::Debug for Pin {
 pub struct Passphrase(Zeroizing<Vec<u8>>);
 
 impl Passphrase {
+    /// maximum passphrase length accepted by the interaction boundary.
+    pub const MAX_BYTES: usize = 1_024;
+
     /// stores bounded nonempty passphrase bytes in zeroizing storage.
     ///
     /// # errors
@@ -65,7 +68,7 @@ impl Passphrase {
     /// than 1,024 bytes.
     pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self> {
         let bytes = Zeroizing::new(bytes.into());
-        if bytes.is_empty() || bytes.len() > MAX_PASSPHRASE_BYTES {
+        if bytes.is_empty() || bytes.len() > Self::MAX_BYTES {
             return Err(Error::InvalidPassphrase);
         }
         Ok(Self(bytes))
@@ -76,8 +79,8 @@ impl Passphrase {
     }
 
     pub(crate) fn confirmation_matches(&self, other: &Self) -> bool {
-        let mut left = Zeroizing::new([0u8; MAX_PASSPHRASE_BYTES]);
-        let mut right = Zeroizing::new([0u8; MAX_PASSPHRASE_BYTES]);
+        let mut left = Zeroizing::new([0u8; Self::MAX_BYTES]);
+        let mut right = Zeroizing::new([0u8; Self::MAX_BYTES]);
         left[..self.0.len()].copy_from_slice(&self.0);
         right[..other.0.len()].copy_from_slice(&other.0);
         let bytes_equal = left.as_slice().ct_eq(right.as_slice());
@@ -336,6 +339,14 @@ mod tests {
         assert_eq!(format!("{first:?}"), "Passphrase([REDACTED])");
         assert!(first.confirmation_matches(&same));
         assert!(!first.confirmation_matches(&different));
+    }
+
+    #[test]
+    fn secret_bounds_are_exact() {
+        assert!(Pin::new("x".repeat(Pin::MAX_BYTES)).is_ok());
+        assert!(Pin::new("x".repeat(Pin::MAX_BYTES + 1)).is_err());
+        assert!(Passphrase::new(vec![b'x'; Passphrase::MAX_BYTES]).is_ok());
+        assert!(Passphrase::new(vec![b'x'; Passphrase::MAX_BYTES + 1]).is_err());
     }
 
     #[test]

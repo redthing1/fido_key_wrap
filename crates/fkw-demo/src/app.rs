@@ -1130,9 +1130,10 @@ mod tests {
     }
 
     fn vector_root() -> RootKey {
-        RootKey::import(std::array::from_fn(|index| {
+        let mut bytes = std::array::from_fn(|index| {
             0x60 + u8::try_from(index).expect("root vector index fits in u8")
-        }))
+        });
+        RootKey::import(&mut bytes)
     }
 
     fn mixed_envelope() -> KeyEnvelope {

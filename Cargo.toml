@@ -2,6 +2,12 @@
 members = [
     "crates/fido-key-wrap",
     "crates/fido-key-wrap-libfido2",
+    "crates/fido-key-wrap-python",
+    "crates/fkw-demo",
+]
+default-members = [
+    "crates/fido-key-wrap",
+    "crates/fido-key-wrap-libfido2",
     "crates/fkw-demo",
 ]
 resolver = "3"
@@ -25,6 +31,7 @@ hmac = { version = "0.13.0", features = ["zeroize"] }
 libc = "0.2.183"
 minicbor = { version = "2.2.2", features = ["std"] }
 p256 = { version = "0.14.0", default-features = false, features = ["arithmetic", "std"] }
+pyo3 = "=0.29.0"
 rpassword = "7.5.4"
 sha2 = { version = "0.11.0", features = ["zeroize"] }
 subtle = "2.6.1"

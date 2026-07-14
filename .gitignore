@@ -1,5 +1,11 @@
 /target/
 /temp/
+/.venv/
+__pycache__/
+*.pyc
+/python/fido_key_wrap/_native*.so
+/python/fido_key_wrap/_native*.pyd
+/dist/
 .DS_Store
 /AGENTS.md
 /.idea/

@@ -571,7 +571,8 @@ mod tests {
     }
 
     fn root(vector: &str) -> RootKey {
-        RootKey::import(array(vector, "root_key"))
+        let mut bytes = array(vector, "root_key");
+        RootKey::import(&mut bytes)
     }
 
     fn same_root(left: &RootKey, right: &RootKey) -> bool {
@@ -1108,7 +1109,7 @@ mod tests {
     #[test]
     fn envelope_mac_mismatch_maps_to_authentication_failure() {
         let envelope = envelope(FIDO_PRESENCE_VECTOR);
-        let wrong = RootKey::import([0xA5; 32]);
+        let wrong = RootKey::import(&mut [0xA5; 32]);
         assert!(!envelope_mac_matches(&envelope, &wrong).unwrap());
         assert!(matches!(
             verify_envelope_mac(&envelope, &wrong),

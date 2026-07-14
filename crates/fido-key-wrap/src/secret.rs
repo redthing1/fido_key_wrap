@@ -1,6 +1,6 @@
 use std::fmt;
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{Error, Result};
 
@@ -10,15 +10,16 @@ pub struct RootKey {
 }
 
 impl RootKey {
-    /// imports an already uniformly random 256-bit root key.
+    /// imports an already uniformly random 256-bit root key and clears the source.
     ///
     /// passwords, passphrases, api tokens, hashes of low-entropy input, and
     /// other guessable values are not valid root keys.
     #[must_use]
-    pub fn import(random_bytes: [u8; 32]) -> Self {
-        Self {
-            bytes: Zeroizing::new(random_bytes),
-        }
+    pub fn import(random_bytes: &mut [u8; 32]) -> Self {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        bytes.copy_from_slice(random_bytes);
+        random_bytes.zeroize();
+        Self { bytes }
     }
 
     /// borrows the root for one application-defined operation.
@@ -55,8 +56,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn debug_is_redacted() {
-        let key = RootKey::import([0x42; 32]);
+    fn import_clears_the_source_and_debug_is_redacted() {
+        let mut source = [0x42; 32];
+        let key = RootKey::import(&mut source);
+        assert_eq!(source, [0; 32]);
         assert_eq!(format!("{key:?}"), "RootKey([REDACTED])");
     }
 }

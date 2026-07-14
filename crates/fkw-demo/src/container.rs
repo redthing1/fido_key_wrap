@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn note_crypto_authenticates_exact_envelope_and_uses_fresh_nonces() {
-        let root = RootKey::import([0x42; 32]);
+        let root = RootKey::import(&mut [0x42; 32]);
         let first =
             EncryptedNote::encrypt(&root, &application(), b"envelope-a", b"secret note").unwrap();
         let second =
@@ -299,16 +299,17 @@ mod tests {
             b"secret note"
         );
         assert!(first.decrypt(&root, &application(), b"envelope-b").is_err());
+        let wrong = RootKey::import(&mut [0x24; 32]);
         assert!(
             first
-                .decrypt(&RootKey::import([0x24; 32]), &application(), b"envelope-a")
+                .decrypt(&wrong, &application(), b"envelope-a")
                 .is_err()
         );
     }
 
     #[test]
     fn container_is_strict_fkd_nul_format_one() {
-        let root = RootKey::import([0x42; 32]);
+        let root = RootKey::import(&mut [0x42; 32]);
         let encrypted =
             EncryptedNote::encrypt(&root, &application(), b"opaque envelope", b"note").unwrap();
         let encoded = NoteFile::new(b"opaque envelope".to_vec(), encrypted)
@@ -334,8 +335,8 @@ mod tests {
                 .find_map(|line| line.strip_prefix(&prefix))
                 .unwrap_or_else(|| panic!("missing vector field {name}"))
         };
-        let root_bytes: [u8; 32] = decode_hex(get("root_key")).try_into().unwrap();
-        let root = RootKey::import(root_bytes);
+        let mut root_bytes: [u8; 32] = decode_hex(get("root_key")).try_into().unwrap();
+        let root = RootKey::import(&mut root_bytes);
         let application = ApplicationId::new(get("application_id").to_owned()).unwrap();
         let envelope = decode_hex(get("envelope"));
         let plaintext = decode_hex(get("note_plaintext"));

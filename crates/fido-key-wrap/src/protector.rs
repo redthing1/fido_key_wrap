@@ -1154,7 +1154,7 @@ mod tests {
             .unwrap();
         let original = envelope.encode();
 
-        let wrong_root = RootKey::import([0x77; 32]);
+        let wrong_root = RootKey::import(&mut [0x77; 32]);
         let mut no_prompt = ScriptedInteraction::new(&[]);
         assert!(matches!(
             protector.add_recipient(
@@ -1339,7 +1339,7 @@ mod tests {
             .add_recipient(&mut envelope, &root, enrollment("second"), &mut add)
             .unwrap();
         let original = envelope.encode();
-        let wrong_root = RootKey::import([0x99; 32]);
+        let wrong_root = RootKey::import(&mut [0x99; 32]);
 
         assert!(matches!(
             protector.remove_recipient(&mut envelope, &wrong_root, second),

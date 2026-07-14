@@ -46,9 +46,14 @@ with the `fido` feature, `KeyProtector::system` uses the same surface for
 security-key routes. applications encrypt their own data and authenticate the
 exact encoded envelope with it.
 
+python applications can install a thin native binding from the repository.
+the binding follows the same root, envelope, recipient, and interaction model;
+see the python guide for installation and use.
+
 ## documentation
 
 - [integration guide](doc/integration.md)
+- [python integration](doc/python.md)
 - [security model](doc/security.md)
 - [protocol](doc/protocol.md)
 - [demo application](doc/demo.md)
