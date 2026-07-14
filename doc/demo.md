@@ -45,11 +45,11 @@ note
 
 ## access policies
 
-security-key routes require exactly libfido2 1.17.0 through `pkg-config` on
-macos or linux:
+security-key routes require libfido2 1.14 or later in the 1.x series through
+`pkg-config` on macos or linux:
 
 ```text
-pkg-config --exact-version=1.17.0 libfido2
+pkg-config --atleast-version=1.14.0 libfido2
 cargo build -p fkw-demo --release --locked
 fkw check
 ```

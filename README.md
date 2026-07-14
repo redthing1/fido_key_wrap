@@ -22,7 +22,8 @@ a combined recipient requires both factors in order: the security-key layer is
 authenticated before the passphrase is requested.
 
 passphrase support requires no security key or native fido library. the `fido`
-crate feature adds security-key support on macos and linux.
+crate feature supports macos and linux with libfido2 1.14 or later in the 1.x
+series.
 
 ## library surface
 

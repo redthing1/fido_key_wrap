@@ -515,10 +515,6 @@ impl Authenticator {
         credential.call("require user verification", |raw| unsafe {
             ffi::fido_cred_set_uv(raw, ffi::FIDO_OPT_TRUE)
         })?;
-        credential.call("set empty exclusion list", |raw| unsafe {
-            ffi::fido_cred_empty_exclude_list(raw)
-        })?;
-
         let result = unsafe {
             ffi::fido_dev_make_cred(self.device.as_ptr(), credential.as_ptr(), pin.as_ptr())
         };
@@ -1088,10 +1084,14 @@ impl Credential {
             return Err(Error::VerificationFailed);
         }
 
-        let status = if unsafe { ffi::fido_cred_x5c_list_count(raw) } == 0 {
-            unsafe { ffi::fido_cred_verify_self(raw) }
-        } else {
+        let has_attestation_certificate =
+            attestation_certificate_present(unsafe { ffi::fido_cred_x5c_ptr(raw) }, unsafe {
+                ffi::fido_cred_x5c_len(raw)
+            })?;
+        let status = if has_attestation_certificate {
             unsafe { ffi::fido_cred_verify(raw) }
+        } else {
+            unsafe { ffi::fido_cred_verify_self(raw) }
         };
         if status != ffi::FIDO_OK {
             return Err(Error::VerificationFailed);
@@ -1232,11 +1232,11 @@ impl Assertion {
             return Err(Error::VerificationFailed);
         }
 
-        // libfido2 1.17 parses the encrypted hmac-secret result from this
-        // assertion's raw authenticator data and decrypts it into the same
-        // assertion statement. fido_assert_verify above authenticates that raw
-        // data. Do not fetch or copy the decrypted result before signature,
-        // exact flags, and credential identity have all been verified.
+        // libfido2 parses the encrypted hmac-secret result from this assertion's
+        // raw authenticator data and decrypts it into the same assertion
+        // statement. fido_assert_verify above authenticates that raw data. Do
+        // not fetch or copy the decrypted result before signature, exact flags,
+        // and credential identity have all been verified.
         let secret_len = unsafe { ffi::fido_assert_hmac_secret_len(raw, 0) };
         let secret_pointer = unsafe { ffi::fido_assert_hmac_secret_ptr(raw, 0) };
         let secret_pointer = exact_secret_pointer(secret_pointer, secret_len)?;
@@ -1253,6 +1253,14 @@ fn exact_secret_pointer(secret_pointer: *const u8, secret_len: usize) -> Result<
         return Err(Error::VerificationFailed);
     }
     NonNull::new(secret_pointer.cast_mut()).ok_or(Error::VerificationFailed)
+}
+
+fn attestation_certificate_present(pointer: *const u8, len: usize) -> Result<bool> {
+    match (pointer.is_null(), len) {
+        (true, 0) => Ok(false),
+        (false, 1..) => Ok(true),
+        _ => Err(Error::VerificationFailed),
+    }
 }
 
 impl Drop for Assertion {
@@ -1536,6 +1544,21 @@ mod tests {
             exact_secret_pointer(secret.as_ptr(), SECRET_BYTES).unwrap(),
             NonNull::from(&mut secret[0])
         );
+    }
+
+    #[test]
+    fn attestation_certificate_shape_is_consistent() {
+        let certificate = [0x30];
+        assert!(!attestation_certificate_present(ptr::null(), 0).unwrap());
+        assert!(attestation_certificate_present(certificate.as_ptr(), 1).unwrap());
+        assert!(matches!(
+            attestation_certificate_present(ptr::null(), 1),
+            Err(Error::VerificationFailed)
+        ));
+        assert!(matches!(
+            attestation_certificate_present(certificate.as_ptr(), 0),
+            Err(Error::VerificationFailed)
+        ));
     }
 
     #[test]

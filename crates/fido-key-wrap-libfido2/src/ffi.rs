@@ -1,6 +1,6 @@
 //! declarations for the libfido2 functions used by the backend.
 //!
-//! signatures follow the public libfido2 1.17 `fido.h` abi.
+//! signatures follow the public libfido2 1.x `fido.h` abi from version 1.14.
 
 #![allow(non_camel_case_types)]
 
@@ -73,8 +73,8 @@ pub const COSE_ES256: c_int = -7;
 
 pub const AUTHDATA_UP: u8 = 0x01;
 pub const AUTHDATA_UV: u8 = 0x04;
-// CTAP 2.2/WebAuthn backup flags. libfido2 1.17 exposes the complete signed
-// flags byte but does not provide public constants for these two bits.
+// CTAP 2.2/WebAuthn backup flags. libfido2 exposes the complete signed flags
+// byte but does not provide public constants for these two bits.
 pub const AUTHDATA_BE: u8 = 0x08;
 pub const AUTHDATA_BS: u8 = 0x10;
 
@@ -159,7 +159,6 @@ unsafe extern "C" {
     pub fn fido_cred_set_prot(credential: *mut fido_cred_t, protection: c_int) -> c_int;
     pub fn fido_cred_set_rk(credential: *mut fido_cred_t, option: c_int) -> c_int;
     pub fn fido_cred_set_uv(credential: *mut fido_cred_t, option: c_int) -> c_int;
-    pub fn fido_cred_empty_exclude_list(credential: *mut fido_cred_t) -> c_int;
     pub fn fido_dev_make_cred(
         dev: *mut fido_dev_t,
         credential: *mut fido_cred_t,
@@ -175,7 +174,8 @@ unsafe extern "C" {
     pub fn fido_cred_id_len(credential: *const fido_cred_t) -> usize;
     pub fn fido_cred_pubkey_ptr(credential: *const fido_cred_t) -> *const c_uchar;
     pub fn fido_cred_pubkey_len(credential: *const fido_cred_t) -> usize;
-    pub fn fido_cred_x5c_list_count(credential: *const fido_cred_t) -> usize;
+    pub fn fido_cred_x5c_ptr(credential: *const fido_cred_t) -> *const c_uchar;
+    pub fn fido_cred_x5c_len(credential: *const fido_cred_t) -> usize;
 
     pub fn fido_assert_new() -> *mut fido_assert_t;
     pub fn fido_assert_free(assertion: *mut *mut fido_assert_t);
