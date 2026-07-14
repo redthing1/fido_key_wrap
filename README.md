@@ -1,47 +1,54 @@
 # fido-key-wrap
 
-`fido-key-wrap` protects a 32-byte application root key with one or more fido2
-credentials.
+`fido-key-wrap` protects one random 32-byte application root with an application
+passphrase, a fido security key, or both.
 
-each credential recovers the same root key through one policy:
+the crate handles root wrapping, strict envelope parsing, fido ceremonies, and
+transactional recipient changes. the application keeps ownership of its data
+encryption, storage, policy choices, unlocked sessions, and root rotation.
 
-- `presence` requires the authenticator and a touch
-- `user-verified` requires the authenticator, its pin, and a touch
-- either policy can also require an application passphrase
+## recovery routes
 
-the root key must be uniformly random and is not stored on the authenticator.
-the key envelope stores the public credential data and encrypted root needed
-for recovery.
+one envelope may contain any combination of five routes:
+
+- application passphrase
+- security key with presence
+- security key with user verification
+- security key with presence and an application passphrase
+- security key with user verification and an application passphrase
+
+multiple routes are alternatives. any one recipient can recover the same root.
+a combined recipient requires both factors in order: the security-key layer is
+authenticated before the passphrase is requested.
+
+passphrase support requires no security key or native fido library. the `fido`
+crate feature adds security-key support on macos and linux.
+
+## library surface
 
 ```rust,ignore
-let application = ApplicationId::new("org.example.vault")?;
-let mut protector = KeyProtector::system(application);
+let application = ApplicationId::new("vault.example")?;
+let mut protector = KeyProtector::new(application);
+let (root, envelope, recipient) =
+    protector.create_root(Enrollment::passphrase("primary")?, &mut interaction)?;
 
-let enrollment = Enrollment::new("primary", policy::user_verified())?;
-let (root, envelope, _recipient) =
-    protector.provision(enrollment, &mut interaction)?;
-
-persist(envelope.encode())?;
-
-let envelope = KeyEnvelope::decode(&load()?)?;
-let recipient = envelope.recipients()[0].id();
-let root = protector.unlock(&envelope, recipient, &mut interaction)?;
+let encoded = envelope.encode();
+let decoded = KeyEnvelope::decode(&encoded)?;
+let recovered = protector.unlock(&decoded, recipient, &mut interaction)?;
 ```
 
-`interaction`, `persist`, and `load` belong to the application. the application
-also owns data encryption, backups, and unlocked-session lifetime.
+`Interaction` supplies passphrase, pin, touch, and authenticator-selection user
+interface. `RootKey`, `Passphrase`, and `Pin` are opaque, non-cloneable,
+zeroizing values with redacted debug output.
 
-## demo
+with the `fido` feature, `KeyProtector::system` uses the same surface for
+security-key routes. applications encrypt their own data and authenticate the
+exact encoded envelope with it.
 
-the included note application has a short command flow:
+## documentation
 
-```text
-fkw new note.fkw
-fkw open note.fkw
-fkw add-key note.fkw backup
-```
-
-see the [demo application](doc/demo.md) for setup and recipient policies.
-
+- [integration guide](doc/integration.md)
 - [security model](doc/security.md)
 - [protocol](doc/protocol.md)
+- [demo application](doc/demo.md)
+- [demo format](doc/demo-format.md)

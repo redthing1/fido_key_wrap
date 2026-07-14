@@ -1,98 +1,161 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "fkw",
-    about = "protect an encrypted note with fido2 credentials",
-    version,
-    after_help = "examples:\n  fkw check\n  fkw new note.fkw\n  fkw open note.fkw\n  fkw add-key note.fkw backup"
+    about = "protect a small encrypted note with an application passphrase or security key",
+    after_help = "examples:\n  printf 'a private note\\n' | fkw new note.fkd -a application-passphrase\n  fkw open note.fkd\n  fkw recipients note.fkd"
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum Access {
+    ApplicationPassphrase,
+    FidoPresence,
+    FidoUserVerification,
+    FidoPresencePlusPassphrase,
+    FidoUserVerificationPlusPassphrase,
+}
+
+#[derive(Args, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct KdfOptions {
+    /// argon2 memory in mib; supply with --passes and --lanes.
+    #[arg(long)]
+    pub(crate) memory_mib: Option<u32>,
+
+    /// argon2 pass count; supply with --memory-mib and --lanes.
+    #[arg(long)]
+    pub(crate) passes: Option<u32>,
+
+    /// argon2 lane count; supply with --memory-mib and --passes.
+    #[arg(long)]
+    pub(crate) lanes: Option<u8>,
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// inspect connected fido authenticator capabilities.
+    /// inspect security-key support without requesting a pin or touch.
     Check {
-        /// show fido capability details.
+        /// show individual compatibility issues.
         #[arg(short, long)]
         details: bool,
     },
 
-    /// create an encrypted note; read one hidden line by default.
+    /// create an encrypted note from standard input.
     New {
-        /// encrypted note to create.
-        path: PathBuf,
+        /// encrypted .fkd file to create.
+        file: PathBuf,
 
-        /// read from a file; use - for multiline standard input.
-        #[arg(short, long)]
-        input: Option<PathBuf>,
+        /// exact recovery policy for the first recipient.
+        #[arg(short, long, value_enum)]
+        access: Access,
 
-        /// require an additional application passphrase.
-        #[arg(short, long)]
-        passphrase: bool,
-
-        /// require touch without a pin after setup.
-        #[arg(short = 't', long)]
-        touch_only: bool,
-    },
-
-    /// open and print an encrypted note.
-    Open {
-        /// encrypted note to open.
-        path: PathBuf,
-
-        /// recipient label or prefix such as id:0123abcd.
-        #[arg(short, long)]
-        key: Option<String>,
-    },
-
-    /// show the recipients that can recover a note's root key.
-    Keys {
-        /// encrypted note to inspect.
-        path: PathBuf,
-
-        /// include public recipient ids.
-        #[arg(short, long)]
-        details: bool,
-    },
-
-    /// add a recipient on a backup authenticator.
-    AddKey {
-        /// encrypted note to update.
-        path: PathBuf,
-
-        /// short lowercase label for the backup recipient.
+        /// presentation label for the first recipient.
+        #[arg(short, long, default_value = "primary")]
         label: String,
 
-        /// current recipient label or prefix such as id:0123abcd.
-        #[arg(short, long)]
-        key: Option<String>,
-
-        /// require an application passphrase for the backup.
-        #[arg(short, long)]
-        passphrase: bool,
-
-        /// require touch without a pin after setup.
-        #[arg(short = 't', long)]
-        touch_only: bool,
+        #[command(flatten)]
+        kdf: KdfOptions,
     },
 
-    /// remove a recipient.
-    RemoveKey {
-        /// encrypted note to update.
-        path: PathBuf,
+    /// decrypt a note to standard output.
+    Open {
+        /// encrypted .fkd file to open.
+        file: PathBuf,
 
-        /// label or prefix such as id:0123abcd.
+        /// exact id, unambiguous id prefix, or unique label.
+        #[arg(short, long)]
+        recipient: Option<String>,
+    },
+
+    /// list unauthenticated recipient metadata.
+    Recipients {
+        /// encrypted .fkd file to inspect.
+        file: PathBuf,
+
+        /// include canonical recipient ids and passphrase work.
+        #[arg(short, long)]
+        details: bool,
+    },
+
+    /// add an alternative recovery route.
+    AddRecipient {
+        /// encrypted .fkd file to update.
+        file: PathBuf,
+
+        /// recovery policy for the new recipient.
+        #[arg(short, long, value_enum)]
+        access: Access,
+
+        /// presentation label for the new recipient.
+        #[arg(short, long)]
+        label: String,
+
+        /// recipient used to authorize the mutation.
+        #[arg(short = 'u', long)]
+        using: Option<String>,
+
+        #[command(flatten)]
+        kdf: KdfOptions,
+    },
+
+    /// remove one recovery route; old file copies remain usable.
+    RemoveRecipient {
+        /// encrypted .fkd file to update.
+        file: PathBuf,
+
+        /// recipient to remove.
         recipient: String,
 
-        /// recipient label or prefix such as id:0123abcd.
-        #[arg(short, long)]
-        key: Option<String>,
+        /// recipient used to authorize the mutation.
+        #[arg(short = 'u', long)]
+        using: Option<String>,
+    },
+
+    /// change the application passphrase for one recipient.
+    ChangePassphrase {
+        /// encrypted .fkd file to update.
+        file: PathBuf,
+
+        /// passphrase-bearing recipient to change.
+        recipient: String,
+
+        /// recipient used to authorize the mutation.
+        #[arg(short = 'u', long)]
+        using: Option<String>,
+
+        #[command(flatten)]
+        kdf: KdfOptions,
+    },
+
+    /// replace the root and every current route with one new route.
+    RotateRoot {
+        /// encrypted .fkd file to update.
+        file: PathBuf,
+
+        /// recovery policy for the replacement recipient.
+        #[arg(short, long, value_enum)]
+        access: Access,
+
+        /// presentation label for the replacement recipient.
+        #[arg(short, long, default_value = "primary")]
+        label: String,
+
+        /// recipient used to unlock the current note.
+        #[arg(short = 'u', long)]
+        using: Option<String>,
+
+        /// skip the destructive-operation confirmation.
+        #[arg(long)]
+        yes: bool,
+
+        #[command(flatten)]
+        kdf: KdfOptions,
     },
 }
 
@@ -101,30 +164,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normal_commands_stay_short() {
-        let cli = Cli::try_parse_from(["fkw", "new", "note.fkw", "-p", "-t"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::New {
-                passphrase: true,
-                touch_only: true,
-                ..
-            }
-        ));
+    fn exact_access_strings_and_short_surface_parse() {
+        for access in [
+            "application-passphrase",
+            "fido-presence",
+            "fido-user-verification",
+            "fido-presence-plus-passphrase",
+            "fido-user-verification-plus-passphrase",
+        ] {
+            let cli = Cli::try_parse_from(["fkw", "new", "note.fkd", "--access", access]);
+            assert!(cli.is_ok(), "failed to parse {access}");
+        }
 
-        let cli = Cli::try_parse_from(["fkw", "open", "note.fkw", "-k", "backup"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Open { key: Some(key), .. } if key == "backup"
-        ));
+        let cli = Cli::try_parse_from([
+            "fkw",
+            "new",
+            "note.fkd",
+            "-a",
+            "application-passphrase",
+            "-l",
+            "primary",
+        ]);
+        assert!(cli.is_ok());
+
+        let cli = Cli::try_parse_from([
+            "fkw",
+            "change-passphrase",
+            "note.fkd",
+            "primary",
+            "-u",
+            "primary",
+            "--memory-mib",
+            "64",
+            "--passes",
+            "3",
+            "--lanes",
+            "1",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::ChangePassphrase { .. }));
     }
 
     #[test]
-    fn backup_label_is_positional() {
-        let cli = Cli::try_parse_from(["fkw", "add-key", "note.fkw", "off-site"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::AddKey { label, .. } if label == "off-site"
-        ));
+    fn new_requires_an_explicit_access_policy() {
+        assert!(Cli::try_parse_from(["fkw", "new", "note.fkd"]).is_err());
     }
 }

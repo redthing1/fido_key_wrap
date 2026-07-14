@@ -1,127 +1,209 @@
 # security model
 
-## protected asset
+## protected value
 
-the protected asset is one uniformly random 32-byte `RootKey`. possession of a
-stored envelope alone does not reveal the root.
+the library protects one uniformly random 32-byte application root. the root
+is not stored on the security key. a key envelope contains one or more
+encrypted copies of the root, plus the public material needed to attempt each
+recovery route.
 
-unlock requires the ceremony recorded for one recipient and, when enabled, its
-application passphrase. a root-derived mac authenticates the recipient set and
-its policies before the root is returned.
+the envelope is public. store it beside application ciphertext only when the
+exact envelope bytes are authenticated with that ciphertext.
 
-## trust assumptions
+## construction in brief
 
-- the authenticator protects its credential secrets, enforces its pin and
-  presence behavior, and signs correct authenticator data
-- the host process is trusted during enrollment and unlock
-- the application stores the envelope and its encrypted data correctly
+a passphrase recipient derives a wrapping key with argon2id followed by
+hkdf-sha-256. a fido recipient obtains a signed and verified `hmac-secret`
+result from its dedicated non-discoverable credential, then derives a wrapping
+key with hkdf-sha-256.
 
-the host briefly sees the pin, passphrase, verified `hmac-secret` result,
-derived keys, root, and application plaintext. code executing in the process
-during unlock can obtain those values.
+a combined recipient encrypts the root under the passphrase key and encrypts
+that result under the fido key. unlock verifies and removes the fido layer
+before requesting the passphrase.
 
-the envelope is untrusted until decoding and cryptographic verification
-succeed. its credential ids, public keys, labels, and policies are public.
+aes-256-gcm authenticates each encrypted layer. recipient identity, policy,
+parameters, credential material, application id, and envelope id are bound into
+domain-separated contexts. a root-derived hmac-sha-256 authenticates the
+canonical envelope body and complete recipient set before a recovered root is
+returned.
 
-## attacker capabilities
+the exact construction and wire format are in [protocol.md](protocol.md).
 
-| attacker has | result |
-| --- | --- |
-| envelope | cannot recover the root |
-| authenticator | lacks the credential id, protocol inputs, and encrypted root |
-| envelope and authenticator | must complete the fido ceremony and any configured passphrase |
-| envelope and application passphrase | still needs the authenticator ceremony |
-| older complete envelope | remains valid and still requires its recorded factors |
-| control of the host during unlock | can obtain the root and plaintext |
+## recovery policies
 
-## fido policies
+`fido presence` requires the recorded credential and a signed assertion with
+user presence set and user verification clear. in ordinary use this means the
+key and a touch.
 
-`presence` requests no pin and accepts only a verified assertion with signed
-`up=1, uv=0`.
+`fido user verification` requires user presence and user verification set. the
+application supplies the authenticator pin through `Interaction`; the library
+passes it to the native operation once and accepts no automatic fallback.
 
-`user-verified` requests one pin and accepts only a verified assertion with
-signed `up=1, uv=1`. an incorrect pin is not retried automatically.
+the policy code is bound into the recipient context and therefore into the prf
+input and wrapping key. an assertion with user verification set does not
+satisfy a presence recipient. backup-eligible and backed-up credentials are
+rejected for both policies.
 
-presence and user verification select different `hmac-secret` branches. one
-cannot substitute for the other, even when user verification might appear
-stronger.
+credential creation always requires user verification. enrollment verifies the
+packed attestation signature, the es256 key, the requested credential
+protection, and exact signed flags. the new credential is then exercised by a
+fresh assertion before the recipient is returned.
 
-credential creation always requires user verification. the new credential is
-then used in a second assertion. the envelope is returned only after the final
-recipient construction has been proved.
+## credential storage
 
-always-uv is incompatible with a presence recipient because the authenticator
-cannot produce `uv=0`. changing the authenticator pin does not invalidate a
-credential, but later verified operations require the new pin. resetting the
-authenticator makes its existing credentials unusable.
+the library requests a non-discoverable credential with `rk=false`. the
+credential id is stored in the envelope and supplied to the authenticator for
+each assertion. it does not consume a discoverable credential slot.
 
-## passphrase layer
+credential-management tools enumerate and delete discoverable credentials;
+they do not manage this envelope-held credential id. removing a recipient
+therefore removes the route from the current envelope without contacting the
+security key. old envelope copies still contain the route. resetting the fido
+function on the authenticator invalidates its non-discoverable credentials,
+along with the device's other fido credentials.
 
-the passphrase is an application factor, not the authenticator pin.
+## several recipients
 
-the root is encrypted under an argon2id-derived key. that ciphertext is then
-encrypted under the authenticator-derived key. unlock authenticates the outer
-layer before asking for the passphrase.
+several recipients are alternative recovery routes to the same root. they are
+joined by **or**.
 
-a copied envelope therefore provides no standalone verifier for passphrase
-guessing. an attacker with the envelope who completes the fido ceremony can
-obtain the inner ciphertext and test guesses, so passphrase strength still
-matters.
+the least demanding available route determines the minimum protection of the
+root. for example, a passphrase-only recovery recipient permits offline
+guessing even when another recipient requires both a security key and a
+passphrase.
 
-passphrases are not normalized or trimmed. their exact bytes are significant.
+the library evaluates exactly the selected `RecipientId`. it does not search
+for a working recipient or fall back after failure.
 
-## envelope integrity and rollback
+each fido-bearing recipient has its own credential. primary and backup keys are
+represented by separate recipients enrolled while the corresponding key is
+selected. when several compatible authenticators are attached, the
+`Interaction` implementation asks the user to choose one by touch.
 
-each recipient ciphertext authenticates the fields that determine its
-cryptographic identity. a root-keyed hmac covers the canonical envelope body,
-including the application id, recipient set, policies, and labels.
+## copied-envelope attacks
 
-changing, removing, adding, or combining recipient records fails
-authentication. an older complete envelope has a valid older mac and remains
-usable.
+### passphrase recipient
 
-the envelope contains no trusted counter, timestamp, or monotonic state.
-applications that need rollback protection must keep freshness state elsewhere.
-recipient removal is not strong revocation while older envelope copies remain.
+a copied envelope provides an offline passphrase verifier. each guess requires
+the recorded, locally admitted argon2id work and an authenticated decryption
+attempt. application rate limits cannot stop guessing after the envelope has
+been copied.
 
-## attestation and device identity
+argon2 increases the cost of each guess but does not add entropy. a strong,
+unique application passphrase remains necessary.
 
-enrollment verifies the attestation signature but does not validate a
-manufacturer trust chain. it proves control of the new credential's assertion
-key, not a trusted vendor, model, serial number, or physical device identity.
+### fido recipient
 
-discovery metadata is never used as credential identity. the application and
-user must ensure that primary and backup recipients are created on different
-authenticators and stored separately.
+a copied envelope alone is insufficient. recovery requires the dedicated
+credential and the exact signed ceremony recorded by its policy.
+
+a valid unlock places the prf result, derived wrapping key, and root in host
+memory. malware present during that unlock can capture them.
+
+### combined recipient
+
+an envelope-only attacker cannot reach the inner passphrase ciphertext without
+first completing the fido layer. this removes the standalone passphrase
+verifier from the copied envelope.
+
+after a successful fido ceremony, anyone who captures the inner ciphertext or
+derived fido material can test passphrase guesses offline. protection against
+envelope-only guessing therefore assumes that no valid unlock has been
+captured.
+
+## host and native trust
+
+the process is trusted while creating or opening a recipient. it briefly owns
+the passphrase or pin, verified prf result, derived keys, root, and any
+application plaintext. code running in that process can obtain them.
+
+fido ceremonies also trust the operating-system transport, the native fido
+library, its loader, and the selected ctap endpoint to execute the verified
+protocol correctly. the adapter applies the host-side verification described
+above before copying prf output into the safe crate.
+
+the construction uses direct ctap. the `ApplicationId` is the relying-party id
+and a cryptographic namespace, but it does not prove which local executable is
+calling the authenticator.
+
+## authenticator identity and attestation
+
+packed attestation authenticates the credential-creation response and its
+embedded credential public key. a fresh assertion proves control of the
+corresponding private key before the recipient is returned. attestation is not
+evaluated against
+a manufacturer trust chain and establishes no vendor, model, serial number,
+physical origin, or unclonability.
+
+credential ids and discovery metadata are not physical-device identities. an
+application or user that wants separate primary and backup keys must arrange
+and verify that separation operationally.
+
+changing an authenticator pin normally leaves its credentials usable under the
+new pin. resetting the authenticator destroys the credential secrets needed by
+existing recipients.
+
+## envelope integrity and application binding
+
+the envelope mac detects changes to the application id, envelope id,
+recipients, policies, labels, and wrapped roots after a candidate root is
+recovered. wrong factors, malformed or corrupted records, and invalid final
+authentication are rejected without exposing partial cryptographic results.
+
+the mac does not bind application ciphertext by itself. the application must
+authenticate the exact encoded envelope with its ciphertext. otherwise a valid
+envelope and valid ciphertext can be spliced across application objects.
+
+recipient summaries are untrusted display data before unlock. the application
+must supply its own trusted application id and policy allowlist rather than
+adopting values from the envelope.
+
+## rollback, removal, and rotation
+
+an old complete envelope contains a valid old mac and remains usable. removing
+a recipient or changing a passphrase affects only the updated copy.
+
+the envelope has no clock, trusted counter, or monotonic state. applications
+that need rollback detection must keep freshness state elsewhere.
+
+root rotation is the revocation boundary. replacing the root and re-encrypting
+application data prevents an old envelope from opening future data. the
+application owns this operation because it alone can decrypt, verify,
+re-encrypt, and atomically replace its data.
+
+## resource limits
+
+the format accepts argon2id memory from 64 to 256 mib, three to six passes, and
+one to four lanes. these are protocol bounds, not permission to spend arbitrary
+resources.
+
+`PassphraseLimits` provides a separate immutable local ceiling. the protector
+checks the selected recipient against it before requesting a passphrase or
+allocating argon2 memory. one operation evaluates one recipient.
+
+an application still controls concurrency. untrusted clients can otherwise
+turn individually valid derivations into memory exhaustion. servers should use
+a bounded blocking pool and limit simultaneous work.
 
 ## secret lifetime
 
-`RootKey`, `Pin`, and `Passphrase` use zeroizing storage, cannot be cloned, and
-redact debug output. owned intermediate-secret buffers are cleared when
-dropped.
+`RootKey`, `Passphrase`, and `Pin` have no `Clone` or `Display`, redact `Debug`,
+and use zeroizing storage. `RootKey::expose` can still let application code copy
+or print the root. owned argon2 memory, kdf output, prf result, derived keys,
+decrypted layers, and transient root buffers are cleared when dropped.
 
-zeroization cannot erase copies made by the compiler, allocator, operating
-system, crash reporter, or application. memory is not locked. valuable keys may
-require process isolation, disabled core dumps, controlled logging, and short
-unlocked sessions.
+zeroization reduces ordinary secret lifetime; it is not forensic erasure. it
+cannot guarantee removal from registers, compiler temporaries, allocator
+history, swap, crash dumps, terminal input buffers, or copies made by the
+application. it also cannot protect a compromised process.
 
-## not protected
+## limits
 
-the library does not protect against:
+the security model excludes:
 
-- malware or a deceptive user interface during enrollment or unlock
-- physical or firmware compromise of the authenticator
-- observation of the pin or passphrase during entry
-- deletion, corruption, or rollback of stored data
-- accidental enrollment of two recipients on one physical authenticator
-- insecure encryption, persistence, logging, backups, or session handling in
-  the application
-
-for valuable data:
-
-- keep at least two independently stored authenticators
-- prefer user verification when possession and touch are insufficient
-- back up the envelope and all key state needed to decrypt application data as
-  one consistent set
-- verify every backup recipient before relying on it
-- rotate the root when strong revocation is required
+- application data encryption or storage
+- protection from malware during a valid unlock
+- availability, backup, deletion, and rollback protection
+- a trusted user interface for passphrase, pin, or touch prompts
+- protection from weak passphrases or observed input
+- non-exportable host-side wrapping keys

@@ -5,13 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = []
+fido = ["dep:fido-key-wrap-libfido2"]
+
 [dependencies]
 aes-gcm.workspace = true
+# enable aes round-key cleanup and ghash construction-temporary cleanup.
 aes.workspace = true
-argon2.workspace = true
-fido-key-wrap-libfido2 = { path = "../fido-key-wrap-libfido2" }
-getrandom.workspace = true
 ghash.workspace = true
+argon2.workspace = true
+fido-key-wrap-libfido2 = { version = "0.1.0", path = "../fido-key-wrap-libfido2", optional = true }
+getrandom.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
 minicbor.workspace = true

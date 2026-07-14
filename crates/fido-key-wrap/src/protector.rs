@@ -1,138 +1,234 @@
 use subtle::ConstantTimeEq;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use crate::{
     ApplicationId, Enrollment, Error, Interaction, KeyEnvelope, Operation, Passphrase,
-    PassphrasePrompt, RecipientId, Result, RootKey,
-    backend::{AuthenticatorBackend, NativeBackend, PrfRequest},
-    crypto,
+    PassphraseLimits, PassphraseParameters, PassphrasePrompt, PassphrasePurpose, RecipientId,
+    Result, RootKey,
+    backend::{AuthenticatorBackend, PrfRequest},
+    crypto::{self, DerivedKey},
     envelope::{
-        MAX_CREDENTIAL_ID, MAX_RECIPIENTS, PassphraseHeader, PublicKey64, RecipientRecord,
-        compute_recipient_id,
+        FidoAndPassphraseRecipient, FidoRecipient, KdfDescriptor, MAX_CREDENTIAL_ID,
+        MAX_RECIPIENTS, PassphraseRecipient, RecipientRecord,
     },
+    policy::RecipientPolicy,
 };
 
-/// fido recipient and key-envelope operations.
+const ROOT_BYTES: usize = 32;
+const WRAPPED_ROOT_BYTES: usize = 48;
+const COMBINED_WRAPPED_ROOT_BYTES: usize = 64;
+const RANDOM_ATTEMPTS: usize = 32;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum StagedFault {
+    CanonicalDecode,
+    RootMismatch,
+    EnvelopeMac,
+}
+
+#[cfg(test)]
+thread_local! {
+    static STAGED_FAULT: Cell<Option<StagedFault>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn fail_next_staged_validation(fault: StagedFault) {
+    STAGED_FAULT.set(Some(fault));
+}
+
+#[cfg(test)]
+fn take_staged_fault(fault: StagedFault) -> bool {
+    if STAGED_FAULT.get() == Some(fault) {
+        STAGED_FAULT.set(None);
+        true
+    } else {
+        false
+    }
+}
+
+/// concrete facade for root protection and recovery.
 pub struct KeyProtector {
     application_id: ApplicationId,
-    backend: Box<dyn AuthenticatorBackend>,
+    passphrase_limits: PassphraseLimits,
+    backend: AuthenticatorBackend,
 }
 
 impl KeyProtector {
-    /// creates a protector using libfido2.
+    /// constructs a protector without security-key support.
+    ///
+    /// passphrase operations are fully functional. selecting a security-key
+    /// policy returns [`Error::FidoSupportUnavailable`] before interaction.
+    #[must_use]
+    pub const fn new(application_id: ApplicationId) -> Self {
+        Self {
+            application_id,
+            passphrase_limits: PassphraseLimits::DESKTOP,
+            backend: AuthenticatorBackend::unavailable(),
+        }
+    }
+
+    /// constructs a protector backed by the system fido transport.
+    ///
+    /// construction performs no device discovery or interaction.
+    #[cfg(feature = "fido")]
     #[must_use]
     pub fn system(application_id: ApplicationId) -> Self {
         Self {
             application_id,
-            backend: Box::new(NativeBackend::new()),
+            passphrase_limits: PassphraseLimits::DESKTOP,
+            backend: AuthenticatorBackend::system(),
         }
     }
 
-    /// inspects authenticator capabilities without requesting a pin or touch.
-    ///
-    /// # Errors
-    ///
-    /// returns a discovery or allocation error.
-    pub fn inspect_authenticators(&self) -> Result<Vec<crate::AuthenticatorReport>> {
-        self.backend.inspect()
+    /// replaces this process's immutable passphrase-work admission ceiling.
+    #[must_use]
+    pub const fn with_passphrase_limits(mut self, limits: PassphraseLimits) -> Self {
+        self.passphrase_limits = limits;
+        self
     }
 
-    /// generates a root key and protects it with the first recipient.
+    /// generates a random root and immediately protects it through one route.
     ///
-    /// # Errors
+    /// # errors
     ///
-    /// returns an error when randomness, interaction, enrollment, proof, or
-    /// wrapping fails. no envelope is returned on partial failure.
-    pub fn provision(
+    /// returns an error without exposing an unprotected generated root when
+    /// enrollment, interaction, derivation, or staged route verification fails.
+    pub fn create_root(
         &mut self,
         enrollment: Enrollment,
         interaction: &mut dyn Interaction,
     ) -> Result<(RootKey, KeyEnvelope, RecipientId)> {
-        let root = RootKey::generate()?;
-        let (envelope, recipient) = self.protect_existing(&root, enrollment, interaction)?;
+        let root = RootKey::random()?;
+        let (envelope, recipient) =
+            self.protect_root_for_operation(&root, enrollment, Operation::CreateRoot, interaction)?;
         Ok((root, envelope, recipient))
     }
 
-    /// protects an existing uniformly random root key with its first recipient.
+    /// protects an existing uniformly random root through one route.
     ///
-    /// # Errors
+    /// # errors
     ///
-    /// returns an error when interaction, enrollment, proof, or wrapping
-    /// fails. no envelope is returned on partial failure.
-    pub fn protect_existing(
+    /// returns an error when enrollment, interaction, derivation, or staged
+    /// route verification fails.
+    pub fn protect_root(
         &mut self,
         root: &RootKey,
         enrollment: Enrollment,
         interaction: &mut dyn Interaction,
     ) -> Result<(KeyEnvelope, RecipientId)> {
-        let mut envelope_id = [0u8; 32];
-        getrandom::fill(&mut envelope_id).map_err(|_| Error::Random)?;
-        let mut envelope = KeyEnvelope {
-            application_id: self.application_id.clone(),
-            envelope_id,
-            recipients: Vec::new(),
-            mac: [0u8; 32],
-        };
-        let recipient =
-            self.add_recipient_inner(&mut envelope, root, enrollment, interaction, true)?;
-        Ok((envelope, recipient))
+        self.protect_root_for_operation(root, enrollment, Operation::ProtectRoot, interaction)
     }
 
-    /// unlocks one recipient and verifies the envelope before
-    /// returning the root key.
+    /// recovers a root through exactly one selected recipient.
     ///
-    /// # Errors
+    /// # errors
     ///
-    /// returns an actionable device error before decryption or
-    /// [`Error::UnlockFailed`] for cryptographic failure.
+    /// returns an error without searching another recipient or weakening the
+    /// selected policy.
     pub fn unlock(
         &mut self,
         envelope: &KeyEnvelope,
-        recipient_id: RecipientId,
+        recipient: RecipientId,
         interaction: &mut dyn Interaction,
     ) -> Result<RootKey> {
         self.require_application(envelope)?;
-        let recipient = envelope.find(recipient_id)?;
-        let input = crypto::prf_input(recipient, &envelope.application_id, &envelope.envelope_id)?;
-        let prf_result = self.backend.evaluate_prf(
-            PrfRequest {
-                application_id: &envelope.application_id,
-                credential_id: &recipient.credential_id,
-                public_key: &recipient.public_key,
-                policy: recipient.policy,
-                input: &input,
-                label: &recipient.label,
-                operation: Operation::Unlock,
-            },
-            interaction,
-        )?;
-        let outer = crypto::unwrap_token_layer(
-            recipient,
-            &envelope.application_id,
-            &envelope.envelope_id,
-            &prf_result,
-        )?;
-        let passphrase = if recipient.policy.passphrase {
-            Some(self.request_passphrase(recipient, Operation::Unlock, false, interaction)?)
-        } else {
-            None
+        let record = envelope.find(recipient)?;
+        self.admit_record(record)?;
+
+        let root = match record {
+            RecipientRecord::Passphrase(passphrase_record) => {
+                let passphrase = request_passphrase(
+                    interaction,
+                    Operation::Unlock,
+                    &passphrase_record.label,
+                    PassphrasePurpose::Unlock,
+                )?;
+                let key = crypto::derive_passphrase_key(
+                    record,
+                    &self.application_id,
+                    &envelope.envelope_id,
+                    &passphrase,
+                )?;
+                drop(passphrase);
+                crypto::unwrap_passphrase_root(
+                    passphrase_record,
+                    &self.application_id,
+                    &envelope.envelope_id,
+                    &key,
+                )?
+            }
+            RecipientRecord::Fido(fido_record) => {
+                let prf = self.evaluate(record, envelope, Operation::Unlock, interaction)?;
+                let key = crypto::derive_fido_key(
+                    record,
+                    &self.application_id,
+                    &envelope.envelope_id,
+                    &prf,
+                )?;
+                drop(prf);
+                crypto::unwrap_fido_root(
+                    fido_record,
+                    &self.application_id,
+                    &envelope.envelope_id,
+                    &key,
+                )?
+            }
+            RecipientRecord::FidoAndPassphrase(combined_record) => {
+                let prf = self.evaluate(record, envelope, Operation::Unlock, interaction)?;
+                let fido_key = crypto::derive_fido_key(
+                    record,
+                    &self.application_id,
+                    &envelope.envelope_id,
+                    &prf,
+                )?;
+                drop(prf);
+                let inner = crypto::unwrap_combined_outer(
+                    combined_record,
+                    &self.application_id,
+                    &envelope.envelope_id,
+                    &fido_key,
+                )?;
+                drop(fido_key);
+
+                let passphrase = request_passphrase(
+                    interaction,
+                    Operation::Unlock,
+                    &combined_record.label,
+                    PassphrasePurpose::Unlock,
+                )?;
+                let passphrase_key = crypto::derive_passphrase_key(
+                    record,
+                    &self.application_id,
+                    &envelope.envelope_id,
+                    &passphrase,
+                )?;
+                drop(passphrase);
+                crypto::unwrap_combined_inner(
+                    combined_record,
+                    &self.application_id,
+                    &envelope.envelope_id,
+                    &inner,
+                    &passphrase_key,
+                )?
+            }
         };
-        let root = crypto::finish_unwrap(
-            recipient,
-            &envelope.application_id,
-            &envelope.envelope_id,
-            &outer,
-            passphrase.as_ref(),
-        )?;
-        crypto::verify_envelope_mac(envelope, &root).map_err(|_| Error::UnlockFailed)?;
-        Ok(root)
+
+        if crypto::envelope_mac_matches(envelope, &root)? {
+            Ok(root)
+        } else {
+            Err(Error::UnlockFailed)
+        }
     }
 
-    /// enrolls and adds one recipient.
+    /// adds another alternative recovery route transactionally.
     ///
-    /// # Errors
+    /// # errors
     ///
-    /// returns an error without modifying `envelope` unless enrollment, proof,
-    /// wrapping, and envelope authentication all succeed.
+    /// authenticates the current envelope before factor interaction and leaves
+    /// it byte-for-byte unchanged on every failure.
     pub fn add_recipient(
         &mut self,
         envelope: &mut KeyEnvelope,
@@ -140,168 +236,507 @@ impl KeyProtector {
         enrollment: Enrollment,
         interaction: &mut dyn Interaction,
     ) -> Result<RecipientId> {
-        self.require_application(envelope)?;
-        self.add_recipient_inner(envelope, root, enrollment, interaction, false)
-    }
-
-    /// removes one recipient from the authenticated envelope.
-    ///
-    /// old complete copies of an envelope remain usable; applications needing
-    /// stronger revocation must rotate the root and enforce freshness.
-    ///
-    /// # Errors
-    ///
-    /// returns an error for the wrong root, unknown recipient, or an attempt
-    /// to remove the final recovery recipient.
-    pub fn remove_recipient(
-        &mut self,
-        envelope: &mut KeyEnvelope,
-        root: &RootKey,
-        recipient_id: RecipientId,
-    ) -> Result<()> {
-        self.require_application(envelope)?;
-        crypto::verify_envelope_mac(envelope, root)?;
-        let mut staged = envelope.clone();
-        let index = staged
-            .recipients
-            .binary_search_by_key(&recipient_id, |recipient| recipient.id)
-            .map_err(|_| Error::RecipientNotFound)?;
-        if envelope.recipients.len() == 1 {
-            return Err(Error::WouldRemoveLastRecipient);
-        }
-        staged.recipients.remove(index);
-        staged.mac = crypto::compute_envelope_mac(&staged, root)?;
-        *envelope = staged;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn add_recipient_inner(
-        &mut self,
-        envelope: &mut KeyEnvelope,
-        root: &RootKey,
-        enrollment: Enrollment,
-        interaction: &mut dyn Interaction,
-        allow_empty: bool,
-    ) -> Result<RecipientId> {
-        if envelope.recipients.is_empty() {
-            if !allow_empty {
-                return Err(Error::InvalidEnvelope);
-            }
-        } else {
-            crypto::verify_envelope_mac(envelope, root)?;
-        }
+        self.require_authenticated(envelope, root)?;
         if envelope.recipients.len() >= MAX_RECIPIENTS {
-            return Err(Error::ResourceLimitExceeded);
+            return Err(Error::TooManyRecipients);
         }
+        self.admit_enrollment(&enrollment)?;
 
-        let credential = self.backend.enroll(
-            &envelope.application_id,
-            enrollment.policy,
-            &enrollment.label,
-            interaction,
-        )?;
-        if credential.credential_id.is_empty()
-            || credential.credential_id.len() > MAX_CREDENTIAL_ID
-            || credential.credential_protection
-                != RecipientRecord::expected_credential_protection(enrollment.policy.token)
-        {
-            return Err(Error::AuthenticatorResponseInvalid);
-        }
-        let public_key = PublicKey64::new(credential.public_key.0)?;
-        let id = compute_recipient_id(
-            &envelope.application_id,
-            &credential.credential_id,
-            &public_key,
-            enrollment.policy,
-        )?;
-        if envelope.recipients.iter().any(|recipient| {
-            recipient.id == id || recipient.credential_id == credential.credential_id
-        }) {
-            return Err(Error::DuplicateRecipient);
-        }
-
-        let mut prf_nonce = [0u8; 32];
-        let mut token_nonce = [0u8; 12];
-        getrandom::fill(&mut prf_nonce).map_err(|_| Error::Random)?;
-        getrandom::fill(&mut token_nonce).map_err(|_| Error::Random)?;
-        let passphrase_header = if enrollment.policy.passphrase {
-            let mut salt = [0u8; 16];
-            let mut nonce = [0u8; 12];
-            getrandom::fill(&mut salt).map_err(|_| Error::Random)?;
-            getrandom::fill(&mut nonce).map_err(|_| Error::Random)?;
-            Some(PassphraseHeader { salt, nonce })
-        } else {
-            None
-        };
-        let mut record = RecipientRecord {
-            id,
-            label: enrollment.label,
-            credential_id: credential.credential_id,
-            public_key,
-            policy: enrollment.policy,
-            credential_protection: credential.credential_protection,
-            prf_nonce,
-            token_nonce,
-            passphrase: passphrase_header,
-            wrapped_key: Vec::new(),
-        };
-
-        let input = crypto::prf_input(&record, &envelope.application_id, &envelope.envelope_id)?;
-        let prf_result = self.backend.evaluate_prf(
-            PrfRequest {
-                application_id: &envelope.application_id,
-                credential_id: &record.credential_id,
-                public_key: &record.public_key,
-                policy: record.policy,
-                input: &input,
-                label: &record.label,
-                operation: Operation::Verify,
-            },
-            interaction,
-        )?;
-        let passphrase = if record.policy.passphrase {
-            let first = self.request_passphrase(&record, Operation::Enroll, false, interaction)?;
-            let second = self.request_passphrase(&record, Operation::Enroll, true, interaction)?;
-            if !bool::from(first.as_bytes().ct_eq(second.as_bytes())) {
-                return Err(Error::InvalidPassphrase);
-            }
-            Some(first)
-        } else {
-            None
-        };
-        record.wrapped_key = crypto::wrap_root(
-            &record,
-            &envelope.application_id,
-            &envelope.envelope_id,
+        let (record, keys) = self.enroll_recipient(
+            envelope,
             root,
-            &prf_result,
-            passphrase.as_ref(),
+            enrollment,
+            Operation::AddRecipient,
+            interaction,
         )?;
-
-        let mut staged = envelope.clone();
-        staged.recipients.push(record);
-        staged.recipients.sort_by_key(|recipient| recipient.id);
-        staged.mac = crypto::compute_envelope_mac(&staged, root)?;
+        let id = record.id();
+        let staged = Self::stage_record(envelope.clone(), record, root, &keys)?;
         *envelope = staged;
         Ok(id)
     }
 
-    fn request_passphrase(
+    /// removes one recovery route transactionally.
+    ///
+    /// # errors
+    ///
+    /// rejects an absent recipient, a final recipient, an application
+    /// mismatch, or a root that does not authenticate the current envelope.
+    pub fn remove_recipient(
         &self,
-        recipient: &RecipientRecord,
-        operation: Operation,
-        confirm: bool,
+        envelope: &mut KeyEnvelope,
+        root: &RootKey,
+        recipient: RecipientId,
+    ) -> Result<()> {
+        self.require_application(envelope)?;
+        let index = envelope
+            .recipients
+            .binary_search_by_key(&recipient, RecipientRecord::id)
+            .map_err(|_| Error::RecipientNotFound)?;
+        if envelope.recipients.len() == 1 {
+            return Err(Error::WouldRemoveLastRecipient);
+        }
+        crypto::verify_envelope_mac(envelope, root)?;
+
+        let mut staged = envelope.clone();
+        staged.recipients.remove(index);
+        staged.mac = crypto::compute_envelope_mac(&staged, root)?;
+        let staged = canonicalize(&staged)?;
+        crypto::verify_envelope_mac(&staged, root)?;
+        *envelope = staged;
+        Ok(())
+    }
+
+    /// replaces a recipient's passphrase while preserving its argon2 work.
+    pub fn rewrap_passphrase(
+        &mut self,
+        envelope: &mut KeyEnvelope,
+        root: &RootKey,
+        recipient: RecipientId,
         interaction: &mut dyn Interaction,
-    ) -> Result<Passphrase> {
-        interaction
-            .request_passphrase(&PassphrasePrompt {
-                application_id: self.application_id.clone(),
+    ) -> Result<()> {
+        self.require_application(envelope)?;
+        let parameters = envelope
+            .find(recipient)?
+            .passphrase_parameters()
+            .ok_or(Error::RecipientDoesNotUsePassphrase)?;
+        self.rewrap_passphrase_inner(envelope, root, recipient, parameters, interaction)
+    }
+
+    /// replaces a recipient's passphrase using the supplied argon2id parameters.
+    pub fn rewrap_passphrase_with_parameters(
+        &mut self,
+        envelope: &mut KeyEnvelope,
+        root: &RootKey,
+        recipient: RecipientId,
+        parameters: PassphraseParameters,
+        interaction: &mut dyn Interaction,
+    ) -> Result<()> {
+        self.rewrap_passphrase_inner(envelope, root, recipient, parameters, interaction)
+    }
+
+    fn protect_root_for_operation(
+        &mut self,
+        root: &RootKey,
+        enrollment: Enrollment,
+        operation: Operation,
+        interaction: &mut dyn Interaction,
+    ) -> Result<(KeyEnvelope, RecipientId)> {
+        self.admit_enrollment(&enrollment)?;
+        let envelope_id = random_array()?;
+        let envelope = KeyEnvelope {
+            application_id: self.application_id.clone(),
+            envelope_id,
+            recipients: Vec::new(),
+            mac: [0; ROOT_BYTES],
+        };
+        let (record, keys) =
+            self.enroll_recipient(&envelope, root, enrollment, operation, interaction)?;
+        let id = record.id();
+        let envelope = Self::stage_record(envelope, record, root, &keys)?;
+        Ok((envelope, id))
+    }
+
+    fn enroll_recipient(
+        &mut self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        enrollment: Enrollment,
+        operation: Operation,
+        interaction: &mut dyn Interaction,
+    ) -> Result<(RecipientRecord, RecoveryKeys)> {
+        match enrollment.policy {
+            RecipientPolicy::Passphrase => self.enroll_passphrase_recipient(
+                envelope,
+                root,
+                enrollment.label,
+                enrollment
+                    .parameters
+                    .ok_or(Error::InvalidPassphraseParameters)?,
                 operation,
-                recipient_label: recipient.label.clone(),
-                confirm,
-            })
-            .map_err(Error::from)
+                interaction,
+            ),
+            RecipientPolicy::Fido(policy) => self.enroll_fido_recipient(
+                envelope,
+                root,
+                enrollment.label,
+                policy,
+                operation,
+                interaction,
+            ),
+            RecipientPolicy::FidoAndPassphrase(policy) => self.enroll_combined_recipient(
+                envelope,
+                root,
+                enrollment.label,
+                policy,
+                enrollment
+                    .parameters
+                    .ok_or(Error::InvalidPassphraseParameters)?,
+                operation,
+                interaction,
+            ),
+        }
+    }
+
+    fn enroll_passphrase_recipient(
+        &self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        label: String,
+        parameters: PassphraseParameters,
+        operation: Operation,
+        interaction: &mut dyn Interaction,
+    ) -> Result<(RecipientRecord, RecoveryKeys)> {
+        let mut record = RecipientRecord::Passphrase(PassphraseRecipient {
+            id: Self::unique_recipient_id(envelope)?,
+            label,
+            kdf: KdfDescriptor {
+                parameters,
+                salt: Self::unique_salt(envelope)?,
+            },
+            passphrase_nonce: random_array()?,
+            wrapped_root: [0; WRAPPED_ROOT_BYTES],
+        });
+        let passphrase = request_new_passphrase(interaction, operation, record.label())?;
+        let key = crypto::derive_passphrase_key(
+            &record,
+            &self.application_id,
+            &envelope.envelope_id,
+            &passphrase,
+        )?;
+        drop(passphrase);
+        if let RecipientRecord::Passphrase(inner) = &mut record {
+            inner.wrapped_root = crypto::wrap_passphrase_root(
+                inner,
+                &self.application_id,
+                &envelope.envelope_id,
+                root,
+                &key,
+            )?;
+        }
+        Ok((record, RecoveryKeys::Passphrase(key)))
+    }
+
+    fn enroll_fido_recipient(
+        &mut self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        label: String,
+        policy: crate::FidoPolicy,
+        operation: Operation,
+        interaction: &mut dyn Interaction,
+    ) -> Result<(RecipientRecord, RecoveryKeys)> {
+        let credential =
+            self.backend
+                .enroll(&self.application_id, policy, &label, operation, interaction)?;
+        Self::validate_credential(envelope, &credential.credential_id)?;
+        let mut record = RecipientRecord::Fido(FidoRecipient {
+            id: Self::unique_recipient_id(envelope)?,
+            label,
+            credential_id: credential.credential_id,
+            public_key: credential.public_key,
+            policy,
+            prf_nonce: random_array()?,
+            fido_nonce: random_array()?,
+            wrapped_root: [0; WRAPPED_ROOT_BYTES],
+        });
+        let prf = self.evaluate(&record, envelope, operation, interaction)?;
+        let key =
+            crypto::derive_fido_key(&record, &self.application_id, &envelope.envelope_id, &prf)?;
+        drop(prf);
+        if let RecipientRecord::Fido(inner) = &mut record {
+            inner.wrapped_root = crypto::wrap_fido_root(
+                inner,
+                &self.application_id,
+                &envelope.envelope_id,
+                root,
+                &key,
+            )?;
+        }
+        Ok((record, RecoveryKeys::Fido(key)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enroll_combined_recipient(
+        &mut self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        label: String,
+        policy: crate::FidoPolicy,
+        parameters: PassphraseParameters,
+        operation: Operation,
+        interaction: &mut dyn Interaction,
+    ) -> Result<(RecipientRecord, RecoveryKeys)> {
+        let credential =
+            self.backend
+                .enroll(&self.application_id, policy, &label, operation, interaction)?;
+        Self::validate_credential(envelope, &credential.credential_id)?;
+        let mut record = RecipientRecord::FidoAndPassphrase(FidoAndPassphraseRecipient {
+            id: Self::unique_recipient_id(envelope)?,
+            label,
+            credential_id: credential.credential_id,
+            public_key: credential.public_key,
+            policy,
+            prf_nonce: random_array()?,
+            fido_nonce: random_array()?,
+            kdf: KdfDescriptor {
+                parameters,
+                salt: Self::unique_salt(envelope)?,
+            },
+            passphrase_nonce: random_array()?,
+            wrapped_root: [0; COMBINED_WRAPPED_ROOT_BYTES],
+        });
+        let prf = self.evaluate(&record, envelope, operation, interaction)?;
+        let fido_key =
+            crypto::derive_fido_key(&record, &self.application_id, &envelope.envelope_id, &prf)?;
+        drop(prf);
+        let passphrase = request_new_passphrase(interaction, operation, record.label())?;
+        let passphrase_key = crypto::derive_passphrase_key(
+            &record,
+            &self.application_id,
+            &envelope.envelope_id,
+            &passphrase,
+        )?;
+        drop(passphrase);
+        if let RecipientRecord::FidoAndPassphrase(inner) = &mut record {
+            inner.wrapped_root = crypto::wrap_combined_root(
+                inner,
+                &self.application_id,
+                &envelope.envelope_id,
+                root,
+                &passphrase_key,
+                &fido_key,
+            )?;
+        }
+        Ok((
+            record,
+            RecoveryKeys::Combined {
+                passphrase: passphrase_key,
+                fido: fido_key,
+            },
+        ))
+    }
+
+    fn rewrap_passphrase_inner(
+        &mut self,
+        envelope: &mut KeyEnvelope,
+        root: &RootKey,
+        recipient: RecipientId,
+        parameters: PassphraseParameters,
+        interaction: &mut dyn Interaction,
+    ) -> Result<()> {
+        self.require_application(envelope)?;
+        let current = envelope.find(recipient)?.clone();
+        if !current.policy().uses_passphrase() {
+            return Err(Error::RecipientDoesNotUsePassphrase);
+        }
+        crypto::verify_envelope_mac(envelope, root)?;
+        self.admit_parameters(parameters)?;
+
+        let (replacement, keys) = match &current {
+            RecipientRecord::Passphrase(old) => {
+                self.rewrap_passphrase_record(envelope, root, old, parameters, interaction)?
+            }
+            RecipientRecord::Fido(_) => return Err(Error::RecipientDoesNotUsePassphrase),
+            RecipientRecord::FidoAndPassphrase(old) => {
+                self.rewrap_combined_record(envelope, root, old, parameters, interaction)?
+            }
+        };
+
+        let mut staged = envelope.clone();
+        let index = staged
+            .recipients
+            .binary_search_by_key(&recipient, RecipientRecord::id)
+            .map_err(|_| Error::RecipientNotFound)?;
+        staged.recipients[index] = replacement;
+        let staged = Self::stage_existing_record(staged, recipient, root, &keys)?;
+        *envelope = staged;
+        Ok(())
+    }
+
+    fn rewrap_passphrase_record(
+        &self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        old: &PassphraseRecipient,
+        parameters: PassphraseParameters,
+        interaction: &mut dyn Interaction,
+    ) -> Result<(RecipientRecord, RecoveryKeys)> {
+        let mut replacement = RecipientRecord::Passphrase(PassphraseRecipient {
+            id: old.id,
+            label: old.label.clone(),
+            kdf: KdfDescriptor {
+                parameters,
+                salt: Self::unique_salt(envelope)?,
+            },
+            passphrase_nonce: fresh_array(&old.passphrase_nonce)?,
+            wrapped_root: [0; WRAPPED_ROOT_BYTES],
+        });
+        let passphrase = request_new_passphrase(
+            interaction,
+            Operation::RewrapPassphrase,
+            replacement.label(),
+        )?;
+        let key = crypto::derive_passphrase_key(
+            &replacement,
+            &self.application_id,
+            &envelope.envelope_id,
+            &passphrase,
+        )?;
+        drop(passphrase);
+        if let RecipientRecord::Passphrase(inner) = &mut replacement {
+            inner.wrapped_root = crypto::wrap_passphrase_root(
+                inner,
+                &self.application_id,
+                &envelope.envelope_id,
+                root,
+                &key,
+            )?;
+        }
+        Ok((replacement, RecoveryKeys::Passphrase(key)))
+    }
+
+    fn rewrap_combined_record(
+        &mut self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        old: &FidoAndPassphraseRecipient,
+        parameters: PassphraseParameters,
+        interaction: &mut dyn Interaction,
+    ) -> Result<(RecipientRecord, RecoveryKeys)> {
+        let mut replacement = RecipientRecord::FidoAndPassphrase(FidoAndPassphraseRecipient {
+            id: old.id,
+            label: old.label.clone(),
+            credential_id: old.credential_id.clone(),
+            public_key: old.public_key.clone(),
+            policy: old.policy,
+            prf_nonce: fresh_array(&old.prf_nonce)?,
+            fido_nonce: fresh_array(&old.fido_nonce)?,
+            kdf: KdfDescriptor {
+                parameters,
+                salt: Self::unique_salt(envelope)?,
+            },
+            passphrase_nonce: fresh_array(&old.passphrase_nonce)?,
+            wrapped_root: [0; COMBINED_WRAPPED_ROOT_BYTES],
+        });
+        let prf = self.evaluate(
+            &replacement,
+            envelope,
+            Operation::RewrapPassphrase,
+            interaction,
+        )?;
+        let fido_key = crypto::derive_fido_key(
+            &replacement,
+            &self.application_id,
+            &envelope.envelope_id,
+            &prf,
+        )?;
+        drop(prf);
+        let passphrase = request_new_passphrase(
+            interaction,
+            Operation::RewrapPassphrase,
+            replacement.label(),
+        )?;
+        let passphrase_key = crypto::derive_passphrase_key(
+            &replacement,
+            &self.application_id,
+            &envelope.envelope_id,
+            &passphrase,
+        )?;
+        drop(passphrase);
+        if let RecipientRecord::FidoAndPassphrase(inner) = &mut replacement {
+            inner.wrapped_root = crypto::wrap_combined_root(
+                inner,
+                &self.application_id,
+                &envelope.envelope_id,
+                root,
+                &passphrase_key,
+                &fido_key,
+            )?;
+        }
+        Ok((
+            replacement,
+            RecoveryKeys::Combined {
+                passphrase: passphrase_key,
+                fido: fido_key,
+            },
+        ))
+    }
+
+    fn stage_record(
+        mut staged: KeyEnvelope,
+        record: RecipientRecord,
+        root: &RootKey,
+        keys: &RecoveryKeys,
+    ) -> Result<KeyEnvelope> {
+        let recipient = record.id();
+        staged.recipients.push(record);
+        staged.recipients.sort_by_key(RecipientRecord::id);
+        Self::stage_existing_record(staged, recipient, root, keys)
+    }
+
+    fn stage_existing_record(
+        mut staged: KeyEnvelope,
+        recipient: RecipientId,
+        root: &RootKey,
+        keys: &RecoveryKeys,
+    ) -> Result<KeyEnvelope> {
+        staged.mac = crypto::compute_envelope_mac(&staged, root)?;
+        let staged = canonicalize(&staged)?;
+        #[cfg(test)]
+        let staged = {
+            let mut staged = staged;
+            if take_staged_fault(StagedFault::EnvelopeMac) {
+                staged.mac[0] ^= 1;
+            }
+            staged
+        };
+        let recovered = recover_with_keys(
+            staged.find(recipient)?,
+            &staged.application_id,
+            &staged.envelope_id,
+            keys,
+        )?;
+        #[cfg(test)]
+        let recovered = if take_staged_fault(StagedFault::RootMismatch) {
+            let mut wrong = zeroize::Zeroizing::new(root.expose(|bytes| *bytes));
+            wrong[0] ^= 1;
+            RootKey::from_zeroizing(wrong)
+        } else {
+            recovered
+        };
+        if !roots_match(root, &recovered) || !crypto::envelope_mac_matches(&staged, &recovered)? {
+            return Err(Error::UnlockFailed);
+        }
+        Ok(staged)
+    }
+
+    fn evaluate(
+        &mut self,
+        record: &RecipientRecord,
+        envelope: &KeyEnvelope,
+        operation: Operation,
+        interaction: &mut dyn Interaction,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+        let (credential_id, public_key, policy) = match record {
+            RecipientRecord::Passphrase(_) => return Err(Error::InvalidEnvelope),
+            RecipientRecord::Fido(inner) => (&inner.credential_id, &inner.public_key, inner.policy),
+            RecipientRecord::FidoAndPassphrase(inner) => {
+                (&inner.credential_id, &inner.public_key, inner.policy)
+            }
+        };
+        let input = crypto::prf_input(record, &self.application_id, &envelope.envelope_id)?;
+        self.backend.evaluate(
+            &PrfRequest {
+                application_id: &self.application_id,
+                credential_id,
+                public_key,
+                policy,
+                input: &input,
+                label: record.label(),
+                operation,
+            },
+            interaction,
+        )
     }
 
     fn require_application(&self, envelope: &KeyEnvelope) -> Result<()> {
@@ -312,344 +747,860 @@ impl KeyProtector {
         }
     }
 
+    fn require_authenticated(&self, envelope: &KeyEnvelope, root: &RootKey) -> Result<()> {
+        self.require_application(envelope)?;
+        crypto::verify_envelope_mac(envelope, root)
+    }
+
+    fn admit_enrollment(&self, enrollment: &Enrollment) -> Result<()> {
+        if let Some(parameters) = enrollment.parameters {
+            self.admit_parameters(parameters)?;
+        }
+        Ok(())
+    }
+
+    fn admit_record(&self, record: &RecipientRecord) -> Result<()> {
+        if let Some(parameters) = record.passphrase_parameters() {
+            self.admit_parameters(parameters)?;
+        }
+        Ok(())
+    }
+
+    fn admit_parameters(&self, parameters: PassphraseParameters) -> Result<()> {
+        if self.passphrase_limits.accepts(parameters) {
+            Ok(())
+        } else {
+            Err(Error::PassphraseLimitExceeded)
+        }
+    }
+
+    fn unique_recipient_id(envelope: &KeyEnvelope) -> Result<RecipientId> {
+        for _ in 0..RANDOM_ATTEMPTS {
+            let id = RecipientId::from_bytes(random_array()?);
+            if envelope.find(id).is_err() {
+                return Ok(id);
+            }
+        }
+        Err(Error::RandomUnavailable)
+    }
+
+    fn unique_salt(envelope: &KeyEnvelope) -> Result<[u8; 16]> {
+        for _ in 0..RANDOM_ATTEMPTS {
+            let salt = random_array()?;
+            let duplicate = envelope.recipients.iter().any(|record| match record {
+                RecipientRecord::Passphrase(inner) => inner.kdf.salt == salt,
+                RecipientRecord::Fido(_) => false,
+                RecipientRecord::FidoAndPassphrase(inner) => inner.kdf.salt == salt,
+            });
+            if !duplicate {
+                return Ok(salt);
+            }
+        }
+        Err(Error::RandomUnavailable)
+    }
+
+    fn validate_credential(envelope: &KeyEnvelope, credential_id: &[u8]) -> Result<()> {
+        if credential_id.is_empty()
+            || credential_id.len() > MAX_CREDENTIAL_ID
+            || envelope.recipients.iter().any(|record| match record {
+                RecipientRecord::Passphrase(_) => false,
+                RecipientRecord::Fido(inner) => inner.credential_id == credential_id,
+                RecipientRecord::FidoAndPassphrase(inner) => inner.credential_id == credential_id,
+            })
+        {
+            return Err(Error::AuthenticatorResponseInvalid);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn fake(application_id: ApplicationId) -> Self {
         Self {
             application_id,
-            backend: Box::new(crate::backend::fake::FakeBackend::new()),
+            passphrase_limits: PassphraseLimits::PROTOCOL_MAX,
+            backend: AuthenticatorBackend::fake(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn fake_backend_mut(&mut self) -> &mut crate::backend::fake::FakeBackend {
+        self.backend.fake_mut()
+    }
+}
+
+enum RecoveryKeys {
+    Passphrase(DerivedKey),
+    Fido(DerivedKey),
+    Combined {
+        passphrase: DerivedKey,
+        fido: DerivedKey,
+    },
+}
+
+fn recover_with_keys(
+    record: &RecipientRecord,
+    application_id: &ApplicationId,
+    envelope_id: &[u8; 32],
+    keys: &RecoveryKeys,
+) -> Result<RootKey> {
+    match (record, keys) {
+        (RecipientRecord::Passphrase(record), RecoveryKeys::Passphrase(key)) => {
+            crypto::unwrap_passphrase_root(record, application_id, envelope_id, key)
+        }
+        (RecipientRecord::Fido(record), RecoveryKeys::Fido(key)) => {
+            crypto::unwrap_fido_root(record, application_id, envelope_id, key)
+        }
+        (
+            RecipientRecord::FidoAndPassphrase(record),
+            RecoveryKeys::Combined { passphrase, fido },
+        ) => {
+            let inner = crypto::unwrap_combined_outer(record, application_id, envelope_id, fido)?;
+            crypto::unwrap_combined_inner(record, application_id, envelope_id, &inner, passphrase)
+        }
+        _ => Err(Error::InvalidEnvelope),
+    }
+}
+
+fn request_passphrase(
+    interaction: &mut dyn Interaction,
+    operation: Operation,
+    label: &str,
+    purpose: PassphrasePurpose,
+) -> Result<Passphrase> {
+    interaction
+        .request_passphrase(&PassphrasePrompt::new(operation, label, purpose))
+        .map_err(Error::from)
+}
+
+fn request_new_passphrase(
+    interaction: &mut dyn Interaction,
+    operation: Operation,
+    label: &str,
+) -> Result<Passphrase> {
+    let passphrase = request_passphrase(interaction, operation, label, PassphrasePurpose::New)?;
+    let confirmation =
+        request_passphrase(interaction, operation, label, PassphrasePurpose::Confirm)?;
+    if !passphrase.confirmation_matches(&confirmation) {
+        return Err(Error::PassphraseConfirmationMismatch);
+    }
+    drop(confirmation);
+    Ok(passphrase)
+}
+
+fn canonicalize(envelope: &KeyEnvelope) -> Result<KeyEnvelope> {
+    let encoded = envelope.encode();
+    #[cfg(test)]
+    let encoded = {
+        let mut encoded = encoded;
+        if take_staged_fault(StagedFault::CanonicalDecode) {
+            encoded.push(0);
+        }
+        encoded
+    };
+    KeyEnvelope::decode(&encoded)
+}
+
+fn roots_match(left: &RootKey, right: &RootKey) -> bool {
+    bool::from(left.bytes().ct_eq(right.bytes()))
+}
+
+fn random_array<const N: usize>() -> Result<[u8; N]> {
+    let mut bytes = [0; N];
+    getrandom::fill(&mut bytes).map_err(|_| Error::RandomUnavailable)?;
+    Ok(bytes)
+}
+
+fn fresh_array<const N: usize>(old: &[u8; N]) -> Result<[u8; N]> {
+    for _ in 0..RANDOM_ATTEMPTS {
+        let value = random_array()?;
+        if &value != old {
+            return Ok(value);
+        }
+    }
+    Err(Error::RandomUnavailable)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
-    use crate::{backend::fake::TestInteraction, policy};
+    use crate::{FidoPolicy, InteractionError, Pin};
 
-    fn same_root(left: &RootKey, right: &RootKey) -> bool {
-        left.expose(|left| right.expose(|right| left == right))
+    struct ScriptedInteraction {
+        passphrases: VecDeque<Vec<u8>>,
+        events: Vec<&'static str>,
+    }
+
+    impl ScriptedInteraction {
+        fn new(values: &[&[u8]]) -> Self {
+            Self {
+                passphrases: values.iter().map(|value| value.to_vec()).collect(),
+                events: Vec::new(),
+            }
+        }
+    }
+
+    impl Interaction for ScriptedInteraction {
+        fn request_passphrase(
+            &mut self,
+            prompt: &PassphrasePrompt,
+        ) -> std::result::Result<Passphrase, InteractionError> {
+            self.events.push(match prompt.purpose() {
+                PassphrasePurpose::Unlock => "unlock passphrase",
+                PassphrasePurpose::New => "new passphrase",
+                PassphrasePurpose::Confirm => "confirm passphrase",
+            });
+            Passphrase::new(
+                self.passphrases
+                    .pop_front()
+                    .ok_or(InteractionError::Failed)?,
+            )
+            .map_err(|_| InteractionError::Failed)
+        }
+
+        fn request_pin(
+            &mut self,
+            _prompt: &crate::PinPrompt,
+        ) -> std::result::Result<Pin, InteractionError> {
+            self.events.push("pin");
+            Pin::new("123456".to_owned()).map_err(|_| InteractionError::Failed)
+        }
+
+        fn touch_required(
+            &mut self,
+            prompt: &crate::TouchPrompt,
+        ) -> std::result::Result<(), InteractionError> {
+            self.events.push(match prompt.ceremony() {
+                crate::FidoCeremony::Enrollment => "enrollment touch",
+                crate::FidoCeremony::Assertion => "assertion touch",
+            });
+            Ok(())
+        }
+    }
+
+    struct CancelledInteraction;
+
+    impl Interaction for CancelledInteraction {
+        fn request_passphrase(
+            &mut self,
+            _prompt: &PassphrasePrompt,
+        ) -> std::result::Result<Passphrase, InteractionError> {
+            Err(InteractionError::Cancelled)
+        }
+    }
+
+    struct UnsupportedInteraction;
+
+    impl Interaction for UnsupportedInteraction {}
+
+    fn application() -> ApplicationId {
+        ApplicationId::new("org.example.protector-test").unwrap()
+    }
+
+    fn test_parameters() -> PassphraseParameters {
+        PassphraseParameters::new(65_536, 3, 1).unwrap()
+    }
+
+    fn enrollment(label: &str) -> Enrollment {
+        Enrollment::passphrase_with_parameters(label, test_parameters()).unwrap()
     }
 
     #[test]
-    fn token_only_round_trip_and_canonical_decode() {
-        let application = ApplicationId::new("org.example.test-vault").unwrap();
-        let mut protector = KeyProtector::fake(application);
-        let mut interaction = TestInteraction::new(b"unused");
-        let (root, envelope, recipient) = protector
-            .provision(
-                Enrollment::new("primary", policy::user_verified()).unwrap(),
-                &mut interaction,
-            )
+    fn passphrase_lifecycle_is_transactional() {
+        crypto::reset_passphrase_derivations();
+        let mut protector =
+            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
+        let mut interaction = ScriptedInteraction::new(&[b"first", b"first"]);
+        let (root, mut envelope, first) = protector
+            .create_root(enrollment("first"), &mut interaction)
             .unwrap();
-        let encoded = envelope.encode();
-        let decoded = KeyEnvelope::decode(&encoded).unwrap();
-        assert_eq!(decoded.encode(), encoded);
-        let unlocked = protector
-            .unlock(&decoded, recipient, &mut interaction)
-            .unwrap();
-        assert!(same_root(&root, &unlocked));
-        assert_eq!(interaction.pin_requests, 3);
-        assert_eq!(
-            interaction.pin_operations,
-            [Operation::Enroll, Operation::Verify, Operation::Unlock]
-        );
-        assert_eq!(
-            interaction.touch_operations,
-            [Operation::Enroll, Operation::Verify, Operation::Unlock]
-        );
-    }
+        assert_eq!(crypto::passphrase_derivations(), 1);
 
-    #[test]
-    fn presence_does_not_request_pin_after_enrollment() {
-        let application = ApplicationId::new("org.example.presence-test").unwrap();
-        let mut protector = KeyProtector::fake(application);
-        let mut interaction = TestInteraction::new(b"unused");
-        let (_root, envelope, recipient) = protector
-            .provision(
-                Enrollment::new("primary", policy::presence()).unwrap(),
-                &mut interaction,
-            )
+        crypto::reset_passphrase_derivations();
+        let mut open = ScriptedInteraction::new(&[b"first"]);
+        let recovered = protector.unlock(&envelope, first, &mut open).unwrap();
+        assert!(roots_match(&root, &recovered));
+        assert_eq!(crypto::passphrase_derivations(), 1);
+
+        let mut add = ScriptedInteraction::new(&[b"second", b"second"]);
+        let second = protector
+            .add_recipient(&mut envelope, &root, enrollment("second"), &mut add)
             .unwrap();
-        assert_eq!(interaction.pin_requests, 1);
         protector
-            .unlock(&envelope, recipient, &mut interaction)
-            .unwrap();
-        assert_eq!(interaction.pin_requests, 1);
-    }
-
-    #[test]
-    fn passphrase_is_confirmed_and_requested_after_token_unwrap() {
-        let application = ApplicationId::new("org.example.passphrase-test").unwrap();
-        let mut protector = KeyProtector::fake(application);
-        let mut interaction = TestInteraction::new(b"correct horse battery staple");
-        let (root, envelope, recipient) = protector
-            .provision(
-                Enrollment::new("primary", policy::user_verified().and_passphrase()).unwrap(),
-                &mut interaction,
-            )
-            .unwrap();
-        assert_eq!(interaction.passphrase_requests, 2);
-        let unlocked = protector
-            .unlock(&envelope, recipient, &mut interaction)
-            .unwrap();
-        assert_eq!(interaction.passphrase_requests, 3);
-        assert_eq!(
-            interaction.passphrase_operations,
-            [Operation::Enroll, Operation::Enroll, Operation::Unlock]
-        );
-        assert_eq!(
-            interaction.touch_policies,
-            [policy::user_verified().and_passphrase(); 3]
-        );
-        assert!(same_root(&root, &unlocked));
-    }
-
-    #[test]
-    fn backup_recipient_recovers_same_root_and_removal_is_authenticated() {
-        let application = ApplicationId::new("org.example.backup-test").unwrap();
-        let mut protector = KeyProtector::fake(application);
-        let mut interaction = TestInteraction::new(b"unused");
-        let (root, mut envelope, primary) = protector
-            .provision(
-                Enrollment::new("primary", policy::user_verified()).unwrap(),
-                &mut interaction,
-            )
-            .unwrap();
-        let backup = protector
-            .add_recipient(
-                &mut envelope,
-                &root,
-                Enrollment::new("backup", policy::user_verified()).unwrap(),
-                &mut interaction,
-            )
-            .unwrap();
-        let recovered = protector
-            .unlock(&envelope, backup, &mut interaction)
-            .unwrap();
-        assert!(same_root(&root, &recovered));
-        protector
-            .remove_recipient(&mut envelope, &root, primary)
+            .remove_recipient(&mut envelope, &root, first)
             .unwrap();
         assert_eq!(envelope.recipients().len(), 1);
-        assert_eq!(envelope.recipients()[0].id(), backup);
-    }
+        assert_eq!(envelope.recipients()[0].id(), second);
 
-    #[test]
-    fn wrong_root_cannot_mutate_envelope() {
-        let application = ApplicationId::new("org.example.wrong-root-test").unwrap();
-        let mut protector = KeyProtector::fake(application);
-        let mut interaction = TestInteraction::new(b"unused");
-        let (_root, mut envelope, _primary) = protector
-            .provision(
-                Enrollment::new("primary", policy::user_verified()).unwrap(),
-                &mut interaction,
-            )
-            .unwrap();
         let before = envelope.encode();
-        let wrong = RootKey::generate().unwrap();
-        let result = protector.add_recipient(
-            &mut envelope,
-            &wrong,
-            Enrollment::new("bad backup", policy::user_verified()).unwrap(),
-            &mut interaction,
-        );
-        assert!(matches!(result, Err(Error::WrongRootKey)));
+        let mut wrong = ScriptedInteraction::new(&[b"wrong"]);
+        assert!(matches!(
+            protector.unlock(&envelope, second, &mut wrong),
+            Err(Error::UnlockFailed)
+        ));
         assert_eq!(envelope.encode(), before);
     }
 
     #[test]
-    fn envelope_mac_tamper_converges_to_unlock_failed() {
-        let application = ApplicationId::new("org.example.mac-test").unwrap();
-        let mut protector = KeyProtector::fake(application);
-        let mut interaction = TestInteraction::new(b"unused");
-        let (_root, mut envelope, recipient) = protector
-            .provision(
-                Enrollment::new("primary", policy::user_verified()).unwrap(),
-                &mut interaction,
-            )
+    fn passphrase_rewrap_preserves_identity_root_and_old_complete_copy() {
+        let mut protector =
+            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
+        let mut create = ScriptedInteraction::new(&[b"old secret", b"old secret"]);
+        let (root, mut envelope, recipient) = protector
+            .create_root(enrollment("primary"), &mut create)
             .unwrap();
-        envelope.mac[0] ^= 1;
-        assert!(matches!(
-            protector.unlock(&envelope, recipient, &mut interaction),
-            Err(Error::UnlockFailed)
-        ));
-    }
+        let old_bytes = envelope.encode();
 
-    #[test]
-    fn outer_tamper_fails_before_passphrase_prompt() {
-        let application = ApplicationId::new("org.example.outer-tamper-test").unwrap();
-        let mut protector = KeyProtector::fake(application);
-        let mut interaction = TestInteraction::new(b"correct passphrase");
-        let (_root, mut envelope, recipient) = protector
-            .provision(
-                Enrollment::new("primary", policy::user_verified().and_passphrase()).unwrap(),
-                &mut interaction,
-            )
-            .unwrap();
-        assert_eq!(interaction.passphrase_requests, 2);
-        envelope.recipients[0].wrapped_key[0] ^= 1;
-        assert!(matches!(
-            protector.unlock(&envelope, recipient, &mut interaction),
-            Err(Error::UnlockFailed)
-        ));
-        assert_eq!(interaction.passphrase_requests, 2);
-    }
-
-    #[test]
-    fn wrong_passphrase_converges_to_unlock_failed() {
-        let application = ApplicationId::new("org.example.wrong-passphrase-test").unwrap();
-        let mut protector = KeyProtector::fake(application);
-        let mut interaction = TestInteraction::new(b"correct passphrase");
-        let (_root, envelope, recipient) = protector
-            .provision(
-                Enrollment::new("primary", policy::user_verified().and_passphrase()).unwrap(),
-                &mut interaction,
-            )
-            .unwrap();
-        interaction.passphrase = b"wrong passphrase".to_vec();
-        assert!(matches!(
-            protector.unlock(&envelope, recipient, &mut interaction),
-            Err(Error::UnlockFailed)
-        ));
-    }
-
-    #[test]
-    fn partial_recipient_rollback_fails_but_complete_old_envelope_remains_valid() {
-        let application = ApplicationId::new("org.example.rollback-test").unwrap();
-        let mut protector = KeyProtector::fake(application);
-        let mut interaction = TestInteraction::new(b"unused");
-        let (root, mut envelope, primary) = protector
-            .provision(
-                Enrollment::new("primary", policy::user_verified()).unwrap(),
-                &mut interaction,
-            )
-            .unwrap();
-        let backup = protector
-            .add_recipient(
-                &mut envelope,
-                &root,
-                Enrollment::new("backup", policy::user_verified()).unwrap(),
-                &mut interaction,
-            )
-            .unwrap();
-        let old_complete = envelope.clone();
-        let removed_record = envelope.find(primary).unwrap().clone();
+        crypto::reset_passphrase_derivations();
+        let mut rewrap = ScriptedInteraction::new(&[b"new secret", b"new secret"]);
         protector
-            .remove_recipient(&mut envelope, &root, primary)
+            .rewrap_passphrase(&mut envelope, &root, recipient, &mut rewrap)
             .unwrap();
+        assert_eq!(crypto::passphrase_derivations(), 1);
+        assert_ne!(envelope.encode(), old_bytes);
+        assert_eq!(envelope.recipients()[0].id(), recipient);
 
-        let mut spliced = envelope.clone();
-        spliced.recipients.push(removed_record);
-        spliced.recipients.sort_by_key(|record| record.id);
+        let mut open_new = ScriptedInteraction::new(&[b"new secret"]);
+        let recovered = protector
+            .unlock(&envelope, recipient, &mut open_new)
+            .unwrap();
+        assert!(roots_match(&root, &recovered));
+
+        let old_envelope = KeyEnvelope::decode(&old_bytes).unwrap();
+        let mut open_old = ScriptedInteraction::new(&[b"old secret"]);
+        let recovered_old = protector
+            .unlock(&old_envelope, recipient, &mut open_old)
+            .unwrap();
+        assert!(roots_match(&root, &recovered_old));
+
+        let mut obsolete = ScriptedInteraction::new(&[b"old secret"]);
         assert!(matches!(
-            protector.unlock(&spliced, backup, &mut interaction),
+            protector.unlock(&envelope, recipient, &mut obsolete),
             Err(Error::UnlockFailed)
         ));
-
-        let recovered = protector
-            .unlock(&old_complete, primary, &mut interaction)
-            .unwrap();
-        assert!(same_root(&root, &recovered));
     }
 
     #[test]
-    fn last_recipient_cannot_be_removed() {
-        let application = ApplicationId::new("org.example.last-recipient-test").unwrap();
-        let mut protector = KeyProtector::fake(application);
-        let mut interaction = TestInteraction::new(b"unused");
-        let (root, mut envelope, primary) = protector
-            .provision(
-                Enrollment::new("primary", policy::user_verified()).unwrap(),
-                &mut interaction,
-            )
+    fn explicit_cost_change_preserves_the_root_and_old_complete_copy() {
+        let mut protector =
+            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
+        let mut create = ScriptedInteraction::new(&[b"old", b"old"]);
+        let (root, mut current, recipient) = protector
+            .create_root(enrollment("primary"), &mut create)
             .unwrap();
-        assert!(matches!(
-            protector.remove_recipient(&mut envelope, &root, primary),
-            Err(Error::WouldRemoveLastRecipient)
-        ));
-    }
+        let old = current.clone();
+        let replacement = PassphraseParameters::new(65_536, 4, 2).unwrap();
 
-    #[test]
-    fn missing_recipient_causes_no_interaction() {
-        let application = ApplicationId::new("org.example.missing-recipient-test").unwrap();
-        let mut protector = KeyProtector::fake(application);
-        let mut interaction = TestInteraction::new(b"unused");
-        let (_root, envelope, _primary) = protector
-            .provision(
-                Enrollment::new("primary", policy::user_verified()).unwrap(),
-                &mut interaction,
+        let mut rewrap = ScriptedInteraction::new(&[b"new", b"new"]);
+        protector
+            .rewrap_passphrase_with_parameters(
+                &mut current,
+                &root,
+                recipient,
+                replacement,
+                &mut rewrap,
             )
             .unwrap();
-        let before = (
-            interaction.pin_requests,
-            interaction.touch_requests,
-            interaction.passphrase_requests,
+        assert_eq!(
+            current.recipients()[0].passphrase_parameters(),
+            Some(replacement)
         );
+
+        let mut open_old = ScriptedInteraction::new(&[b"old"]);
+        let old_root = protector.unlock(&old, recipient, &mut open_old).unwrap();
+        let mut open_new = ScriptedInteraction::new(&[b"new"]);
+        let new_root = protector
+            .unlock(&current, recipient, &mut open_new)
+            .unwrap();
+        assert!(roots_match(&root, &old_root));
+        assert!(roots_match(&root, &new_root));
+    }
+
+    #[test]
+    fn removal_does_not_invalidate_an_old_complete_copy() {
+        let mut protector =
+            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
+        let mut create = ScriptedInteraction::new(&[b"primary", b"primary"]);
+        let (root, mut current, _primary) = protector
+            .create_root(enrollment("primary"), &mut create)
+            .unwrap();
+        let mut add = ScriptedInteraction::new(&[b"removed", b"removed"]);
+        let removed = protector
+            .add_recipient(&mut current, &root, enrollment("removed"), &mut add)
+            .unwrap();
+        let old = current.clone();
+
+        protector
+            .remove_recipient(&mut current, &root, removed)
+            .unwrap();
+        let mut no_prompt = ScriptedInteraction::new(&[]);
         assert!(matches!(
-            protector.unlock(
-                &envelope,
-                RecipientId::from_bytes([0xff; 32]),
-                &mut interaction
-            ),
+            protector.unlock(&current, removed, &mut no_prompt),
             Err(Error::RecipientNotFound)
         ));
+        let mut open_old = ScriptedInteraction::new(&[b"removed"]);
+        let recovered = protector.unlock(&old, removed, &mut open_old).unwrap();
+        assert!(roots_match(&root, &recovered));
+    }
+
+    #[test]
+    fn mutation_failures_leave_the_exact_envelope_unchanged() {
+        let mut protector =
+            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
+        let mut create = ScriptedInteraction::new(&[b"primary", b"primary"]);
+        let (root, mut envelope, recipient) = protector
+            .create_root(enrollment("primary"), &mut create)
+            .unwrap();
+        let original = envelope.encode();
+
+        let wrong_root = RootKey::import([0x77; 32]);
+        let mut no_prompt = ScriptedInteraction::new(&[]);
+        assert!(matches!(
+            protector.add_recipient(
+                &mut envelope,
+                &wrong_root,
+                enrollment("secondary"),
+                &mut no_prompt
+            ),
+            Err(Error::EnvelopeAuthenticationFailed)
+        ));
+        assert!(no_prompt.events.is_empty());
+        assert_eq!(envelope.encode(), original);
+
+        crypto::reset_passphrase_derivations();
+        let mut mismatch = ScriptedInteraction::new(&[b"one", b"two"]);
+        assert!(matches!(
+            protector.add_recipient(&mut envelope, &root, enrollment("secondary"), &mut mismatch),
+            Err(Error::PassphraseConfirmationMismatch)
+        ));
+        assert_eq!(crypto::passphrase_derivations(), 0);
+        assert_eq!(envelope.encode(), original);
+
+        assert!(matches!(
+            protector.remove_recipient(&mut envelope, &root, recipient),
+            Err(Error::WouldRemoveLastRecipient)
+        ));
+        assert_eq!(envelope.encode(), original);
+
+        let mut unsupported = UnsupportedInteraction;
+        assert!(matches!(
+            protector.add_recipient(
+                &mut envelope,
+                &root,
+                enrollment("unsupported"),
+                &mut unsupported,
+            ),
+            Err(Error::Interaction(InteractionError::Unsupported))
+        ));
+        assert_eq!(envelope.encode(), original);
+    }
+
+    #[test]
+    fn final_recipient_removal_fails_for_every_structural_suite() {
+        let cases = [
+            Enrollment::passphrase_with_parameters("passphrase", test_parameters()).unwrap(),
+            Enrollment::fido("fido", FidoPolicy::Presence).unwrap(),
+            Enrollment::fido_and_passphrase_with_parameters(
+                "combined",
+                FidoPolicy::Presence,
+                test_parameters(),
+            )
+            .unwrap(),
+        ];
+
+        for enrollment in cases {
+            let mut protector = KeyProtector::fake(application());
+            let mut create = ScriptedInteraction::new(&[b"secret", b"secret"]);
+            let (root, mut envelope, recipient) =
+                protector.create_root(enrollment, &mut create).unwrap();
+            let original = envelope.encode();
+            assert!(matches!(
+                protector.remove_recipient(&mut envelope, &root, recipient),
+                Err(Error::WouldRemoveLastRecipient)
+            ));
+            assert_eq!(envelope.encode(), original);
+        }
+    }
+
+    #[test]
+    fn allocation_and_staged_validation_failures_never_publish() {
+        let mut protector =
+            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
+        let mut create = ScriptedInteraction::new(&[b"primary", b"primary"]);
+        let (root, mut envelope, _) = protector
+            .create_root(enrollment("primary"), &mut create)
+            .unwrap();
+        let original = envelope.encode();
+
+        crypto::fail_next_argon2_allocation();
+        let mut allocation = ScriptedInteraction::new(&[b"new", b"new"]);
+        assert!(matches!(
+            protector.add_recipient(
+                &mut envelope,
+                &root,
+                enrollment("allocation"),
+                &mut allocation,
+            ),
+            Err(Error::KdfResourceUnavailable)
+        ));
+        assert_eq!(envelope.encode(), original);
+
+        for (fault, expected) in [
+            (StagedFault::CanonicalDecode, Error::InvalidEnvelope),
+            (StagedFault::RootMismatch, Error::UnlockFailed),
+            (StagedFault::EnvelopeMac, Error::UnlockFailed),
+        ] {
+            fail_next_staged_validation(fault);
+            let mut interaction = ScriptedInteraction::new(&[b"new", b"new"]);
+            let result = protector.add_recipient(
+                &mut envelope,
+                &root,
+                enrollment("staged failure"),
+                &mut interaction,
+            );
+            assert_eq!(
+                std::mem::discriminant(&result.unwrap_err()),
+                std::mem::discriminant(&expected)
+            );
+            assert_eq!(envelope.encode(), original);
+        }
+    }
+
+    #[test]
+    fn selected_hostile_work_is_refused_before_prompt_or_derivation() {
+        let mut creator =
+            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
+        let mut interaction = ScriptedInteraction::new(&[b"secret", b"secret"]);
+        let (_root, envelope, recipient) = creator
+            .create_root(enrollment("primary"), &mut interaction)
+            .unwrap();
+
+        let mut hostile = envelope.clone();
+        if let RecipientRecord::Passphrase(record) = &mut hostile.recipients[0] {
+            record.kdf.parameters = PassphraseParameters::new(262_144, 6, 4).unwrap();
+        } else {
+            panic!("test envelope must contain a passphrase recipient");
+        }
+        let hostile = KeyEnvelope::decode(&hostile.encode()).unwrap();
+        let mut protector = KeyProtector::new(application());
+        let mut no_prompt = ScriptedInteraction::new(&[]);
+        crypto::reset_passphrase_derivations();
+        assert!(matches!(
+            protector.unlock(&hostile, recipient, &mut no_prompt),
+            Err(Error::PassphraseLimitExceeded)
+        ));
+        assert!(no_prompt.events.is_empty());
+        assert_eq!(crypto::passphrase_derivations(), 0);
+    }
+
+    #[test]
+    fn unselected_record_tampering_converges_on_unlock_failed_after_one_kdf() {
+        let mut protector =
+            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
+        let mut create = ScriptedInteraction::new(&[b"first", b"first"]);
+        let (root, mut envelope, first) = protector
+            .create_root(enrollment("first"), &mut create)
+            .unwrap();
+        let mut add = ScriptedInteraction::new(&[b"second", b"second"]);
+        protector
+            .add_recipient(&mut envelope, &root, enrollment("second"), &mut add)
+            .unwrap();
+
+        let unselected = envelope
+            .recipients
+            .iter_mut()
+            .find(|record| record.id() != first)
+            .unwrap();
+        if let RecipientRecord::Passphrase(record) = unselected {
+            record.label = "changed".to_owned();
+        }
+        let tampered = KeyEnvelope::decode(&envelope.encode()).unwrap();
+
+        crypto::reset_passphrase_derivations();
+        let mut open = ScriptedInteraction::new(&[b"first"]);
+        assert!(matches!(
+            protector.unlock(&tampered, first, &mut open),
+            Err(Error::UnlockFailed)
+        ));
+        assert_eq!(crypto::passphrase_derivations(), 1);
+    }
+
+    #[test]
+    fn mutation_authorization_and_cancellation_fail_without_publication() {
+        let mut protector =
+            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
+        let mut create = ScriptedInteraction::new(&[b"first", b"first"]);
+        let (root, mut envelope, first) = protector
+            .create_root(enrollment("first"), &mut create)
+            .unwrap();
+        let mut add = ScriptedInteraction::new(&[b"second", b"second"]);
+        let second = protector
+            .add_recipient(&mut envelope, &root, enrollment("second"), &mut add)
+            .unwrap();
+        let original = envelope.encode();
+        let wrong_root = RootKey::import([0x99; 32]);
+
+        assert!(matches!(
+            protector.remove_recipient(&mut envelope, &wrong_root, second),
+            Err(Error::EnvelopeAuthenticationFailed)
+        ));
+        assert_eq!(envelope.encode(), original);
+
+        let mut no_prompt = ScriptedInteraction::new(&[]);
+        assert!(matches!(
+            protector.rewrap_passphrase(&mut envelope, &wrong_root, first, &mut no_prompt),
+            Err(Error::EnvelopeAuthenticationFailed)
+        ));
+        assert!(no_prompt.events.is_empty());
+        assert_eq!(envelope.encode(), original);
+
+        let missing = RecipientId::from_bytes([0xff; 32]);
+        assert!(matches!(
+            protector.remove_recipient(&mut envelope, &root, missing),
+            Err(Error::RecipientNotFound)
+        ));
+        assert_eq!(envelope.encode(), original);
+
+        let mut cancelled = CancelledInteraction;
+        assert!(matches!(
+            protector.add_recipient(
+                &mut envelope,
+                &root,
+                enrollment("cancelled"),
+                &mut cancelled
+            ),
+            Err(Error::Interaction(InteractionError::Cancelled))
+        ));
+        assert_eq!(envelope.encode(), original);
+
+        let other_application = ApplicationId::new("org.example.other-application").unwrap();
+        let mut other = KeyProtector::new(other_application);
+        assert!(matches!(
+            other.unlock(&envelope, first, &mut no_prompt),
+            Err(Error::ApplicationMismatch)
+        ));
+        assert!(no_prompt.events.is_empty());
+    }
+
+    #[test]
+    fn rewrap_limit_refusal_precedes_interaction() {
+        let mut protector =
+            KeyProtector::new(application()).with_passphrase_limits(PassphraseLimits::PROTOCOL_MAX);
+        let mut create = ScriptedInteraction::new(&[b"secret", b"secret"]);
+        let (root, mut envelope, recipient) = protector
+            .create_root(enrollment("primary"), &mut create)
+            .unwrap();
+        let original = envelope.encode();
+        let expensive = PassphraseParameters::new(262_144, 6, 4).unwrap();
+        let mut default_limits = KeyProtector::new(application());
+        let mut no_prompt = ScriptedInteraction::new(&[]);
+        assert!(matches!(
+            default_limits.rewrap_passphrase_with_parameters(
+                &mut envelope,
+                &root,
+                recipient,
+                expensive,
+                &mut no_prompt
+            ),
+            Err(Error::PassphraseLimitExceeded)
+        ));
+        assert!(no_prompt.events.is_empty());
+        assert_eq!(envelope.encode(), original);
+    }
+
+    #[test]
+    fn limit_and_backend_refusals_precede_interaction() {
+        let expensive = PassphraseParameters::new(262_144, 6, 4).unwrap();
+        let mut protector = KeyProtector::new(application());
+        let mut interaction = ScriptedInteraction::new(&[]);
+        assert!(matches!(
+            protector.create_root(
+                Enrollment::passphrase_with_parameters("expensive", expensive).unwrap(),
+                &mut interaction
+            ),
+            Err(Error::PassphraseLimitExceeded)
+        ));
+        assert!(interaction.events.is_empty());
+
+        assert!(matches!(
+            protector.create_root(
+                Enrollment::fido("key", FidoPolicy::Presence).unwrap(),
+                &mut interaction
+            ),
+            Err(Error::FidoSupportUnavailable)
+        ));
+        assert!(interaction.events.is_empty());
+    }
+
+    #[test]
+    fn combined_prompts_for_fido_before_passphrase() {
+        let mut protector = KeyProtector::fake(application());
+        let enrollment = Enrollment::fido_and_passphrase_with_parameters(
+            "combined",
+            FidoPolicy::Presence,
+            test_parameters(),
+        )
+        .unwrap();
+        let mut create = ScriptedInteraction::new(&[b"secret", b"secret"]);
+        let (_root, envelope, recipient) = protector.create_root(enrollment, &mut create).unwrap();
         assert_eq!(
-            before,
-            (
-                interaction.pin_requests,
-                interaction.touch_requests,
-                interaction.passphrase_requests,
-            )
+            create.events,
+            [
+                "pin",
+                "enrollment touch",
+                "assertion touch",
+                "new passphrase",
+                "confirm passphrase"
+            ]
         );
+
+        let mut open = ScriptedInteraction::new(&[b"secret"]);
+        protector.unlock(&envelope, recipient, &mut open).unwrap();
+        assert_eq!(open.events, ["assertion touch", "unlock passphrase"]);
+        let counters = protector.fake_backend_mut().counters();
+        assert_eq!(counters.enrollments, 1);
+        assert_eq!(counters.assertions, 2);
     }
 
     #[test]
-    fn passphrase_confirmation_failure_is_transactional() {
-        let application = ApplicationId::new("org.example.confirmation-test").unwrap();
-        let mut protector = KeyProtector::fake(application);
-        let mut interaction = TestInteraction::new(b"correct passphrase");
-        let (root, mut envelope, _primary) = protector
-            .provision(
-                Enrollment::new("primary", policy::user_verified()).unwrap(),
-                &mut interaction,
-            )
-            .unwrap();
-        let before = envelope.encode();
-        interaction.confirmation = Some(b"different passphrase".to_vec());
-        assert!(matches!(
-            protector.add_recipient(
-                &mut envelope,
-                &root,
-                Enrollment::new("backup", policy::user_verified().and_passphrase()).unwrap(),
-                &mut interaction,
-            ),
-            Err(Error::InvalidPassphrase)
-        ));
-        assert_eq!(envelope.encode(), before);
+    fn combined_context_and_outer_ciphertext_fail_before_passphrase() {
+        type Mutation = fn(&mut FidoAndPassphraseRecipient);
+
+        let mut protector = KeyProtector::fake(application());
+        let enrollment = Enrollment::fido_and_passphrase_with_parameters(
+            "combined",
+            FidoPolicy::Presence,
+            test_parameters(),
+        )
+        .unwrap();
+        let mut create = ScriptedInteraction::new(&[b"secret", b"secret"]);
+        let (_root, envelope, recipient) = protector.create_root(enrollment, &mut create).unwrap();
+
+        let cases: [(&str, Mutation); 2] = [
+            ("altered PRF input", |record| record.prf_nonce[0] ^= 1),
+            ("altered outer ciphertext", |record| {
+                record.wrapped_root[0] ^= 1;
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut altered = envelope.clone();
+            let RecipientRecord::FidoAndPassphrase(record) = &mut altered.recipients[0] else {
+                panic!("fixture must contain a combined recipient");
+            };
+            mutate(record);
+
+            crypto::reset_passphrase_derivations();
+            let before = protector.fake_backend_mut().counters();
+            let mut open = ScriptedInteraction::new(&[]);
+            assert!(
+                matches!(
+                    protector.unlock(&altered, recipient, &mut open),
+                    Err(Error::UnlockFailed)
+                ),
+                "{name}"
+            );
+            assert_eq!(open.events, ["assertion touch"], "{name}");
+            assert_eq!(crypto::passphrase_derivations(), 0, "{name}");
+            let after = protector.fake_backend_mut().counters();
+            assert_eq!(after.assertions, before.assertions + 1, "{name}");
+        }
     }
 
     #[test]
-    fn cancelled_proof_assertion_is_transactional() {
-        let application = ApplicationId::new("org.example.cancelled-proof-test").unwrap();
-        let mut protector = KeyProtector::fake(application);
-        let mut interaction = TestInteraction::new(b"unused");
-        let (root, mut envelope, _primary) = protector
-            .provision(
-                Enrollment::new("primary", policy::user_verified()).unwrap(),
-                &mut interaction,
-            )
-            .unwrap();
-        let before = envelope.encode();
-        interaction.cancel_on_touch = Some(interaction.touch_requests + 2);
+    fn fido_only_routes_never_derive_a_passphrase() {
+        for policy in [FidoPolicy::Presence, FidoPolicy::UserVerification] {
+            crypto::reset_passphrase_derivations();
+            let mut protector = KeyProtector::fake(application());
+            let mut create = ScriptedInteraction::new(&[]);
+            let (root, envelope, recipient) = protector
+                .create_root(
+                    Enrollment::fido("security key", policy).unwrap(),
+                    &mut create,
+                )
+                .unwrap();
+            assert_eq!(crypto::passphrase_derivations(), 0);
+
+            let mut open = ScriptedInteraction::new(&[]);
+            let recovered = protector.unlock(&envelope, recipient, &mut open).unwrap();
+            assert!(roots_match(&root, &recovered));
+            assert_eq!(crypto::passphrase_derivations(), 0);
+            assert!(!open.events.iter().any(|event| event.contains("passphrase")));
+        }
+    }
+
+    #[test]
+    fn failed_combined_rewrap_is_transactional_and_skips_passphrase() {
+        use crate::backend::fake::FailurePoint;
+
+        let mut protector = KeyProtector::fake(application());
+        let enrollment = Enrollment::fido_and_passphrase_with_parameters(
+            "combined",
+            FidoPolicy::Presence,
+            test_parameters(),
+        )
+        .unwrap();
+        let mut create = ScriptedInteraction::new(&[b"old", b"old"]);
+        let (root, mut envelope, recipient) =
+            protector.create_root(enrollment, &mut create).unwrap();
+        let original = envelope.encode();
+        let before = protector.fake_backend_mut().counters();
+        protector
+            .fake_backend_mut()
+            .fail_next(FailurePoint::Assertion);
+
+        let mut rewrap = ScriptedInteraction::new(&[]);
         assert!(matches!(
-            protector.add_recipient(
-                &mut envelope,
-                &root,
-                Enrollment::new("backup", policy::user_verified()).unwrap(),
-                &mut interaction,
-            ),
-            Err(Error::Cancelled)
+            protector.rewrap_passphrase(&mut envelope, &root, recipient, &mut rewrap),
+            Err(Error::AuthenticatorOperationFailed)
         ));
-        assert_eq!(envelope.encode(), before);
+        assert_eq!(envelope.encode(), original);
+        assert_eq!(rewrap.events, ["assertion touch"]);
+        let after = protector.fake_backend_mut().counters();
+        assert_eq!(after.enrollments, before.enrollments);
+        assert_eq!(after.assertions, before.assertions + 1);
+    }
+
+    #[test]
+    fn combined_rewrap_rejects_bad_flags_and_wrong_credential_transactionally() {
+        use crate::backend::fake::FailurePoint;
+
+        let mut protector = KeyProtector::fake(application());
+        let enrollment = Enrollment::fido_and_passphrase_with_parameters(
+            "combined",
+            FidoPolicy::Presence,
+            test_parameters(),
+        )
+        .unwrap();
+        let mut create = ScriptedInteraction::new(&[b"old", b"old"]);
+        let (root, mut envelope, recipient) =
+            protector.create_root(enrollment, &mut create).unwrap();
+        let original = envelope.encode();
+
+        protector
+            .fake_backend_mut()
+            .fail_next(FailurePoint::VerifiedResponse);
+        let mut bad_flags = ScriptedInteraction::new(&[]);
+        assert!(matches!(
+            protector.rewrap_passphrase(&mut envelope, &root, recipient, &mut bad_flags),
+            Err(Error::AuthenticatorResponseInvalid)
+        ));
+        assert_eq!(bad_flags.events, ["assertion touch"]);
+        assert_eq!(envelope.encode(), original);
+
+        let credential_id = match envelope.find(recipient).unwrap() {
+            RecipientRecord::FidoAndPassphrase(record) => record.credential_id.clone(),
+            _ => panic!("fixture must contain a combined recipient"),
+        };
+        protector
+            .fake_backend_mut()
+            .forget_credential(&credential_id);
+        let mut wrong_credential = ScriptedInteraction::new(&[]);
+        assert!(matches!(
+            protector.rewrap_passphrase(&mut envelope, &root, recipient, &mut wrong_credential,),
+            Err(Error::AuthenticatorOperationFailed)
+        ));
+        assert_eq!(wrong_credential.events, ["assertion touch"]);
+        assert_eq!(envelope.encode(), original);
     }
 }

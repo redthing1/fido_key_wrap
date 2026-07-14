@@ -2,7 +2,7 @@ use std::{
     fmt::Write as FmtWrite,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -23,16 +23,29 @@ impl NoteLock {
         lock_name.push(file_name);
         lock_name.push(".fkw-lock");
         let lock_path = parent.join(lock_name);
-        let file = OpenOptions::new()
+        let file = match OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create_new(true)
             .mode(PRIVATE_MODE)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&lock_path)
-            .context("failed to open the note lock")?;
+        {
+            Ok(file) => {
+                file.set_permissions(fs::Permissions::from_mode(PRIVATE_MODE))
+                    .context("failed to set private note-lock permissions")?;
+                file
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&lock_path)
+                .context("failed to open the note lock")?,
+            Err(error) => return Err(error).context("failed to create the note lock"),
+        };
         let metadata = file.metadata().context("failed to inspect the note lock")?;
-        if !metadata.file_type().is_file() || metadata.mode() & 0o777 != PRIVATE_MODE {
+        if !metadata.file_type().is_file() || metadata.mode() & 0o7777 != PRIVATE_MODE {
             bail!("the note lock must be a mode-0600 regular file");
         }
         <File as fs2::FileExt>::try_lock_exclusive(&file)
@@ -59,7 +72,7 @@ pub(crate) fn read_private(path: &Path) -> Result<Vec<u8>> {
     if !metadata.file_type().is_file() {
         bail!("the note path is not a regular file");
     }
-    if metadata.mode() & 0o777 != PRIVATE_MODE {
+    if metadata.mode() & 0o7777 != PRIVATE_MODE {
         bail!("the note file must have mode 0600");
     }
     if metadata.len() > MAX_FILE_BYTES {
@@ -132,6 +145,8 @@ fn write_temporary(destination: &Path, bytes: &[u8]) -> Result<PathBuf> {
         {
             Ok(mut file) => {
                 let result = (|| {
+                    file.set_permissions(fs::Permissions::from_mode(PRIVATE_MODE))
+                        .context("failed to set private temporary-note permissions")?;
                     file.write_all(bytes)
                         .context("failed to write the temporary note")?;
                     file.sync_all().context("failed to sync the temporary note")
@@ -165,7 +180,7 @@ fn ensure_size(bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::symlink;
 
     use super::*;
 
@@ -200,14 +215,19 @@ mod tests {
         let note = directory.0.join("note.fkw");
         create_atomic(&note, b"first").unwrap();
         assert_eq!(read_private(&note).unwrap(), b"first");
-        assert_eq!(fs::metadata(&note).unwrap().mode() & 0o777, PRIVATE_MODE);
+        assert_eq!(fs::metadata(&note).unwrap().mode() & 0o7777, PRIVATE_MODE);
 
         assert!(create_atomic(&note, b"must not replace").is_err());
         assert_eq!(read_private(&note).unwrap(), b"first");
+        assert!(fs::read_dir(&directory.0).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            !(name.starts_with(".fkw-") && name.ends_with(".tmp"))
+        }));
 
         replace_atomic(&note, b"second").unwrap();
         assert_eq!(read_private(&note).unwrap(), b"second");
-        assert_eq!(fs::metadata(&note).unwrap().mode() & 0o777, PRIVATE_MODE);
+        assert_eq!(fs::metadata(&note).unwrap().mode() & 0o7777, PRIVATE_MODE);
     }
 
     #[test]
@@ -222,11 +242,19 @@ mod tests {
 
         fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read_private(&target).is_err());
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o4600)).unwrap();
+        assert!(read_private(&target).is_err());
 
         let note = directory.0.join("note.fkw");
         let lock = directory.0.join(".note.fkw.fkw-lock");
         symlink(&target, &lock).unwrap();
         assert!(NoteLock::acquire(&note).is_err());
+
+        let other_note = directory.0.join("other.fkw");
+        let other_lock = directory.0.join(".other.fkw.fkw-lock");
+        fs::write(&other_lock, []).unwrap();
+        fs::set_permissions(&other_lock, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(NoteLock::acquire(&other_note).is_err());
     }
 
     #[test]

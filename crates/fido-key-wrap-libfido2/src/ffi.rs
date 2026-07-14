@@ -73,6 +73,10 @@ pub const COSE_ES256: c_int = -7;
 
 pub const AUTHDATA_UP: u8 = 0x01;
 pub const AUTHDATA_UV: u8 = 0x04;
+// CTAP 2.2/WebAuthn backup flags. libfido2 1.17 exposes the complete signed
+// flags byte but does not provide public constants for these two bits.
+pub const AUTHDATA_BE: u8 = 0x08;
+pub const AUTHDATA_BS: u8 = 0x10;
 
 unsafe extern "C" {
     pub fn fido_init(flags: c_int);
@@ -179,6 +183,22 @@ unsafe extern "C" {
     pub fn fido_assert_set_clientdata_hash(
         assertion: *mut fido_assert_t,
         hash: *const c_uchar,
+        len: usize,
+    ) -> c_int;
+    #[cfg(test)]
+    pub fn fido_assert_set_count(assertion: *mut fido_assert_t, count: usize) -> c_int;
+    #[cfg(test)]
+    pub fn fido_assert_set_authdata_raw(
+        assertion: *mut fido_assert_t,
+        index: usize,
+        authdata: *const c_uchar,
+        len: usize,
+    ) -> c_int;
+    #[cfg(test)]
+    pub fn fido_assert_set_sig(
+        assertion: *mut fido_assert_t,
+        index: usize,
+        signature: *const c_uchar,
         len: usize,
     ) -> c_int;
     pub fn fido_assert_allow_cred(

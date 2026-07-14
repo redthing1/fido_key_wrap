@@ -1,195 +1,193 @@
 # demo application
 
-`fkw` protects one encrypted note with one or more fido2 credentials.
+`fkw` is a small encrypted-note application. it demonstrates all five recovery
+policies, recipient changes, passphrase changes, and root rotation while keeping
+application encryption outside the library.
 
-the build requires `libfido2` and `pkg-config`. a `libfido2` 1.x release at
-version 1.17 or newer must be visible to `pkg-config` on macos or linux.
+passphrases and pins are read from the terminal with echo disabled.
 
-install the demo from the repository:
+build the passphrase-only demo in release mode:
 
 ```text
-cargo install --path crates/fkw-demo --locked
+cargo build -p fkw-demo --release --no-default-features --locked
+target/release/fkw --help
 ```
+
+the examples below use `fkw` for the resulting executable. this build supports
+all passphrase operations and requires no libfido2 installation or security
+key.
 
 ## first note
 
-inspect the connected authenticators without requesting a pin or touch:
+create a passphrase-protected note:
 
 ```text
+printf 'a private note\n' | fkw new note.fkd -a application-passphrase
+```
+
+open it:
+
+```text
+fkw open note.fkd
+```
+
+plaintext travels only through standard input and standard output. redirected
+or recorded streams may retain it.
+
+multiline input works through an ordinary pipe:
+
+```text
+fkw new note.fkd -a application-passphrase <<'note'
+first line
+second line
+note
+```
+
+## access policies
+
+security-key routes require exactly libfido2 1.17.0 through `pkg-config` on
+macos or linux:
+
+```text
+pkg-config --exact-version=1.17.0 libfido2
+cargo build -p fkw-demo --release --locked
 fkw check
 ```
 
-create a note:
+`check` inspects authenticator capabilities without requesting a pin or touch
+or creating a credential.
+
+`--access` accepts exactly:
 
 ```text
-fkw new note.fkw
+application-passphrase
+fido-presence
+fido-user-verification
+fido-presence-plus-passphrase
+fido-user-verification-plus-passphrase
 ```
 
-enter one line at the `note (input hidden):` prompt. `fkw` creates a
-non-discoverable fido2 credential, verifies a signed assertion carrying its prf
-output, and constructs the recipient. the default policy requires the fido pin
-and a touch for each operation.
-
-open the note later:
+examples:
 
 ```text
-fkw open note.fkw
+printf 'a private note\n' | fkw new note.fkd -a fido-presence
+printf 'a private note\n' | fkw new note.fkd -a fido-user-verification-plus-passphrase
 ```
 
-the root key is returned only after the selected recipient and the complete key
-envelope have been authenticated. the note ciphertext is then authenticated and
-decrypted.
+fido recipient creation performs two ceremonies: credential enrollment, then a
+fresh assertion that verifies the new recovery route before the note is saved.
+enrollment requires the security-key pin and a touch. the assertion follows the
+recipient policy: presence requires a touch, while user verification requires
+the pin and a touch. combined policies authenticate the security-key layer
+before asking for the application passphrase.
 
-`fkw open` writes the plaintext note to standard output. terminal scrollback,
-session recording, logging, or output redirection can retain it. redirecting the
-output creates a separate plaintext file whose permissions are controlled by the
-shell and operating system.
+the application passphrase and security-key pin are different factors.
 
-## input
+## recipients
 
-read a note from a file:
+list recovery routes:
 
 ```text
-fkw new note.fkw -i note.txt
+fkw recipients note.fkd
+fkw recipients note.fkd --details
 ```
 
-the source file remains plaintext and must be protected or removed separately.
+the detailed form includes canonical recipient ids and recorded argon2 work.
+this metadata is structurally valid but unauthenticated until the note is
+opened.
 
-read multiline input from the terminal with `-i -`; this input is visible.
-finish with end-of-file (`control-d` on macos and linux):
+when several routes exist, a command asks which one to use. select one directly
+with `--recipient` for `open` or `--using` for a mutation:
 
 ```text
-fkw new note.fkw -i -
-first line
-second line
-<control-d>
+fkw open note.fkd --recipient primary
+fkw open note.fkd --recipient 2f7a3c91
 ```
 
-the note is never accepted as a command-line argument, where it could be
-retained in shell history or process listings.
+a selector may be a unique label, full id, or unambiguous id prefix. labels are
+presentation names, not physical-device identities.
 
-## recipient policies
+## adding a recovery route
 
-pin and touch are the default. a recipient can instead require touch with
-user verification absent:
+add an alternative route after unlocking the current note:
 
 ```text
-fkw new note.fkw --touch-only
+fkw add-recipient note.fkd -a fido-user-verification -l backup -u primary
 ```
 
-credential creation still requires the pin. later assertions for this recipient
-require signed `up=1, uv=0`. this policy is appropriate only when possession and
-a touch are sufficient.
+the library verifies the new route before updating the note. adding the first
+passphrase-only route to an envelope that does not already contain one requires
+confirmation because copied note files then permit offline passphrase guessing
+through that alternative route.
 
-add an application passphrase with `-p`:
+## removing a route
 
 ```text
-fkw new note.fkw -p
+fkw remove-recipient note.fkd backup -u primary
 ```
 
-the application passphrase is separate from the fido pin. both are required to
-recover the root key through this recipient.
+the last route cannot be removed. an old complete file retains the removed
+route and remains usable.
 
-the options can be combined:
+removal does not contact or delete the removed credential. the command first
+unlocks through `--using`, which may itself be a security-key route.
+
+## changing a passphrase
 
 ```text
-fkw new note.fkw -t -p
+fkw change-passphrase note.fkd primary -u primary
 ```
 
-## backup recipient
+this works for passphrase-only and combined recipients. it preserves the root,
+recipient id, label, and any fido credential and policy while replacing the
+passphrase protection. a combined recipient checks the security key before
+requesting the new passphrase. old complete files retain the old passphrase.
 
-add a backup recipient with label `backup`:
+the command first unlocks through `--using`. when that authorizer and the
+recipient being changed both use fido, each route requires its own assertion.
+
+## argon2 parameters
+
+passphrase-bearing routes use the desktop profile by default. an explicit
+profile supplies all three values together:
 
 ```text
-fkw add-key note.fkw backup
+fkw new note.fkd -a application-passphrase --memory-mib 256 --passes 3 --lanes 4
 ```
 
-labels contain 1 to 32 lowercase letters, numbers, or hyphens. a label must
-begin and end with a letter or number.
+the same options are available when adding a passphrase-bearing recipient,
+changing a passphrase, or rotating the root.
 
-the command first unlocks the root key through the current recipient. it then
-pauses so that the current authenticator can be unplugged and the backup
-connected. the backup credential is created, its signed prf assertion is
-verified, and the staged envelope is unlocked through the new recipient before
-the file is replaced. under the default policy, these three backup operations
-each request its pin and touch.
-an application passphrase is entered and confirmed during construction, then
-entered once more for the final unlock.
+the demo accepts the desktop profile and lighter format-1 profiles.
 
-store the backup authenticator separately. `fkw` proves that each credential
-works, but cannot prove that two recipients belong to different physical
-authenticators.
-
-the same policy options apply to a backup:
+## rotating the root
 
 ```text
-fkw add-key note.fkw backup -t
-fkw add-key note.fkw backup -p
+fkw rotate-root note.fkd -a fido-user-verification-plus-passphrase -u primary
 ```
 
-## choosing a recipient
+root rotation replaces every current route with one new route and re-encrypts
+the note under a new random root. it requires confirmation unless `--yes` is
+supplied. the library verifies the replacement route, and the staged note is
+decrypted and compared before it replaces the current file.
 
-when several recipients can recover the root key, `fkw` presents a numbered
-choice. a recipient can also be selected by label:
+old complete files remain independently usable. rotation prevents them from
+opening data encrypted under the new root; it cannot erase or invalidate those
+old copies.
 
-```text
-fkw open note.fkw -k backup
-```
+## file security
 
-this avoids the numbered choice. fido and passphrase interaction is still
-required by the selected policy.
+the `.fkd` file contains the key envelope, a random note nonce, and the
+authenticated ciphertext. the note key is derived from the root with
+hkdf-sha-256. aes-256-gcm authenticates the exact envelope bytes as associated
+data, so an envelope cannot be exchanged without invalidating the note.
 
-list the recipient labels and policies:
+recipient changes re-encrypt the note and replace the file atomically. note and
+lock files must be mode `0600` regular files; symbolic links are rejected. the
+[demo format](demo-format.md) specifies the container and update procedure.
 
-```text
-fkw keys note.fkw
-```
+the security key alone is not a backup: a non-discoverable credential cannot
+recover the envelope, wrapped root, or note ciphertext. back up the complete
+`.fkd` file together with access to at least one working recovery route.
 
-recipient ids are public but hidden from normal output. show them when needed:
-
-```text
-fkw keys note.fkw --details
-```
-
-`-k` accepts either a recipient label or `id:` followed by a unique recipient-id
-prefix of at least eight hexadecimal characters:
-
-```text
-fkw open note.fkw -k id:e499e42d
-```
-
-a recipient id identifies one envelope record. it is not a physical-device id.
-labels and policies are unauthenticated display data until the root key is
-recovered and the envelope mac is verified.
-
-## removing a recipient
-
-```text
-fkw remove-key note.fkw backup
-```
-
-the final recipient cannot be removed. removal updates the current file, but an
-older complete copy retains its valid envelope mac and remains recoverable
-through the removed recipient.
-
-## the note file
-
-the `.fkw` file contains the encrypted note and its key envelope. each envelope
-recipient stores the public credential material, policy, protocol inputs, and
-wrapped root key needed for recovery. the authenticator cannot recover the note
-without this file, so it must be backed up.
-
-files are created with mode `0600`. updates use an advisory lock and atomic
-same-directory replacement. a symbolic link in the final path component is
-rejected. use `chmod 600 note.fkw` to correct an overly permissive file before
-opening it.
-
-the adjacent lock is named `.<file-name>.fkw-lock`. when no `fkw` process is
-using the note, the note and lock can be deleted together.
-
-the non-discoverable credentials created by `fkw` cannot be enumerated and
-deleted individually through ordinary authenticator management. deleting the
-final copy of the note file loses the credential ids and wrapped root even when
-the physical authenticator remains.
-
-see the [security model](security.md) for the guarantees and limitations.
+see the [security model](security.md) for the library guarantees.

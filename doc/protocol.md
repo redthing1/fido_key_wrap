@@ -1,306 +1,332 @@
 # protocol
 
-this document specifies the version 1 envelope and key-wrapping protocol.
+format 1 combines fido primitives with project-defined transcripts, wrapping
+layers, and an envelope format. it is not a standardized fido key-wrapping
+protocol. all algorithms, codes, field order, and limits are fixed.
 
 ## notation
 
-- `||` is byte concatenation
+- `||` means byte concatenation
 - `u32be(n)` is an unsigned 32-bit integer in network byte order
-- `sha256`, `hmac-sha-256`, and `hkdf-sha-256` follow their standard definitions
-- `aes-256-gcm` uses a 12-byte nonce and appends a 16-byte tag to the ciphertext
-- `empty` is a zero-length byte string
+- `sha256`, `hmac-sha-256`, and `hkdf-sha-256` have their standard meanings
+- `aead(k, n, p, a)` is aes-256-gcm encryption with key `k`, 12-byte nonce `n`,
+  plaintext `p`, associated data `a`, and an appended 16-byte tag
+- `argon2id(p, s, m, t, q)` uses version `0x13`, passphrase `p`, salt `s`,
+  memory in kibibytes `m`, passes `t`, lanes `q`, and 32 output bytes
 
-`t(a, b, ...)` is the following byte encoding:
+transcripts use length-prefixed framing:
 
 ```text
-u32be(field count) ||
-u32be(length of a) || a ||
-u32be(length of b) || b ||
-...
+t(a, b, ...) =
+  u32be(field_count) ||
+  u32be(len(a)) || a ||
+  u32be(len(b)) || b ||
+  ...
 ```
 
-transcript framing uses `u32be` for its field count and lengths. protocol codes
-supplied as fields are one byte. strings are utf-8 bytes without a terminator.
+one-byte protocol codes are encoded as one-byte transcript fields. argon2
+memory and pass counts are four-byte big-endian transcript fields. a transcript
+contains at most 32 fields, and its field and total lengths are checked before
+allocation.
 
 ## codes
 
-| field | name | code |
+| value | meaning | code |
 | --- | --- | --- |
-| format | version 1 | `1` |
-| suite | version 1 suite | `1` |
-| token policy | presence | `1` |
-| token policy | user-verified | `2` |
-| additional factor | none | `0` |
-| additional factor | passphrase | `1` |
-| credential protection | uv optional with credential id | `2` |
-| credential protection | uv required | `3` |
-| passphrase suite | argon2id | `1` |
+| format | format 1 | `1` |
+| suite | passphrase | `1` |
+| suite | fido | `2` |
+| suite | fido and passphrase | `3` |
+| fido policy | presence | `1` |
+| fido policy | user verification | `2` |
+| kdf | argon2id | `1` |
 
-presence recipients use credential-protection code `2`. user-verified
-recipients use code `3`. every unlisted code is rejected.
+all other codes are rejected.
+
+## fixed domains
+
+```text
+fido_key_wrap/format_1/recipient_context
+fido_key_wrap/format_1/prf_input
+fido_key_wrap/format_1/passphrase_key
+fido_key_wrap/format_1/fido_key
+fido_key_wrap/format_1/passphrase_aad
+fido_key_wrap/format_1/fido_aad
+fido_key_wrap/format_1/combined_passphrase_aad
+fido_key_wrap/format_1/combined_fido_aad
+fido_key_wrap/format_1/envelope_mac_key
+fido_key_wrap/format_1/envelope_mac
+```
+
+the ascii bytes of each displayed string are used directly.
 
 ## values
 
-the following values are independently random:
-
-| name | length | meaning |
+| symbol | length | value |
 | --- | --- | --- |
-| `m` | 32 bytes | application root key |
-| `e` | 32 bytes | envelope id |
-| `n_prf` | 32 bytes | recipient prf nonce |
-| `n_token` | 12 bytes | recipient token nonce |
-| `s_pass` | 16 bytes | passphrase salt, when present |
-| `n_pass` | 12 bytes | passphrase nonce, when present |
+| `f` | 1 byte | format code |
+| `su` | 1 byte | suite code |
+| `app` | 3–253 bytes | application id |
+| `eid` | 32 bytes | random envelope id |
+| `rid` | 32 bytes | random recipient id |
+| `root` | 32 bytes | random application root |
+| `cid` | 1–1,024 bytes | fido credential id |
+| `pk` | 64 bytes | es256 public key as `x || y` |
+| `fp` | 1 byte | fido policy code |
+| `np` | 32 bytes | random prf nonce |
+| `nf` | 12 bytes | random fido-layer nonce |
+| `s` | 16 bytes | random argon2 salt |
+| `npass` | 12 bytes | random passphrase-layer nonce |
 
-`m` must be uniformly random. all generated values come from the
-operating-system random number generator.
+### generation
 
-an es256 public key `pk` is encoded as `x || y`, where each p-256 coordinate is
-a 32-byte big-endian integer. the point must be on the p-256 curve.
+`create_root` generates `root` with the operating-system random source.
+`protect_root` instead accepts caller-supplied root bytes, which must already be
+uniformly random. library-generated ids, nonces, and salts are drawn from the
+same source. recipient ids and passphrase salts use bounded collision rejection
+within an envelope; rewrap also rejects a repeated prior nonce. recipient ids
+are public random identifiers, not credential or physical-device identities.
 
-## application id
+### validation
 
-the application id `app` is both the fido relying-party id and a protocol
-input. its utf-8 representation must be ascii, lowercase, dns-shaped, no more
-than 253 bytes, and contain at least two labels. each label is 1 to 63 bytes,
-begins and ends with an ascii letter or digit, and otherwise contains only
-ascii letters, digits, or `-`.
+the p-256 point encoded by `pk` must be valid. labels are 1–64 printable ascii
+bytes, with no leading or trailing space. labels are presentation data and are
+not included in recipient contexts; the final envelope mac authenticates them.
 
-## credential creation
+the application id is ascii lowercase dns-shaped text with at least two
+labels. each label contains 1–63 lowercase letters, digits, or `-`, begins and
+ends with a letter or digit, and the full value is at most 253 bytes.
 
-each recipient uses a non-discoverable es256 credential scoped to `app`. the
-creation request contains a fresh random 32-byte client-data hash and random
-32-byte user id, sets `rk=false` and `uv=true`, and enables the `hmac-secret`
-and credential-protection extensions. user names and display names do not
-affect the envelope construction.
+## recipient context
 
-creation requires client-pin user verification and uses the
-credential-protection code assigned to the recipient policy. the response must
-use packed self-attestation or packed basic attestation, es256, the requested
-credential-protection value, and signed `up=1, uv=1`. its signature is verified
-against the request's client-data hash and relying-party data. `fmt=none` is
-rejected.
+each recipient has one context `c`. including random `rid` and `eid` separates
+otherwise equal recipients and envelopes.
 
-the returned credential id `cid` must contain 1 to 1,024 bytes. the public key
-is normalized to the 64-byte encoding above and validated as a p-256 point.
-
-## recipient id
-
-let `tp` be the one-byte token-policy code and `af` the one-byte
-additional-factor code:
+for a passphrase recipient:
 
 ```text
-rid = sha256(t(
-  "fido_key_wrap/recipient_id/v1",
-  app,
-  cid,
-  pk,
-  tp,
-  af
+c = sha256(t(
+  "fido_key_wrap/format_1/recipient_context",
+  f, su, app, eid, rid,
+  kdf_code, u32be(memory_kib), u32be(passes), lanes,
+  s, npass
 ))
 ```
 
-`rid` is 32 bytes. the recipient label is not an input to `rid`.
-
-## recipient header
-
-let `v` be the one-byte format version, `su` the one-byte suite code, and `cp`
-the one-byte credential-protection code. for a recipient without a passphrase,
-`s_pass` and `n_pass` below are both `empty`.
+for a fido recipient:
 
 ```text
-h = t(
-  "fido_key_wrap/recipient_header/v1",
-  v,
-  su,
-  app,
-  e,
-  rid,
-  cid,
-  pk,
-  tp,
-  cp,
-  af,
-  n_prf,
-  n_token,
-  s_pass,
-  n_pass
-)
+c = sha256(t(
+  "fido_key_wrap/format_1/recipient_context",
+  f, su, app, eid, rid,
+  cid, pk, fp, np, nf
+))
 ```
 
-the recipient context and fido extension input are:
+for a combined recipient:
 
 ```text
-c = sha256(t("fido_key_wrap/recipient_context/v1", h))
-s = sha256(t("fido_key_wrap/prf_input/v1", c))
+c = sha256(t(
+  "fido_key_wrap/format_1/recipient_context",
+  f, su, app, eid, rid,
+  cid, pk, fp, np, nf,
+  kdf_code, u32be(memory_kib), u32be(passes), lanes,
+  s, npass
+))
 ```
-
-## fido assertion
-
-the assertion request supplies `app` and a fresh random 32-byte client-data
-hash, allows only `cid`, requests `hmac-secret(s)`, and requires user presence.
-presence supplies no pin and requests uv false. user-verified supplies one
-client pin and requests uv true.
-
-the response is accepted only when:
-
-- the es256 signature verifies under `pk` over authenticator data for `app` and
-  the request's client-data hash
-- exactly one assertion is returned for `cid`
-- `up=1, uv=0` for presence or `up=1, uv=1` for user-verified
-- exactly one 32-byte `hmac-secret` result is returned
-
-call the verified extension result `r`.
-
-## token key
-
-```text
-k_token = hkdf-sha-256(
-  ikm  = r,
-  salt = e,
-  info = t("fido_key_wrap/token_key/v1", c),
-  len  = 32
-)
-
-a_token = t("fido_key_wrap/token_aad/v1", h)
-```
-
-without a passphrase:
-
-```text
-wrapped = aes-256-gcm.encrypt(k_token, n_token, m, a_token)
-```
-
-`wrapped` is 48 bytes.
 
 ## passphrase key
 
-the passphrase is an unmodified byte string from 1 to 1,024 bytes. no unicode
-normalization or whitespace processing is applied.
+passphrases contain 1–1,024 bytes. bytes are used exactly as supplied; there is
+no text normalization, trimming, or case conversion.
+
+format 1 accepts:
+
+- memory from 65,536 through 262,144 kibibytes
+- three through six passes
+- one through four lanes
+- memory at least eight times the lane count
+- memory divisible by four times the lane count
+- memory, work, byte count, and block count safely representable on the target
+
+the default desktop profile is 262,144 kibibytes, three passes, and four lanes.
 
 ```text
-i_pass = argon2id(
-  password = passphrase,
-  salt = s_pass,
-  version = 0x13,
-  memory = 65536 kib,
-  passes = 3,
-  lanes = 4,
-  output = 32 bytes
-)
+i = argon2id(passphrase, s, memory_kib, passes, lanes)
 
-k_pass = hkdf-sha-256(
-  ikm  = i_pass,
-  salt = e,
-  info = t("fido_key_wrap/passphrase_key/v1", c),
+kpass = hkdf-sha-256(
+  ikm  = i,
+  salt = eid,
+  info = t("fido_key_wrap/format_1/passphrase_key", c),
+  len  = 32
+)
+```
+
+## fido credential and prf key
+
+### enrollment
+
+each fido-bearing recipient creates one dedicated non-discoverable es256
+credential under relying-party id `app`. creation uses fresh random
+client-data and user-id values, requests `hmac-secret` and credential
+protection, and requires user verification.
+
+presence credentials use protection optional with the credential id. user
+verification credentials require user verification. the result is accepted
+only after packed attestation, es256, the requested protection, and signed
+`up=1`, `uv=1`, `be=0`, `bs=0` have been verified.
+
+### assertion
+
+the prf salt for an assertion is:
+
+```text
+prf_input = sha256(t("fido_key_wrap/format_1/prf_input", c))
+```
+
+each assertion uses a fresh random 32-byte client-data hash, allows only `cid`,
+requests `hmac-secret(prf_input)`, and requests user presence. presence
+requests exact `uv=0` without a pin. user verification supplies one pin and
+requests exact `uv=1`.
+
+the result is accepted only after the es256 assertion signature, relying-party
+binding, fresh client-data hash, exact credential id, exact signed
+`up`/`uv`/`be`/`bs` flags, single assertion count, and 32-byte extension result
+have been verified. call the verified extension result `r`.
+
+```text
+kfido = hkdf-sha-256(
+  ikm  = r,
+  salt = eid,
+  info = t("fido_key_wrap/format_1/fido_key", c),
+  len  = 32
+)
+```
+
+## wrapping
+
+a passphrase recipient stores:
+
+```text
+aad = t("fido_key_wrap/format_1/passphrase_aad", c)
+wrapped_root = aead(kpass, npass, root, aad)
+```
+
+a fido recipient stores:
+
+```text
+aad = t("fido_key_wrap/format_1/fido_aad", c)
+wrapped_root = aead(kfido, nf, root, aad)
+```
+
+a combined recipient stores two layers:
+
+```text
+inner_aad = t("fido_key_wrap/format_1/combined_passphrase_aad", c)
+inner = aead(kpass, npass, root, inner_aad)
+
+outer_aad = t("fido_key_wrap/format_1/combined_fido_aad", c)
+wrapped_root = aead(kfido, nf, inner, outer_aad)
+```
+
+a wrapped root is 48 bytes for the passphrase and fido suites. the combined
+inner value is 48 bytes and its outer value is 64 bytes. combined decryption
+authenticates the outer fido layer before requesting or deriving the
+passphrase.
+
+## envelope authentication
+
+let `body` be the core deterministic cbor encoding of:
+
+```text
+[1, app, eid, recipients]
+```
+
+the complete recipient records, including their labels and wrapped roots, are
+part of `body`.
+
+```text
+kmac = hkdf-sha-256(
+  ikm  = root,
+  salt = eid,
+  info = t(
+    "fido_key_wrap/format_1/envelope_mac_key",
+    f,
+    app
+  ),
   len  = 32
 )
 
-a_pass = t("fido_key_wrap/passphrase_aad/v1", h)
-inner = aes-256-gcm.encrypt(k_pass, n_pass, m, a_pass)
-wrapped = aes-256-gcm.encrypt(k_token, n_token, inner, a_token)
+mac = hmac-sha-256(
+  kmac,
+  t("fido_key_wrap/format_1/envelope_mac", f, body)
+)
 ```
 
-`inner` is 48 bytes and `wrapped` is 64 bytes. decryption authenticates the
-token layer before processing the passphrase.
+mac comparison is constant-time. unlock returns the root only after the
+selected recipient and this whole-envelope mac have both authenticated.
 
-## envelope body and mac
+## failure convergence
 
-the canonical body uses the core deterministic encoding requirements from rfc
-8949 section 4.2.1 to encode:
+the parser reports malformed, noncanonical, unsupported, and structurally
+contradictory input as an invalid envelope before factor interaction. a trusted
+application-id mismatch and a local argon2 resource refusal are also detected
+before interaction.
+
+once a passphrase-bearing unlock begins, a wrong passphrase, selected wrapping
+ciphertext failure, or candidate-root envelope-mac failure returns the same
+unlock failure. the result does not reveal which cryptographic check rejected
+the candidate. a passphrase confirmation mismatch remains distinct because it
+is new enrollment input, not an unlock verifier.
+
+security-key transport and verified-response failures are bounded public error
+classes. native error strings, credential material, prf output, pins,
+passphrases, derived keys, candidate roots, and plaintext are not included in
+errors. an operation evaluates only the selected recipient and never tries a
+different recipient or weaker policy after failure.
+
+## wire format
+
+an encoded envelope is the four bytes `FKW\0` followed by core deterministic
+cbor for:
 
 ```text
 [
   1,
   app,
-  e,
-  recipients
-]
-```
-
-the envelope mac is:
-
-```text
-k_envelope = hkdf-sha-256(
-  ikm  = m,
-  salt = e,
-  info = t("fido_key_wrap/envelope_mac_key/v1", app),
-  len  = 32
-)
-
-envelope_mac = hmac-sha-256(
-  k_envelope,
-  t("fido_key_wrap/envelope_mac/v1", canonical_body)
-)
-```
-
-mac comparison is constant-time.
-
-## envelope encoding
-
-the serialized envelope is the ascii bytes `FKW1` followed by rfc 8949 core
-deterministic cbor encoding of:
-
-```text
-[
-  1,
-  app,
-  e,
+  eid,
   recipients,
-  envelope_mac
+  mac
 ]
 ```
 
-each recipient is:
+recipient arrays are:
 
 ```text
-[
-  1,
-  rid,
-  label,
-  cid,
-  pk,
-  tp,
-  af,
-  cp,
-  n_prf,
-  n_token,
-  passphrase_parameters,
-  wrapped
-]
+passphrase:
+[1, rid, label, [1, memory_kib, passes, lanes, s], npass, wrapped_root]
+
+fido:
+[2, rid, label, cid, pk, fp, np, nf, wrapped_root]
+
+fido and passphrase:
+[3, rid, label, cid, pk, fp, np, nf,
+ [1, memory_kib, passes, lanes, s], npass, wrapped_root]
 ```
 
-`passphrase_parameters` is `null` when `af=0`. when `af=1`, it is:
+recipients are ordered by ascending `rid`. ids are unique. fido-bearing
+recipients have unique credential ids, and passphrase-bearing recipients have
+unique salts. an envelope contains 1–32 recipients and is at most 65,536 bytes,
+including the magic.
 
-```text
-[1, s_pass, n_pass]
-```
+the decoder requires definite arrays, exact array sizes, shortest integers,
+exact byte lengths, valid utf-8 and p-256 points, canonical ordering, no
+trailing data, and byte-for-byte canonical re-encoding. malformed or unsupported
+input is rejected before factor interaction.
 
-`app` and `label` are cbor text strings. ids, keys, nonces, salts, ciphertexts,
-and macs are cbor byte strings. codes are unsigned cbor integers using their
-shortest encoding. arrays have definite lengths. tags, floats, indefinite
-values, unknown fields, and trailing bytes are not accepted.
+## interoperability vectors
 
-recipients are sorted by `rid` in bytewise ascending order. recipient ids and
-credential ids are unique within an envelope. labels are valid utf-8, contain
-no control characters, and are 1 to 128 bytes.
-
-decoding recomputes `rid` and validates `pk` as a p-256 point. presence requires
-`cp=2`; user-verified requires `cp=3`. `af=0` requires null passphrase
-parameters and a 48-byte `wrapped` value. `af=1` requires
-`[1, s_pass, n_pass]` and a 64-byte `wrapped` value.
-
-an envelope contains 1 to 32 recipients and is no larger than 65,536 bytes.
-decoding and re-encoding must produce the same bytes.
-
-## recovery
-
-1. decode the envelope and require `app` to match the expected application id
-2. locate `rid`
-3. obtain and verify the fido assertion
-4. derive `k_token` and authenticate the outer ciphertext
-5. when present, derive `k_pass` and authenticate the inner ciphertext
-6. require a 32-byte plaintext root
-7. verify `envelope_mac`
-
-the recovered root is released only after all seven steps succeed.
+`test-vectors/` contains deterministic format-1 fixtures for passphrase,
+presence, user verification, both combined policies, a mixed envelope, and the
+demo container. `test-vectors/generate.py` implements transcript framing,
+hkdf, cbor, and envelope construction independently from the rust code.

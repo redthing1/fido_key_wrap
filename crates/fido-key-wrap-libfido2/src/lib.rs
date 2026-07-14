@@ -6,6 +6,9 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[cfg(test)]
+#[path = "../build_policy.rs"]
+mod build_policy;
 mod error;
 mod ffi;
 mod native;

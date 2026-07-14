@@ -1,109 +1,148 @@
-/// read-only authenticator capability report.
-///
-/// manufacturer and product strings are presentation hints, never stable
-/// identity and never credential selectors. they are untrusted device metadata
-/// and must be escaped for the output context.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct AuthenticatorReport {
-    pub(crate) manufacturer: Option<String>,
-    pub(crate) product: Option<String>,
-    pub(crate) available: bool,
-    pub(crate) compatible: bool,
-    pub(crate) fido2: bool,
-    pub(crate) hmac_secret: bool,
-    pub(crate) credential_protection: bool,
-    pub(crate) es256: bool,
-    pub(crate) pin_supported: bool,
-    pub(crate) pin_configured: bool,
-    pub(crate) always_uv: bool,
-    pub(crate) issue: Option<AuthenticatorIssue>,
-}
+use fido_key_wrap_libfido2 as native;
 
-/// reason a discovered authenticator could not be inspected.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum AuthenticatorIssue {
-    /// another process or operation is using the authenticator.
-    Busy,
-    /// an operation reached its deadline.
-    TimedOut,
-    /// the device disappeared or operating-system access was denied.
-    Inaccessible,
-    /// another native failure occurred.
-    Backend,
+use crate::{Error, Result};
+
+/// one bounded read-only authenticator capability report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatorReport {
+    compatible: bool,
+    issues: Vec<AuthenticatorIssue>,
 }
 
 impl AuthenticatorReport {
-    /// returns the untrusted manufacturer string reported during discovery.
-    #[must_use]
-    pub fn manufacturer(&self) -> Option<&str> {
-        self.manufacturer.as_deref()
-    }
-
-    /// returns the untrusted product string reported during discovery.
-    #[must_use]
-    pub fn product(&self) -> Option<&str> {
-        self.product.as_deref()
-    }
-
-    /// reports whether the authenticator could be opened and inspected.
-    #[must_use]
-    pub const fn available(&self) -> bool {
-        self.available
-    }
-
-    /// reports whether all features required by this crate are available.
+    /// reports whether the authenticator supports every recovery policy.
     #[must_use]
     pub const fn compatible(&self) -> bool {
         self.compatible
     }
 
-    /// reports whether the authenticator supports fido2.
+    /// returns capability limitations without device identity.
     #[must_use]
-    pub const fn fido2(&self) -> bool {
-        self.fido2
+    pub fn issues(&self) -> &[AuthenticatorIssue] {
+        &self.issues
+    }
+}
+
+/// capability preventing one or more recovery policies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AuthenticatorIssue {
+    /// the authenticator could not be opened or inspected.
+    Unavailable,
+    /// ctap2/fido2 operations are unavailable.
+    Fido2Unavailable,
+    /// es256 credential creation is unavailable.
+    Es256Unavailable,
+    /// the ctap2 `hmac-secret` extension is unavailable.
+    HmacSecretUnavailable,
+    /// credential protection is unavailable.
+    CredentialProtectionUnavailable,
+    /// pin-backed user verification is unavailable.
+    UserVerificationUnavailable,
+    /// user verification is supported but not configured.
+    UserVerificationNotConfigured,
+    /// the authenticator cannot preserve an exact presence-only recovery route.
+    PresenceRecoveryUnavailable,
+}
+
+/// inspects connected authenticators without requesting a pin or touch.
+///
+/// reports contain no serial number, transport path, vendor/product string, or
+/// stable device identity. authenticators that cannot be opened for a capability
+/// query are reported only as unavailable.
+///
+/// # errors
+///
+/// returns [`Error::AuthenticatorOperationFailed`] when discovery itself
+/// cannot complete.
+pub fn inspect_authenticators() -> Result<Vec<AuthenticatorReport>> {
+    Ok(native::Backend::default()
+        .doctor()
+        .map_err(|_| Error::AuthenticatorOperationFailed)?
+        .into_iter()
+        .map(|report| match report.status {
+            native::DeviceStatus::Compatible(capabilities)
+            | native::DeviceStatus::Incompatible { capabilities, .. } => report_for(&capabilities),
+            native::DeviceStatus::Unavailable(_) => AuthenticatorReport {
+                compatible: false,
+                issues: vec![AuthenticatorIssue::Unavailable],
+            },
+        })
+        .collect())
+}
+
+fn report_for(capabilities: &native::Capabilities) -> AuthenticatorReport {
+    let mut issues = Vec::new();
+    if !capabilities.fido2 {
+        issues.push(AuthenticatorIssue::Fido2Unavailable);
+    }
+    if !capabilities.es256 {
+        issues.push(AuthenticatorIssue::Es256Unavailable);
+    }
+    if !capabilities.hmac_secret {
+        issues.push(AuthenticatorIssue::HmacSecretUnavailable);
+    }
+    if !capabilities.credential_protection {
+        issues.push(AuthenticatorIssue::CredentialProtectionUnavailable);
+    }
+    if !capabilities.client_pin_supported {
+        issues.push(AuthenticatorIssue::UserVerificationUnavailable);
+    } else if !capabilities.client_pin_configured {
+        issues.push(AuthenticatorIssue::UserVerificationNotConfigured);
+    }
+    if capabilities.always_uv {
+        issues.push(AuthenticatorIssue::PresenceRecoveryUnavailable);
+    }
+    AuthenticatorReport {
+        compatible: issues.is_empty(),
+        issues,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn complete() -> native::Capabilities {
+        native::Capabilities {
+            fido2: true,
+            hmac_secret: true,
+            credential_protection: true,
+            es256: true,
+            client_pin_supported: true,
+            client_pin_configured: true,
+            internal_uv_supported: false,
+            internal_uv_configured: false,
+            always_uv: false,
+        }
     }
 
-    /// reports support for the ctap2 `hmac-secret` extension.
-    #[must_use]
-    pub const fn hmac_secret(&self) -> bool {
-        self.hmac_secret
+    #[test]
+    fn report_contains_only_bounded_capability_results() {
+        let report = report_for(&complete());
+        assert!(report.compatible());
+        assert!(report.issues().is_empty());
+
+        let mut limited = complete();
+        limited.hmac_secret = false;
+        limited.always_uv = true;
+        let report = report_for(&limited);
+        assert!(!report.compatible());
+        assert_eq!(
+            report.issues(),
+            [
+                AuthenticatorIssue::HmacSecretUnavailable,
+                AuthenticatorIssue::PresenceRecoveryUnavailable
+            ]
+        );
     }
 
-    /// reports support for the credential-protection extension.
-    #[must_use]
-    pub const fn credential_protection(&self) -> bool {
-        self.credential_protection
-    }
-
-    /// reports support for es256 credentials.
-    #[must_use]
-    pub const fn es256(&self) -> bool {
-        self.es256
-    }
-
-    /// reports whether the authenticator supports a client pin.
-    #[must_use]
-    pub const fn pin_supported(&self) -> bool {
-        self.pin_supported
-    }
-
-    /// reports whether a client pin is configured.
-    #[must_use]
-    pub const fn pin_configured(&self) -> bool {
-        self.pin_configured
-    }
-
-    /// reports whether the authenticator forces user verification.
-    #[must_use]
-    pub const fn always_uv(&self) -> bool {
-        self.always_uv
-    }
-
-    /// explains why an unavailable device could not be inspected.
-    #[must_use]
-    pub const fn issue(&self) -> Option<AuthenticatorIssue> {
-        self.issue
+    #[test]
+    fn unavailable_issue_contains_no_native_detail() {
+        let report = AuthenticatorReport {
+            compatible: false,
+            issues: vec![AuthenticatorIssue::Unavailable],
+        };
+        assert_eq!(report.issues(), [AuthenticatorIssue::Unavailable]);
     }
 }

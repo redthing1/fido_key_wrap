@@ -10,53 +10,43 @@ pub struct RootKey {
 }
 
 impl RootKey {
-    /// generates a root key from the operating-system csprng.
+    /// imports an already uniformly random 256-bit root key.
     ///
-    /// # Errors
-    ///
-    /// returns [`Error::Random`] if the operating system cannot provide secure
-    /// random bytes.
-    pub fn generate() -> Result<Self> {
-        let mut bytes = Zeroizing::new([0u8; 32]);
-        getrandom::fill(bytes.as_mut()).map_err(|_| Error::Random)?;
-        Ok(Self { bytes })
-    }
-
-    /// imports uniformly random 256-bit key material.
-    ///
-    /// passwords, passphrases, api tokens, and other low-entropy values are not
-    /// valid root keys.
+    /// passwords, passphrases, api tokens, hashes of low-entropy input, and
+    /// other guessable values are not valid root keys.
     #[must_use]
-    pub fn import(bytes: [u8; 32]) -> Self {
+    pub fn import(random_bytes: [u8; 32]) -> Self {
         Self {
-            bytes: Zeroizing::new(bytes),
+            bytes: Zeroizing::new(random_bytes),
         }
     }
 
-    /// provides temporary borrowed access to the key bytes.
-    pub fn expose<R>(&self, function: impl for<'a> FnOnce(&'a [u8; 32]) -> R) -> R {
-        function(&self.bytes)
+    /// borrows the root for one application-defined operation.
+    ///
+    /// the closure can copy or return these bytes. any such copy is owned and
+    /// must be cleared by the application.
+    pub fn expose<T>(&self, use_key: impl FnOnce(&[u8; 32]) -> T) -> T {
+        use_key(&self.bytes)
+    }
+
+    pub(crate) fn random() -> Result<Self> {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        getrandom::fill(bytes.as_mut()).map_err(|_| Error::RandomUnavailable)?;
+        Ok(Self { bytes })
+    }
+
+    pub(crate) fn from_zeroizing(bytes: Zeroizing<[u8; 32]>) -> Self {
+        Self { bytes }
     }
 
     pub(crate) fn bytes(&self) -> &[u8; 32] {
         &self.bytes
     }
-
-    pub(crate) fn copy_from(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != 32 {
-            return Err(Error::UnlockFailed);
-        }
-        let mut root = Self {
-            bytes: Zeroizing::new([0; 32]),
-        };
-        root.bytes.copy_from_slice(bytes);
-        Ok(root)
-    }
 }
 
 impl fmt::Debug for RootKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("RootKey([REDACTED])")
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RootKey([REDACTED])")
     }
 }
 

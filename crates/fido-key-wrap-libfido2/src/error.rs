@@ -1,8 +1,8 @@
 use thiserror::Error;
 
-/// A sanitized backend error.
+/// a sanitized backend error.
 ///
-/// Errors never contain an authenticator path, a PIN, credential material, or
+/// errors never contain an authenticator path, a pin, credential material, or
 /// native library debug output. `Native` exposes only a stable operation name
 /// and numeric status code for diagnostics.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

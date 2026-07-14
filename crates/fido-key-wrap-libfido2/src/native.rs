@@ -4,7 +4,7 @@ use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::ffi;
@@ -16,21 +16,21 @@ const MAX_CREDENTIAL_ID_BYTES: usize = 1024;
 const ES256_PUBLIC_KEY_BYTES: usize = 64;
 const SECRET_BYTES: usize = 32;
 
-/// Exact assertion policy. The backend never falls back between variants.
+/// exact assertion policy. the backend never falls back between variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExactPolicy {
-    /// Require signed `UP=1, UV=0` and pass no PIN to libfido2.
+    /// require signed `UP=1, UV=0, BE=0, BS=0` and pass no pin to libfido2.
     Presence,
-    /// Require signed `UP=1, UV=1` and pass the supplied PIN once.
+    /// require signed `UP=1, UV=1, BE=0, BS=0` and pass the supplied pin once.
     UserVerified,
 }
 
-/// The credential-protection level enforced during enrollment.
+/// the credential-protection level enforced during enrollment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialProtection {
-    /// CTAP `userVerificationOptionalWithCredentialID` (level 2).
+    /// ctap `userVerificationOptionalWithCredentialID` (level 2).
     OptionalWithCredentialId,
-    /// CTAP `userVerificationRequired` (level 3).
+    /// ctap `userVerificationRequired` (level 3).
     UserVerificationRequired,
 }
 
@@ -52,23 +52,23 @@ impl ExactPolicy {
     }
 }
 
-/// A NUL-terminated, zeroizing UTF-8 PIN.
+/// a nul-terminated, zeroizing utf-8 pin.
 ///
-/// The value cannot be cloned and its `Debug` output is redacted. libfido2
+/// the value cannot be cloned and its `Debug` output is redacted. libfido2
 /// receives the pointer only for the duration of one synchronous call.
 pub struct Pin {
     bytes: Zeroizing<Vec<u8>>,
 }
 
 impl Pin {
-    /// Copies a PIN into zeroizing storage.
+    /// stores a pin in zeroizing storage.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidInput`] for an empty PIN, a PIN longer than
-    /// CTAP permits, or an embedded NUL byte.
-    pub fn new(pin: impl AsRef<str>) -> Result<Self> {
-        let pin = pin.as_ref().as_bytes();
+    /// returns [`Error::InvalidInput`] for an empty pin, a pin longer than
+    /// ctap permits, or an embedded nul byte.
+    pub fn new(pin: &str) -> Result<Self> {
+        let pin = pin.as_bytes();
         if pin.is_empty() {
             return Err(Error::InvalidInput("PIN must not be empty"));
         }
@@ -96,7 +96,7 @@ impl std::fmt::Debug for Pin {
     }
 }
 
-/// Finite bounds for native operations and device selection.
+/// finite bounds for native operations and device selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     operation_timeout: Duration,
@@ -106,11 +106,11 @@ pub struct Config {
 }
 
 impl Config {
-    /// Creates a validated configuration.
+    /// creates a validated configuration.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidInput`] when a timeout is zero or cannot be
+    /// returns [`Error::InvalidInput`] when a timeout is zero or cannot be
     /// represented by libfido2, or when the device bound is outside `1..=32`.
     pub fn new(
         operation_timeout: Duration,
@@ -154,7 +154,7 @@ fn validate_milliseconds(duration: Duration, message: &'static str) -> Result<()
     Ok(())
 }
 
-/// Read-only authenticator capabilities used by the wrapping protocol.
+/// read-only authenticator capabilities used by the wrapping protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Capabilities {
@@ -170,7 +170,7 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// Whether this device satisfies the backend's common v1 requirements.
+    /// whether this device satisfies the backend's common format-1 requirements.
     #[must_use]
     pub fn compatible(&self) -> bool {
         self.fido2
@@ -181,20 +181,27 @@ impl Capabilities {
             && self.client_pin_configured
     }
 
-    /// Whether exact presence-only recipients are possible on this device.
+    /// whether exact presence-only recipients are possible on this device.
     #[must_use]
     pub fn supports_presence_policy(&self) -> bool {
         self.compatible() && !self.always_uv
     }
 
-    /// Whether PIN-backed user-verified recipients are possible on this device.
+    /// whether pin-backed user-verified recipients are possible on this device.
     #[must_use]
     pub fn supports_verified_policy(&self) -> bool {
         self.compatible()
     }
+
+    fn supports_policy(&self, policy: ExactPolicy) -> bool {
+        match policy {
+            ExactPolicy::Presence => self.supports_presence_policy(),
+            ExactPolicy::UserVerified => self.supports_verified_policy(),
+        }
+    }
 }
 
-/// A reason a discovered device cannot implement the v1 protocol.
+/// a reason a discovered device cannot implement the wrapping protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Incompatibility {
     NotFido2,
@@ -205,7 +212,7 @@ pub enum Incompatibility {
     ClientPinNotConfigured,
 }
 
-/// Read-only inspection result for one discovered device.
+/// read-only inspection result for one discovered device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceStatus {
     Compatible(Capabilities),
@@ -216,9 +223,9 @@ pub enum DeviceStatus {
     Unavailable(Error),
 }
 
-/// Ephemeral presentation information from discovery.
+/// ephemeral presentation information from discovery.
 ///
-/// These fields are explicitly not stable device identity and must not be
+/// these fields are not stable device identity and must not be
 /// persisted as credential selectors. manufacturer and product are untrusted
 /// device metadata and must be escaped for the output context.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,7 +235,7 @@ pub struct DeviceReport {
     pub status: DeviceStatus,
 }
 
-/// Parameters for dedicated credential enrollment.
+/// parameters for dedicated credential enrollment.
 #[derive(Clone, Copy)]
 pub struct EnrollmentRequest<'a> {
     pub relying_party_id: &'a str,
@@ -236,7 +243,7 @@ pub struct EnrollmentRequest<'a> {
     pub policy: ExactPolicy,
 }
 
-/// A newly enrolled credential.
+/// a newly enrolled credential.
 #[derive(PartialEq, Eq)]
 pub struct Enrollment {
     pub credential_id: Vec<u8>,
@@ -255,7 +262,7 @@ impl std::fmt::Debug for Enrollment {
     }
 }
 
-/// Parameters for one exact, verified `hmac-secret` assertion.
+/// parameters for one exact, verified `hmac-secret` assertion.
 #[derive(Clone, Copy)]
 pub struct PrfRequest<'a> {
     pub relying_party_id: &'a str,
@@ -265,7 +272,7 @@ pub struct PrfRequest<'a> {
     pub policy: ExactPolicy,
 }
 
-/// Entry point for system-backed operations.
+/// entry point for system-backed operations.
 #[derive(Debug, Clone, Copy)]
 pub struct Backend {
     config: Config,
@@ -277,13 +284,13 @@ impl Backend {
         Self { config }
     }
 
-    /// Enumerates and opens devices only long enough to read `GetInfo`.
+    /// enumerates and opens devices only long enough to read `GetInfo`.
     ///
-    /// This does not request a PIN, a touch, or create a credential.
+    /// this does not request a pin, a touch, or create a credential.
     ///
     /// # Errors
     ///
-    /// Returns an allocation or sanitized native discovery error. Errors for
+    /// returns an allocation or sanitized native discovery error. errors for
     /// individual devices are retained in [`DeviceStatus::Unavailable`].
     pub fn doctor(&self) -> Result<Vec<DeviceReport>> {
         initialize_thread();
@@ -312,15 +319,15 @@ impl Backend {
             .collect())
     }
 
-    /// Opens and inspects the candidates for one selection operation.
+    /// opens and inspects candidates satisfying one exact assertion policy.
     ///
-    /// The returned set remains open so the caller can describe the exact
+    /// the returned set remains open so the caller can describe the exact
     /// selection ceremony before starting it.
     ///
     /// # Errors
     ///
-    /// Returns a discovery, compatibility, or transport error.
-    pub fn prepare_selection(&self) -> Result<PreparedSelection> {
+    /// returns a discovery, exact-policy compatibility, or transport error.
+    pub fn prepare_selection(&self, policy: ExactPolicy) -> Result<PreparedSelection> {
         initialize_thread();
         let candidates = manifest(self.config.max_devices)?;
         if candidates.is_empty() {
@@ -345,7 +352,7 @@ impl Backend {
                     continue;
                 }
             };
-            if capabilities.compatible() {
+            if capabilities.supports_policy(policy) {
                 devices.push((device, capabilities));
             } else {
                 found_incompatible = true;
@@ -364,23 +371,11 @@ impl Backend {
             config: self.config,
         })
     }
-
-    /// Opens one compatible authenticator, selecting by touch when needed.
-    ///
-    /// multiple compatible devices start a touch-selection ceremony.
-    ///
-    /// # Errors
-    ///
-    /// Returns a discovery, compatibility, transport, or bounded selection
-    /// error. It never asks for a PIN or creates a credential.
-    pub fn select(&self) -> Result<Authenticator> {
-        self.prepare_selection()?.select()
-    }
 }
 
-/// Open candidates prepared for one selection ceremony.
+/// open exact-policy candidates prepared for one selection ceremony.
 ///
-/// The candidate count and the consuming [`PreparedSelection::select`] call
+/// the candidate count and the consuming [`PreparedSelection::select`] call
 /// refer to the same native device handles.
 pub struct PreparedSelection {
     devices: Vec<(RawDevice, Capabilities)>,
@@ -388,17 +383,17 @@ pub struct PreparedSelection {
 }
 
 impl PreparedSelection {
-    /// Returns the number of compatible candidates in this ceremony.
+    /// returns the number of exact-policy candidates in this ceremony.
     #[must_use]
     pub fn compatible_authenticators(&self) -> usize {
         self.devices.len()
     }
 
-    /// Selects one prepared authenticator, using touch when several remain.
+    /// selects one prepared authenticator, using touch when several remain.
     ///
     /// # Errors
     ///
-    /// Returns a bounded selection or transport error.
+    /// returns a bounded selection or transport error.
     pub fn select(mut self) -> Result<Authenticator> {
         match self.devices.len() {
             1 => {
@@ -416,7 +411,7 @@ impl Default for Backend {
     }
 }
 
-/// An open, thread-affine native authenticator.
+/// an open, thread-affine native authenticator.
 ///
 /// this type is `!Send` and `!Sync`; libfido2 device state remains on the
 /// thread where it was opened.
@@ -449,14 +444,15 @@ impl Authenticator {
         &self.capabilities
     }
 
-    /// Enrolls a non-discoverable ES256 credential using UV and verifies
-    /// packed attestation. The high-level caller must immediately evaluate its
-    /// final transcript-derived PRF salt before persisting the recipient.
+    /// enrolls a non-discoverable, non-backup es256 credential using uv and
+    /// verifies packed attestation. the high-level caller must immediately
+    /// evaluate its final transcript-derived prf salt before persisting the
+    /// recipient.
     ///
     /// # Errors
     ///
-    /// Returns a sanitized validation, capability, PIN, transport, timeout,
-    /// protocol, or verification error. An incorrect PIN is never retried.
+    /// returns a sanitized validation, capability, pin, transport, timeout,
+    /// protocol, or verification error. an incorrect pin is never retried.
     pub fn enroll(&mut self, request: EnrollmentRequest<'_>, pin: &Pin) -> Result<Enrollment> {
         validate_rp_id(request.relying_party_id)?;
         validate_name(request.relying_party_name)?;
@@ -477,8 +473,8 @@ impl Authenticator {
             "relying-party name contains a NUL byte",
         )?;
         let user_name = c_string("fido-key-wrap", "fixed user name is invalid")?;
-        let mut client_data_hash = random_array()?;
-        let mut user_id = random_array()?;
+        let client_data_hash = Zeroizing::new(random_array()?);
+        let user_id = Zeroizing::new(random_array()?);
         let mut credential = Credential::new()?;
 
         credential.call("set client-data hash", |raw| unsafe {
@@ -526,11 +522,11 @@ impl Authenticator {
         let result = unsafe {
             ffi::fido_dev_make_cred(self.device.as_ptr(), credential.as_ptr(), pin.as_ptr())
         };
-        client_data_hash.zeroize();
-        user_id.zeroize();
         if result != ffi::FIDO_OK {
             return Err(self.device.translate(result, "make credential"));
         }
+        drop(client_data_hash);
+        drop(user_id);
 
         credential.verify(request.policy)?;
         let credential_id = credential.copy_id()?;
@@ -542,13 +538,13 @@ impl Authenticator {
         })
     }
 
-    /// Evaluates `hmac-secret` only after complete ES256 verification and
-    /// exact post-verification UP/UV flag checks.
+    /// evaluates `hmac-secret` only after complete es256 verification and
+    /// exact post-verification UP/UV/BE/BS flag checks.
     ///
     /// # Errors
     ///
-    /// Returns a sanitized validation, policy, PIN, transport, timeout,
-    /// protocol, or verification error. No secret is returned unless every
+    /// returns a sanitized validation, policy, pin, transport, timeout,
+    /// protocol, or verification error. no secret is returned unless every
     /// assertion check succeeds.
     pub fn evaluate(
         &mut self,
@@ -577,7 +573,7 @@ impl Authenticator {
             request.relying_party_id,
             "relying-party ID contains a NUL byte",
         )?;
-        let mut client_data_hash = random_array()?;
+        let client_data_hash = Zeroizing::new(random_array()?);
         let mut assertion = Assertion::new()?;
         assertion.call("set relying party", |raw| unsafe {
             ffi::fido_assert_set_rp(raw, rp_id.as_ptr())
@@ -619,10 +615,10 @@ impl Authenticator {
         let result = unsafe {
             ffi::fido_dev_get_assert(self.device.as_ptr(), assertion.as_ptr(), pin_pointer)
         };
-        client_data_hash.zeroize();
         if result != ffi::FIDO_OK {
             return Err(self.device.translate(result, "get assertion"));
         }
+        drop(client_data_hash);
 
         assertion.verified_secret(
             request.credential_id,
@@ -1088,10 +1084,6 @@ impl Credential {
         }
         if unsafe { ffi::fido_cred_type(raw) } != ffi::COSE_ES256
             || unsafe { ffi::fido_cred_prot(raw) } != policy.native_protection()
-            || !flags_match(
-                unsafe { ffi::fido_cred_flags(raw) },
-                ExactPolicy::UserVerified,
-            )
         {
             return Err(Error::VerificationFailed);
         }
@@ -1101,11 +1093,21 @@ impl Credential {
         } else {
             unsafe { ffi::fido_cred_verify(raw) }
         };
-        if status == ffi::FIDO_OK {
-            Ok(())
-        } else {
-            Err(Error::VerificationFailed)
+        if status != ffi::FIDO_OK {
+            return Err(Error::VerificationFailed);
         }
+
+        // Creation always requires signed UP and UV, and this construction
+        // rejects credentials marked backup-eligible or currently backed up.
+        // Inspect the flags only after attestation verification succeeds.
+        if !flags_match(
+            unsafe { ffi::fido_cred_flags(raw) },
+            ExactPolicy::UserVerified,
+        ) {
+            return Err(Error::VerificationFailed);
+        }
+
+        Ok(())
     }
 
     fn copy_id(&self) -> Result<Vec<u8>> {
@@ -1215,8 +1217,9 @@ impl Assertion {
         }
 
         // libfido2 verifies flags requested as true, but does not prove the
-        // absence of UV when false was requested. Inspect only after the
-        // signature has verified and require the exact branch.
+        // absence of UV when false was requested and does not enforce the
+        // backup flags. Inspect only after the signature has verified and
+        // require the exact policy branch with BE=0 and BS=0.
         if !flags_match(unsafe { ffi::fido_assert_flags(raw, 0) }, policy) {
             return Err(Error::VerificationFailed);
         }
@@ -1229,15 +1232,27 @@ impl Assertion {
             return Err(Error::VerificationFailed);
         }
 
+        // libfido2 1.17 parses the encrypted hmac-secret result from this
+        // assertion's raw authenticator data and decrypts it into the same
+        // assertion statement. fido_assert_verify above authenticates that raw
+        // data. Do not fetch or copy the decrypted result before signature,
+        // exact flags, and credential identity have all been verified.
         let secret_len = unsafe { ffi::fido_assert_hmac_secret_len(raw, 0) };
         let secret_pointer = unsafe { ffi::fido_assert_hmac_secret_ptr(raw, 0) };
-        if secret_len != SECRET_BYTES || secret_pointer.is_null() {
-            return Err(Error::VerificationFailed);
-        }
+        let secret_pointer = exact_secret_pointer(secret_pointer, secret_len)?;
         let mut secret = Zeroizing::new([0_u8; SECRET_BYTES]);
-        secret.copy_from_slice(unsafe { std::slice::from_raw_parts(secret_pointer, SECRET_BYTES) });
+        secret.copy_from_slice(unsafe {
+            std::slice::from_raw_parts(secret_pointer.as_ptr(), SECRET_BYTES)
+        });
         Ok(secret)
     }
+}
+
+fn exact_secret_pointer(secret_pointer: *const u8, secret_len: usize) -> Result<NonNull<u8>> {
+    if secret_len != SECRET_BYTES {
+        return Err(Error::VerificationFailed);
+    }
+    NonNull::new(secret_pointer.cast_mut()).ok_or(Error::VerificationFailed)
 }
 
 impl Drop for Assertion {
@@ -1250,7 +1265,9 @@ impl Drop for Assertion {
 fn flags_match(flags: u8, policy: ExactPolicy) -> bool {
     let up = flags & ffi::AUTHDATA_UP != 0;
     let uv = flags & ffi::AUTHDATA_UV != 0;
-    up && uv == (policy == ExactPolicy::UserVerified)
+    let backup_eligible = flags & ffi::AUTHDATA_BE != 0;
+    let backup_state = flags & ffi::AUTHDATA_BS != 0;
+    up && uv == (policy == ExactPolicy::UserVerified) && !backup_eligible && !backup_state
 }
 
 fn translate_status(status: i32, operation: &'static str) -> Error {
@@ -1292,6 +1309,94 @@ fn translate_open_status(status: i32) -> Error {
 mod tests {
     use super::*;
 
+    const SIGNED_EXTENSION_CLIENT_DATA_HASH: [u8; 32] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ];
+    const SIGNED_EXTENSION_AUTHDATA: [u8; 84] = [
+        0x98, 0x3b, 0x29, 0x53, 0xb3, 0xa8, 0x56, 0x7d, 0x53, 0x9f, 0xd2, 0xbf, 0x8d, 0x8c, 0xf3,
+        0x5e, 0xfe, 0xdc, 0x2d, 0x04, 0xf6, 0x7a, 0xc0, 0x86, 0xca, 0x59, 0x48, 0x77, 0x85, 0x72,
+        0x2d, 0xf8, 0x81, 0x00, 0x00, 0x00, 0x07, 0xa1, 0x6b, 0x68, 0x6d, 0x61, 0x63, 0x2d, 0x73,
+        0x65, 0x63, 0x72, 0x65, 0x74, 0x58, 0x20, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+        0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6,
+        0xb7, 0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf,
+    ];
+    const SIGNED_EXTENSION_PUBLIC_KEY: [u8; ES256_PUBLIC_KEY_BYTES] = [
+        0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4, 0x40,
+        0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45, 0xd8, 0x98,
+        0xc2, 0x96, 0x4f, 0xe3, 0x42, 0xe2, 0xfe, 0x1a, 0x7f, 0x9b, 0x8e, 0xe7, 0xeb, 0x4a, 0x7c,
+        0x0f, 0x9e, 0x16, 0x2b, 0xce, 0x33, 0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68,
+        0x37, 0xbf, 0x51, 0xf5,
+    ];
+    const ALTERED_VALID_PUBLIC_KEY: [u8; ES256_PUBLIC_KEY_BYTES] = [
+        0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4, 0x40,
+        0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45, 0xd8, 0x98,
+        0xc2, 0x96, 0xb0, 0x1c, 0xbd, 0x1c, 0x01, 0xe5, 0x80, 0x65, 0x71, 0x18, 0x14, 0xb5, 0x83,
+        0xf0, 0x61, 0xe9, 0xd4, 0x31, 0xcc, 0xa9, 0x94, 0xce, 0xa1, 0x31, 0x34, 0x49, 0xbf, 0x97,
+        0xc8, 0x40, 0xae, 0x0a,
+    ];
+    const SIGNED_EXTENSION_SIGNATURE: [u8; 70] = [
+        0x30, 0x44, 0x02, 0x20, 0x0f, 0xab, 0x53, 0x30, 0x2b, 0xa4, 0x6c, 0x61, 0x28, 0x4f, 0xc2,
+        0xc1, 0xe0, 0xd8, 0x45, 0xda, 0xff, 0x04, 0xb0, 0x26, 0x8f, 0x37, 0xbc, 0x5d, 0x70, 0xc6,
+        0x19, 0xf1, 0x28, 0x18, 0xfe, 0x96, 0x02, 0x20, 0x79, 0xb3, 0x9f, 0x4a, 0x1d, 0x70, 0xd4,
+        0x3a, 0x1b, 0x69, 0xba, 0xe3, 0x10, 0x3f, 0xbc, 0x2a, 0x43, 0x11, 0x9d, 0x45, 0x1c, 0xe5,
+        0x60, 0xe3, 0xc8, 0x13, 0x50, 0x91, 0xa7, 0x5a, 0xf8, 0x87,
+    ];
+
+    fn signed_extension_assertion(
+        authdata: &[u8],
+        client_data_hash: &[u8; SECRET_BYTES],
+    ) -> Assertion {
+        let relying_party = CString::new("fixture.example").unwrap();
+        let mut assertion = Assertion::new().unwrap();
+        assertion
+            .call("fixture count", |raw| unsafe {
+                ffi::fido_assert_set_count(raw, 1)
+            })
+            .unwrap();
+        assertion
+            .call("fixture relying party", |raw| unsafe {
+                ffi::fido_assert_set_rp(raw, relying_party.as_ptr())
+            })
+            .unwrap();
+        assertion
+            .call("fixture client-data hash", |raw| unsafe {
+                ffi::fido_assert_set_clientdata_hash(
+                    raw,
+                    client_data_hash.as_ptr(),
+                    client_data_hash.len(),
+                )
+            })
+            .unwrap();
+        assertion
+            .call("fixture authdata", |raw| unsafe {
+                ffi::fido_assert_set_authdata_raw(raw, 0, authdata.as_ptr(), authdata.len())
+            })
+            .unwrap();
+        assertion
+            .call("fixture extensions", |raw| unsafe {
+                ffi::fido_assert_set_extensions(raw, ffi::FIDO_EXT_HMAC_SECRET)
+            })
+            .unwrap();
+        assertion
+            .call("fixture presence", |raw| unsafe {
+                ffi::fido_assert_set_up(raw, ffi::FIDO_OPT_TRUE)
+            })
+            .unwrap();
+        assertion
+            .call("fixture signature", |raw| unsafe {
+                ffi::fido_assert_set_sig(
+                    raw,
+                    0,
+                    SIGNED_EXTENSION_SIGNATURE.as_ptr(),
+                    SIGNED_EXTENSION_SIGNATURE.len(),
+                )
+            })
+            .unwrap();
+        assertion
+    }
+
     #[test]
     fn pin_is_redacted_and_validated() {
         let pin = Pin::new("123456").unwrap();
@@ -1317,12 +1422,125 @@ mod tests {
             ffi::AUTHDATA_UP | ffi::AUTHDATA_UV,
             ExactPolicy::UserVerified
         ));
+        assert!(!flags_match(ffi::AUTHDATA_UP, ExactPolicy::UserVerified));
         assert!(!flags_match(ffi::AUTHDATA_UV, ExactPolicy::UserVerified));
+
+        for backup_flag in [ffi::AUTHDATA_BE, ffi::AUTHDATA_BS] {
+            assert!(!flags_match(
+                ffi::AUTHDATA_UP | backup_flag,
+                ExactPolicy::Presence
+            ));
+            assert!(!flags_match(
+                ffi::AUTHDATA_UP | ffi::AUTHDATA_UV | backup_flag,
+                ExactPolicy::UserVerified
+            ));
+        }
+
+        assert!(!flags_match(
+            ffi::AUTHDATA_UP | ffi::AUTHDATA_BE | ffi::AUTHDATA_BS,
+            ExactPolicy::Presence
+        ));
+    }
+
+    #[test]
+    fn hmac_secret_extension_bytes_are_covered_by_the_assertion_signature() {
+        initialize_thread();
+        let public_key = Es256PublicKey::from_bytes(&SIGNED_EXTENSION_PUBLIC_KEY).unwrap();
+        let assertion = signed_extension_assertion(
+            &SIGNED_EXTENSION_AUTHDATA,
+            &SIGNED_EXTENSION_CLIENT_DATA_HASH,
+        );
+        assert_eq!(
+            unsafe {
+                ffi::fido_assert_verify(
+                    assertion.0.as_ptr(),
+                    0,
+                    ffi::COSE_ES256,
+                    public_key.as_ptr().cast(),
+                )
+            },
+            ffi::FIDO_OK
+        );
+
+        // Flip only the final encrypted hmac-secret byte, retaining the
+        // original signature. Verification must reject the altered authdata.
+        let mut altered_authdata = SIGNED_EXTENSION_AUTHDATA;
+        *altered_authdata.last_mut().unwrap() ^= 1;
+        let altered_assertion =
+            signed_extension_assertion(&altered_authdata, &SIGNED_EXTENSION_CLIENT_DATA_HASH);
+        assert_eq!(
+            unsafe {
+                ffi::fido_assert_verify(
+                    altered_assertion.0.as_ptr(),
+                    0,
+                    ffi::COSE_ES256,
+                    public_key.as_ptr().cast(),
+                )
+            },
+            ffi::FIDO_ERR_INVALID_SIG
+        );
+    }
+
+    #[test]
+    fn signed_assertion_replay_and_altered_valid_public_key_are_rejected() {
+        initialize_thread();
+        let public_key = Es256PublicKey::from_bytes(&SIGNED_EXTENSION_PUBLIC_KEY).unwrap();
+        let mut fresh_challenge = SIGNED_EXTENSION_CLIENT_DATA_HASH;
+        fresh_challenge[0] ^= 1;
+        let replayed = signed_extension_assertion(&SIGNED_EXTENSION_AUTHDATA, &fresh_challenge);
+        assert_eq!(
+            unsafe {
+                ffi::fido_assert_verify(
+                    replayed.0.as_ptr(),
+                    0,
+                    ffi::COSE_ES256,
+                    public_key.as_ptr().cast(),
+                )
+            },
+            ffi::FIDO_ERR_INVALID_SIG
+        );
+
+        let altered_public_key = Es256PublicKey::from_bytes(&ALTERED_VALID_PUBLIC_KEY)
+            .expect("the negated generator is a valid P-256 public key");
+        let assertion = signed_extension_assertion(
+            &SIGNED_EXTENSION_AUTHDATA,
+            &SIGNED_EXTENSION_CLIENT_DATA_HASH,
+        );
+        assert_eq!(
+            unsafe {
+                ffi::fido_assert_verify(
+                    assertion.0.as_ptr(),
+                    0,
+                    ffi::COSE_ES256,
+                    altered_public_key.as_ptr().cast(),
+                )
+            },
+            ffi::FIDO_ERR_INVALID_SIG
+        );
+    }
+
+    #[test]
+    fn prf_result_shape_rejects_missing_and_wrong_lengths() {
+        let mut secret = [0x5a; SECRET_BYTES];
+        for len in [0, SECRET_BYTES - 1, SECRET_BYTES + 1, SECRET_BYTES * 2] {
+            assert!(matches!(
+                exact_secret_pointer(secret.as_ptr(), len),
+                Err(Error::VerificationFailed)
+            ));
+        }
+        assert!(matches!(
+            exact_secret_pointer(ptr::null(), SECRET_BYTES),
+            Err(Error::VerificationFailed)
+        ));
+        assert_eq!(
+            exact_secret_pointer(secret.as_ptr(), SECRET_BYTES).unwrap(),
+            NonNull::from(&mut secret[0])
+        );
     }
 
     #[test]
     fn compatibility_is_strict() {
-        let mut capabilities = Capabilities {
+        let capabilities = Capabilities {
             fido2: true,
             hmac_secret: true,
             credential_protection: true,
@@ -1335,11 +1553,33 @@ mod tests {
         };
         assert!(capabilities.compatible());
         assert!(capabilities.supports_presence_policy());
-        capabilities.always_uv = true;
-        assert!(!capabilities.supports_presence_policy());
-        assert!(capabilities.supports_verified_policy());
-        capabilities.es256 = false;
-        assert!(!capabilities.compatible());
+        assert!(capabilities.supports_policy(ExactPolicy::Presence));
+        assert!(capabilities.supports_policy(ExactPolicy::UserVerified));
+
+        let mut always_uv = capabilities.clone();
+        always_uv.always_uv = true;
+        assert!(!always_uv.supports_policy(ExactPolicy::Presence));
+        assert!(always_uv.supports_policy(ExactPolicy::UserVerified));
+
+        let candidates = [&capabilities, &always_uv];
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.supports_policy(ExactPolicy::Presence))
+                .count(),
+            1
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.supports_policy(ExactPolicy::UserVerified))
+                .count(),
+            2
+        );
+
+        let mut missing_es256 = capabilities;
+        missing_es256.es256 = false;
+        assert!(!missing_es256.compatible());
     }
 
     #[test]
@@ -1382,6 +1622,7 @@ mod tests {
 
     #[test]
     fn serialized_es256_key_uses_the_native_opaque_type() {
+        initialize_thread();
         let bytes: [u8; ES256_PUBLIC_KEY_BYTES] = [
             0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4,
             0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45,
