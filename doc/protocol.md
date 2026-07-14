@@ -37,6 +37,7 @@ allocation.
 | suite | passphrase | `1` |
 | suite | fido | `2` |
 | suite | fido and passphrase | `3` |
+| suite | recovery secret | `4` |
 | fido policy | presence | `1` |
 | fido policy | user verification | `2` |
 | kdf | argon2id | `1` |
@@ -54,6 +55,8 @@ fido_key_wrap/format_1/passphrase_aad
 fido_key_wrap/format_1/fido_aad
 fido_key_wrap/format_1/combined_passphrase_aad
 fido_key_wrap/format_1/combined_fido_aad
+fido_key_wrap/format_1/recovery_secret_key
+fido_key_wrap/format_1/recovery_secret_aad
 fido_key_wrap/format_1/envelope_mac_key
 fido_key_wrap/format_1/envelope_mac
 ```
@@ -70,6 +73,7 @@ the ascii bytes of each displayed string are used directly.
 | `eid` | 32 bytes | random envelope id |
 | `rid` | 32 bytes | random recipient id |
 | `root` | 32 bytes | random application root |
+| `rs` | 32 bytes | random recovery secret |
 | `cid` | 1–1,024 bytes | fido credential id |
 | `pk` | 64 bytes | es256 public key as `x || y` |
 | `fp` | 1 byte | fido policy code |
@@ -77,21 +81,24 @@ the ascii bytes of each displayed string are used directly.
 | `nf` | 12 bytes | random fido-layer nonce |
 | `s` | 16 bytes | random argon2 salt |
 | `npass` | 12 bytes | random passphrase-layer nonce |
+| `nr` | 12 bytes | random recovery-secret nonce |
 
 ### generation
 
-`create_root` generates `root` with the operating-system random source.
-`protect_root` instead accepts caller-supplied root bytes, which must already be
-uniformly random. library-generated ids, nonces, and salts are drawn from the
-same source. recipient ids and passphrase salts use bounded collision rejection
-within an envelope; rewrap also rejects a repeated prior nonce. recipient ids
-are public random identifiers, not credential or physical-device identities.
+root-creation methods generate `root` with the operating-system random source.
+protection methods instead accept caller-supplied root bytes, which must already
+be uniformly random. each new recovery-secret route also generates `rs` from
+this source. library-generated ids, nonces, and salts use the same source.
+recipient ids and passphrase salts use bounded collision rejection within an
+envelope; rewrap also rejects a repeated prior nonce. recipient ids are public
+random identifiers, not credential or physical-device identities.
 
 ### validation
 
 the p-256 point encoded by `pk` must be valid. labels are 1–64 printable ascii
-bytes, with no leading or trailing space. labels are presentation data and are
-not included in recipient contexts; the final envelope mac authenticates them.
+bytes, with no leading or trailing space. the recovery-secret context includes
+its label. other recipient contexts omit labels. the final envelope mac
+authenticates every label.
 
 the application id is ascii lowercase dns-shaped text with at least two
 labels. each label contains 1–63 lowercase letters, digits, or `-`, begins and
@@ -110,6 +117,15 @@ c = sha256(t(
   f, su, app, eid, rid,
   kdf_code, u32be(memory_kib), u32be(passes), lanes,
   s, npass
+))
+```
+
+for a recovery-secret recipient:
+
+```text
+c = sha256(t(
+  "fido_key_wrap/format_1/recipient_context",
+  f, su, app, eid, rid, label, nr
 ))
 ```
 
@@ -158,6 +174,17 @@ kpass = hkdf-sha-256(
   ikm  = i,
   salt = eid,
   info = t("fido_key_wrap/format_1/passphrase_key", c),
+  len  = 32
+)
+```
+
+## recovery-secret key
+
+```text
+krecovery = hkdf-sha-256(
+  ikm  = rs,
+  salt = eid,
+  info = t("fido_key_wrap/format_1/recovery_secret_key", c),
   len  = 32
 )
 ```
@@ -212,6 +239,13 @@ aad = t("fido_key_wrap/format_1/passphrase_aad", c)
 wrapped_root = aead(kpass, npass, root, aad)
 ```
 
+a recovery-secret recipient stores:
+
+```text
+aad = t("fido_key_wrap/format_1/recovery_secret_aad", c)
+wrapped_root = aead(krecovery, nr, root, aad)
+```
+
 a fido recipient stores:
 
 ```text
@@ -229,10 +263,10 @@ outer_aad = t("fido_key_wrap/format_1/combined_fido_aad", c)
 wrapped_root = aead(kfido, nf, inner, outer_aad)
 ```
 
-a wrapped root is 48 bytes for the passphrase and fido suites. the combined
-inner value is 48 bytes and its outer value is 64 bytes. combined decryption
-authenticates the outer fido layer before requesting or deriving the
-passphrase.
+a wrapped root is 48 bytes for the passphrase, recovery-secret, and fido
+suites. the combined inner value is 48 bytes and its outer value is 64 bytes.
+combined decryption authenticates the outer fido layer before requesting or
+deriving the passphrase.
 
 ## envelope authentication
 
@@ -279,6 +313,10 @@ unlock failure. the result does not reveal which cryptographic check rejected
 the candidate. a passphrase confirmation mismatch remains distinct because it
 is new enrollment input, not an unlock verifier.
 
+a wrong recovery secret, absent or changed recipient id, context change,
+wrapping failure, or final envelope-mac failure returns the same unlock
+failure.
+
 security-key transport and verified-response failures are bounded public error
 classes. native error strings, credential material, prf output, pins,
 passphrases, derived keys, candidate roots, and plaintext are not included in
@@ -306,6 +344,9 @@ recipient arrays are:
 passphrase:
 [1, rid, label, [1, memory_kib, passes, lanes, s], npass, wrapped_root]
 
+recovery secret:
+[4, rid, label, nr, wrapped_root]
+
 fido:
 [2, rid, label, cid, pk, fp, np, nf, wrapped_root]
 
@@ -327,6 +368,7 @@ input is rejected before factor interaction.
 ## interoperability vectors
 
 `test-vectors/` contains deterministic format-1 fixtures for passphrase,
-presence, user verification, both combined policies, a mixed envelope, and the
-demo container. `test-vectors/generate.py` implements transcript framing,
-hkdf, cbor, and envelope construction independently from the rust code.
+recovery secret, presence, user verification, both combined policies, a mixed
+envelope, and the demo container. `test-vectors/generate.py` implements
+transcript framing, hkdf, cbor, and envelope construction independently from
+the rust code.

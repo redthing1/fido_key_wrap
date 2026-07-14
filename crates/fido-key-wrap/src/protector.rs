@@ -6,15 +6,18 @@ use std::cell::Cell;
 use crate::{
     ApplicationId, Enrollment, Error, Interaction, KeyEnvelope, Operation, Passphrase,
     PassphraseLimits, PassphraseParameters, PassphrasePrompt, PassphrasePurpose, RecipientId,
-    Result, RootKey,
+    RecoverySecret, RecoverySecretRecipient, Result, RootKey,
     backend::{AuthenticatorBackend, PrfRequest},
     crypto::{self, DerivedKey},
     envelope::{
         FidoAndPassphraseRecipient, FidoRecipient, KdfDescriptor, MAX_CREDENTIAL_ID,
-        MAX_RECIPIENTS, PassphraseRecipient, RecipientRecord,
+        MAX_RECIPIENTS, PassphraseRecipient, RecipientRecord, RecoverySecretRecord,
     },
-    policy::RecipientPolicy,
+    policy::{RecipientPolicy, validate_label},
 };
+
+#[cfg(feature = "fido")]
+use crate::FidoConfig;
 
 const ROOT_BYTES: usize = 32;
 const WRAPPED_ROOT_BYTES: usize = 48;
@@ -76,10 +79,19 @@ impl KeyProtector {
     #[cfg(feature = "fido")]
     #[must_use]
     pub fn system(application_id: ApplicationId) -> Self {
+        Self::system_with_config(application_id, FidoConfig::default())
+    }
+
+    /// constructs a protector with trusted native-operation limits.
+    ///
+    /// construction performs no device discovery or interaction.
+    #[cfg(feature = "fido")]
+    #[must_use]
+    pub fn system_with_config(application_id: ApplicationId, config: FidoConfig) -> Self {
         Self {
             application_id,
             passphrase_limits: PassphraseLimits::DESKTOP,
-            backend: AuthenticatorBackend::system(),
+            backend: AuthenticatorBackend::system(config),
         }
     }
 
@@ -122,6 +134,38 @@ impl KeyProtector {
         self.protect_root_for_operation(root, enrollment, Operation::ProtectRoot, interaction)
     }
 
+    /// generates a random root and protects it with a new recovery secret.
+    ///
+    /// the recovery secret is returned only after the complete staged envelope
+    /// has been recovered and authenticated.
+    pub fn create_root_with_recovery_secret(
+        &self,
+        label: impl Into<String>,
+    ) -> Result<(RootKey, KeyEnvelope, RecoverySecretRecipient)> {
+        let root = RootKey::random()?;
+        let (envelope, recovery) = self.protect_root_with_recovery_secret(&root, label)?;
+        Ok((root, envelope, recovery))
+    }
+
+    /// protects an existing uniformly random root with a new recovery secret.
+    pub fn protect_root_with_recovery_secret(
+        &self,
+        root: &RootKey,
+        label: impl Into<String>,
+    ) -> Result<(KeyEnvelope, RecoverySecretRecipient)> {
+        let label = validate_recovery_label(label)?;
+        let envelope = KeyEnvelope {
+            application_id: self.application_id.clone(),
+            envelope_id: random_array()?,
+            recipients: Vec::new(),
+            mac: [0; ROOT_BYTES],
+        };
+        let (record, secret, key) = Self::new_recovery_secret_record(&envelope, root, label)?;
+        let id = record.id();
+        let envelope = Self::stage_record(envelope, record, root, &RecoveryKeys::Recovery(key))?;
+        Ok((envelope, RecoverySecretRecipient::new(id, secret)))
+    }
+
     /// recovers a root through exactly one selected recipient.
     ///
     /// # errors
@@ -160,6 +204,7 @@ impl KeyProtector {
                     &key,
                 )?
             }
+            RecipientRecord::RecoverySecret(_) => return Err(Error::UnlockFailed),
             RecipientRecord::Fido(fido_record) => {
                 let prf = self.evaluate(record, envelope, Operation::Unlock, interaction)?;
                 let key = crypto::derive_fido_key(
@@ -223,6 +268,38 @@ impl KeyProtector {
         }
     }
 
+    /// recovers a root through exactly one selected recovery-secret recipient.
+    pub fn unlock_with_recovery_secret(
+        &self,
+        envelope: &KeyEnvelope,
+        recipient: RecipientId,
+        secret: &RecoverySecret,
+    ) -> Result<RootKey> {
+        self.require_application(envelope)?;
+        let RecipientRecord::RecoverySecret(record) =
+            envelope.find(recipient).map_err(|_| Error::UnlockFailed)?
+        else {
+            return Err(Error::UnlockFailed);
+        };
+        let key = crypto::derive_recovery_secret_key(
+            record,
+            &self.application_id,
+            &envelope.envelope_id,
+            secret,
+        )?;
+        let root = crypto::unwrap_recovery_secret_root(
+            record,
+            &self.application_id,
+            &envelope.envelope_id,
+            &key,
+        )?;
+        if crypto::envelope_mac_matches(envelope, &root)? {
+            Ok(root)
+        } else {
+            Err(Error::UnlockFailed)
+        }
+    }
+
     /// adds another alternative recovery route transactionally.
     ///
     /// # errors
@@ -253,6 +330,26 @@ impl KeyProtector {
         let staged = Self::stage_record(envelope.clone(), record, root, &keys)?;
         *envelope = staged;
         Ok(id)
+    }
+
+    /// adds a new recovery-secret route transactionally.
+    pub fn add_recovery_secret(
+        &self,
+        envelope: &mut KeyEnvelope,
+        root: &RootKey,
+        label: impl Into<String>,
+    ) -> Result<RecoverySecretRecipient> {
+        self.require_authenticated(envelope, root)?;
+        if envelope.recipients.len() >= MAX_RECIPIENTS {
+            return Err(Error::TooManyRecipients);
+        }
+        let label = validate_recovery_label(label)?;
+        let (record, secret, key) = Self::new_recovery_secret_record(envelope, root, label)?;
+        let id = record.id();
+        let staged =
+            Self::stage_record(envelope.clone(), record, root, &RecoveryKeys::Recovery(key))?;
+        *envelope = staged;
+        Ok(RecoverySecretRecipient::new(id, secret))
     }
 
     /// removes one recovery route transactionally.
@@ -355,6 +452,7 @@ impl KeyProtector {
                 operation,
                 interaction,
             ),
+            RecipientPolicy::RecoverySecret => Err(Error::InvalidEnvelope),
             RecipientPolicy::Fido(policy) => self.enroll_fido_recipient(
                 envelope,
                 root,
@@ -414,6 +512,39 @@ impl KeyProtector {
             )?;
         }
         Ok((record, RecoveryKeys::Passphrase(key)))
+    }
+
+    fn new_recovery_secret_record(
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        label: String,
+    ) -> Result<(RecipientRecord, RecoverySecret, DerivedKey)> {
+        let secret = RecoverySecret::random()?;
+        let mut record = RecipientRecord::RecoverySecret(RecoverySecretRecord {
+            id: Self::unique_recipient_id(envelope)?,
+            label,
+            recovery_nonce: random_array()?,
+            wrapped_root: [0; WRAPPED_ROOT_BYTES],
+        });
+        let RecipientRecord::RecoverySecret(inner) = &record else {
+            unreachable!("constructed recovery-secret record")
+        };
+        let key = crypto::derive_recovery_secret_key(
+            inner,
+            &envelope.application_id,
+            &envelope.envelope_id,
+            &secret,
+        )?;
+        if let RecipientRecord::RecoverySecret(inner) = &mut record {
+            inner.wrapped_root = crypto::wrap_recovery_secret_root(
+                inner,
+                &envelope.application_id,
+                &envelope.envelope_id,
+                root,
+                &key,
+            )?;
+        }
+        Ok((record, secret, key))
     }
 
     fn enroll_fido_recipient(
@@ -535,6 +666,9 @@ impl KeyProtector {
         let (replacement, keys) = match &current {
             RecipientRecord::Passphrase(old) => {
                 self.rewrap_passphrase_record(envelope, root, old, parameters, interaction)?
+            }
+            RecipientRecord::RecoverySecret(_) => {
+                return Err(Error::RecipientDoesNotUsePassphrase);
             }
             RecipientRecord::Fido(_) => return Err(Error::RecipientDoesNotUsePassphrase),
             RecipientRecord::FidoAndPassphrase(old) => {
@@ -718,7 +852,9 @@ impl KeyProtector {
         interaction: &mut dyn Interaction,
     ) -> Result<zeroize::Zeroizing<[u8; 32]>> {
         let (credential_id, public_key, policy) = match record {
-            RecipientRecord::Passphrase(_) => return Err(Error::InvalidEnvelope),
+            RecipientRecord::Passphrase(_) | RecipientRecord::RecoverySecret(_) => {
+                return Err(Error::InvalidEnvelope);
+            }
             RecipientRecord::Fido(inner) => (&inner.credential_id, &inner.public_key, inner.policy),
             RecipientRecord::FidoAndPassphrase(inner) => {
                 (&inner.credential_id, &inner.public_key, inner.policy)
@@ -789,7 +925,7 @@ impl KeyProtector {
             let salt = random_array()?;
             let duplicate = envelope.recipients.iter().any(|record| match record {
                 RecipientRecord::Passphrase(inner) => inner.kdf.salt == salt,
-                RecipientRecord::Fido(_) => false,
+                RecipientRecord::RecoverySecret(_) | RecipientRecord::Fido(_) => false,
                 RecipientRecord::FidoAndPassphrase(inner) => inner.kdf.salt == salt,
             });
             if !duplicate {
@@ -803,7 +939,7 @@ impl KeyProtector {
         if credential_id.is_empty()
             || credential_id.len() > MAX_CREDENTIAL_ID
             || envelope.recipients.iter().any(|record| match record {
-                RecipientRecord::Passphrase(_) => false,
+                RecipientRecord::Passphrase(_) | RecipientRecord::RecoverySecret(_) => false,
                 RecipientRecord::Fido(inner) => inner.credential_id == credential_id,
                 RecipientRecord::FidoAndPassphrase(inner) => inner.credential_id == credential_id,
             })
@@ -813,16 +949,16 @@ impl KeyProtector {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(any(feature = "testing", test))]
     pub(crate) fn fake(application_id: ApplicationId) -> Self {
         Self {
             application_id,
-            passphrase_limits: PassphraseLimits::PROTOCOL_MAX,
+            passphrase_limits: PassphraseLimits::DESKTOP,
             backend: AuthenticatorBackend::fake(),
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(feature = "testing", test))]
     pub(crate) fn fake_backend_mut(&mut self) -> &mut crate::backend::fake::FakeBackend {
         self.backend.fake_mut()
     }
@@ -830,6 +966,7 @@ impl KeyProtector {
 
 enum RecoveryKeys {
     Passphrase(DerivedKey),
+    Recovery(DerivedKey),
     Fido(DerivedKey),
     Combined {
         passphrase: DerivedKey,
@@ -847,6 +984,9 @@ fn recover_with_keys(
         (RecipientRecord::Passphrase(record), RecoveryKeys::Passphrase(key)) => {
             crypto::unwrap_passphrase_root(record, application_id, envelope_id, key)
         }
+        (RecipientRecord::RecoverySecret(record), RecoveryKeys::Recovery(key)) => {
+            crypto::unwrap_recovery_secret_root(record, application_id, envelope_id, key)
+        }
         (RecipientRecord::Fido(record), RecoveryKeys::Fido(key)) => {
             crypto::unwrap_fido_root(record, application_id, envelope_id, key)
         }
@@ -859,6 +999,12 @@ fn recover_with_keys(
         }
         _ => Err(Error::InvalidEnvelope),
     }
+}
+
+fn validate_recovery_label(label: impl Into<String>) -> Result<String> {
+    let label = label.into();
+    validate_label(&label).map_err(|()| Error::InvalidLabel)?;
+    Ok(label)
 }
 
 fn request_passphrase(
@@ -925,7 +1071,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
-    use crate::{FidoPolicy, InteractionError, Pin};
+    use crate::{AuthenticatorFailure, FidoPolicy, InteractionError, Pin};
 
     struct ScriptedInteraction {
         passphrases: VecDeque<Vec<u8>>,
@@ -1040,6 +1186,154 @@ mod tests {
             Err(Error::UnlockFailed)
         ));
         assert_eq!(envelope.encode(), before);
+    }
+
+    #[test]
+    fn recovery_secret_lifecycle_is_noninteractive_and_transactional() {
+        let mut protector = KeyProtector::new(application());
+        let (root, mut envelope, recovery) = protector
+            .create_root_with_recovery_secret("recovery")
+            .unwrap();
+        let recipient = recovery.recipient_id();
+        assert_eq!(
+            envelope.recipients()[0].policy(),
+            RecipientPolicy::RecoverySecret
+        );
+
+        let encoded = envelope.encode();
+        recovery.secret().expose(|secret| {
+            assert!(!encoded.windows(secret.len()).any(|window| window == secret));
+        });
+
+        let recovered = protector
+            .unlock_with_recovery_secret(&envelope, recipient, recovery.secret())
+            .unwrap();
+        assert!(roots_match(&root, &recovered));
+
+        let mut exported = recovery.secret().expose(|secret| *secret);
+        let imported = RecoverySecret::import(&mut exported);
+        assert_eq!(exported, [0; 32]);
+        let recovered = protector
+            .unlock_with_recovery_secret(&envelope, recipient, &imported)
+            .unwrap();
+        assert!(roots_match(&root, &recovered));
+
+        let mut wrong_bytes = [0x81; 32];
+        let wrong = RecoverySecret::import(&mut wrong_bytes);
+        assert!(matches!(
+            protector.unlock_with_recovery_secret(&envelope, recipient, &wrong),
+            Err(Error::UnlockFailed)
+        ));
+
+        let mut no_interaction = ScriptedInteraction::new(&[]);
+        assert!(matches!(
+            protector.unlock(&envelope, recipient, &mut no_interaction),
+            Err(Error::UnlockFailed)
+        ));
+        assert!(no_interaction.events.is_empty());
+
+        let second = protector
+            .add_recovery_secret(&mut envelope, &root, "second recovery")
+            .unwrap();
+        assert_eq!(envelope.recipients().len(), 2);
+        protector
+            .remove_recipient(&mut envelope, &root, recipient)
+            .unwrap();
+        let recovered = protector
+            .unlock_with_recovery_secret(&envelope, second.recipient_id(), second.secret())
+            .unwrap();
+        assert!(roots_match(&root, &recovered));
+    }
+
+    #[test]
+    fn recovery_secret_binds_context_and_failed_additions_do_not_publish() {
+        let protector = KeyProtector::new(application());
+        let (root, envelope, recovery) = protector
+            .create_root_with_recovery_secret("recovery")
+            .unwrap();
+
+        for mutate in [
+            |record: &mut RecoverySecretRecord| record.label.push('x'),
+            |record: &mut RecoverySecretRecord| record.recovery_nonce[0] ^= 1,
+            |record: &mut RecoverySecretRecord| record.wrapped_root[0] ^= 1,
+        ] {
+            let mut hostile = envelope.clone();
+            let RecipientRecord::RecoverySecret(record) = &mut hostile.recipients[0] else {
+                panic!("fixture must contain a recovery-secret recipient");
+            };
+            mutate(record);
+            assert!(matches!(
+                protector.unlock_with_recovery_secret(
+                    &hostile,
+                    recovery.recipient_id(),
+                    recovery.secret(),
+                ),
+                Err(Error::UnlockFailed)
+            ));
+        }
+
+        let absent = RecipientId::from_bytes([0x7a; 32]);
+        assert!(matches!(
+            protector.unlock_with_recovery_secret(&envelope, absent, recovery.secret()),
+            Err(Error::UnlockFailed)
+        ));
+
+        let mut hostile = envelope.clone();
+        hostile.envelope_id[0] ^= 1;
+        assert!(matches!(
+            protector.unlock_with_recovery_secret(
+                &hostile,
+                recovery.recipient_id(),
+                recovery.secret(),
+            ),
+            Err(Error::UnlockFailed)
+        ));
+
+        let mut hostile = envelope.clone();
+        let RecipientRecord::RecoverySecret(record) = &mut hostile.recipients[0] else {
+            panic!("fixture must contain a recovery-secret recipient");
+        };
+        let changed_id = RecipientId::from_bytes([0x6b; 32]);
+        record.id = changed_id;
+        assert!(matches!(
+            protector.unlock_with_recovery_secret(&hostile, changed_id, recovery.secret()),
+            Err(Error::UnlockFailed)
+        ));
+
+        let mut hostile = envelope.clone();
+        hostile.application_id = ApplicationId::new("org.example.other-application").unwrap();
+        let other_protector = KeyProtector::new(hostile.application_id.clone());
+        assert!(matches!(
+            other_protector.unlock_with_recovery_secret(
+                &hostile,
+                recovery.recipient_id(),
+                recovery.secret(),
+            ),
+            Err(Error::UnlockFailed)
+        ));
+
+        let mut mutable = envelope;
+        let original = mutable.encode();
+        let wrong_root = RootKey::import(&mut [0x45; 32]);
+        assert!(matches!(
+            protector.add_recovery_secret(&mut mutable, &wrong_root, "new recovery"),
+            Err(Error::EnvelopeAuthenticationFailed)
+        ));
+        assert_eq!(mutable.encode(), original);
+
+        for fault in [
+            StagedFault::CanonicalDecode,
+            StagedFault::RootMismatch,
+            StagedFault::EnvelopeMac,
+        ] {
+            fail_next_staged_validation(fault);
+            assert!(
+                protector
+                    .add_recovery_secret(&mut mutable, &root, "new recovery")
+                    .is_err()
+            );
+            assert_eq!(mutable.encode(), original);
+        }
     }
 
     #[test]
@@ -1221,6 +1515,17 @@ mod tests {
             ));
             assert_eq!(envelope.encode(), original);
         }
+
+        let protector = KeyProtector::new(application());
+        let (root, mut envelope, recovery) = protector
+            .create_root_with_recovery_secret("recovery")
+            .unwrap();
+        let original = envelope.encode();
+        assert!(matches!(
+            protector.remove_recipient(&mut envelope, &root, recovery.recipient_id()),
+            Err(Error::WouldRemoveLastRecipient)
+        ));
+        assert_eq!(envelope.encode(), original);
     }
 
     #[test]
@@ -1552,7 +1857,7 @@ mod tests {
         let mut rewrap = ScriptedInteraction::new(&[]);
         assert!(matches!(
             protector.rewrap_passphrase(&mut envelope, &root, recipient, &mut rewrap),
-            Err(Error::AuthenticatorOperationFailed)
+            Err(Error::Authenticator(AuthenticatorFailure::OperationFailed))
         ));
         assert_eq!(envelope.encode(), original);
         assert_eq!(rewrap.events, ["assertion touch"]);
@@ -1598,7 +1903,9 @@ mod tests {
         let mut wrong_credential = ScriptedInteraction::new(&[]);
         assert!(matches!(
             protector.rewrap_passphrase(&mut envelope, &root, recipient, &mut wrong_credential,),
-            Err(Error::AuthenticatorOperationFailed)
+            Err(Error::Authenticator(
+                AuthenticatorFailure::CredentialUnavailable
+            ))
         ));
         assert_eq!(wrong_credential.events, ["assertion touch"]);
         assert_eq!(envelope.encode(), original);

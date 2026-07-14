@@ -1,4 +1,4 @@
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use fido_key_wrap as core;
 use pyo3::{
@@ -23,14 +23,16 @@ use crate::errors::map_error;
 pub enum Policy {
     #[pyo3(name = "PASSPHRASE")]
     Passphrase = 1,
+    #[pyo3(name = "RECOVERY_SECRET")]
+    RecoverySecret = 2,
     #[pyo3(name = "FIDO_PRESENCE")]
-    FidoPresence = 2,
+    FidoPresence = 3,
     #[pyo3(name = "FIDO_USER_VERIFICATION")]
-    FidoUserVerification = 3,
+    FidoUserVerification = 4,
     #[pyo3(name = "FIDO_PRESENCE_AND_PASSPHRASE")]
-    FidoPresenceAndPassphrase = 4,
+    FidoPresenceAndPassphrase = 5,
     #[pyo3(name = "FIDO_USER_VERIFICATION_AND_PASSPHRASE")]
-    FidoUserVerificationAndPassphrase = 5,
+    FidoUserVerificationAndPassphrase = 6,
 }
 
 /// the authenticator requirement within a fido policy.
@@ -63,6 +65,7 @@ impl Policy {
     pub const fn from_core(value: core::RecipientPolicy) -> Self {
         match value {
             core::RecipientPolicy::Passphrase => Self::Passphrase,
+            core::RecipientPolicy::RecoverySecret => Self::RecoverySecret,
             core::RecipientPolicy::Fido(core::FidoPolicy::Presence) => Self::FidoPresence,
             core::RecipientPolicy::Fido(core::FidoPolicy::UserVerification) => {
                 Self::FidoUserVerification
@@ -88,6 +91,7 @@ impl Policy {
     const fn python_name(self) -> &'static str {
         match self {
             Self::Passphrase => "Policy.PASSPHRASE",
+            Self::RecoverySecret => "Policy.RECOVERY_SECRET",
             Self::FidoPresence => "Policy.FIDO_PRESENCE",
             Self::FidoUserVerification => "Policy.FIDO_USER_VERIFICATION",
             Self::FidoPresenceAndPassphrase => "Policy.FIDO_PRESENCE_AND_PASSPHRASE",
@@ -96,6 +100,76 @@ impl Policy {
             }
         }
     }
+}
+
+/// trusted limits for native security-key operations.
+#[pyclass(
+    name = "FidoConfig",
+    eq,
+    frozen,
+    from_py_object,
+    module = "fido_key_wrap._native"
+)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct FidoConfig {
+    pub core: core::FidoConfig,
+}
+
+#[pymethods]
+impl FidoConfig {
+    /// creates validated operation limits expressed in milliseconds.
+    #[new]
+    fn new(
+        py: Python<'_>,
+        operation_timeout_ms: u64,
+        selection_timeout_ms: u64,
+        max_devices: usize,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            core: core::FidoConfig::new(
+                Duration::from_millis(operation_timeout_ms),
+                Duration::from_millis(selection_timeout_ms),
+                max_devices,
+            )
+            .map_err(|error| map_error(py, &error))?,
+        })
+    }
+
+    /// returns the standard native-operation profile.
+    #[staticmethod]
+    fn standard() -> Self {
+        Self {
+            core: core::FidoConfig::default(),
+        }
+    }
+
+    #[getter]
+    fn operation_timeout_ms(&self) -> u64 {
+        timeout_millis(self.core.operation_timeout())
+    }
+
+    #[getter]
+    fn selection_timeout_ms(&self) -> u64 {
+        timeout_millis(self.core.selection_timeout())
+    }
+
+    #[getter]
+    fn max_devices(&self) -> usize {
+        self.core.max_devices()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FidoConfig(operation_timeout_ms={}, selection_timeout_ms={}, max_devices={})",
+            self.core.operation_timeout().as_millis(),
+            self.core.selection_timeout().as_millis(),
+            self.core.max_devices()
+        )
+    }
+}
+
+fn timeout_millis(timeout: Duration) -> u64 {
+    u64::try_from(timeout.as_millis()).expect("validated fido timeout fits in u64")
 }
 
 /// argon2id parameters stored with a passphrase-bearing recipient.
@@ -244,6 +318,11 @@ impl Enrollment {
         policy: Policy,
         parameters: Option<PassphraseParameters>,
     ) -> PyResult<Self> {
+        if policy == Policy::RecoverySecret {
+            return Err(PyTypeError::new_err(
+                "recovery secrets use the dedicated KeyProtector recovery methods",
+            ));
+        }
         if !policy.uses_passphrase() && parameters.is_some() {
             return Err(PyTypeError::new_err(
                 "parameters are only valid for passphrase-bearing policies",
@@ -258,6 +337,7 @@ impl Enrollment {
             (Policy::Passphrase, Some(parameters)) => {
                 core::Enrollment::passphrase_with_parameters(label, parameters.core)
             }
+            (Policy::RecoverySecret, _) => unreachable!("handled above"),
             (Policy::FidoPresence, None) => {
                 core::Enrollment::fido(label, core::FidoPolicy::Presence)
             }
@@ -441,6 +521,131 @@ pub struct RootKey {
     pub core: Arc<core::RootKey>,
 }
 
+/// an opaque, zeroizing 256-bit recovery secret.
+#[pyclass(name = "RecoverySecret", frozen, module = "fido_key_wrap._native")]
+pub struct RecoverySecret {
+    pub core: Arc<core::RecoverySecret>,
+}
+
+impl RecoverySecret {
+    pub fn new(core: core::RecoverySecret) -> Self {
+        Self {
+            core: Arc::new(core),
+        }
+    }
+}
+
+#[allow(clippy::unused_self)]
+#[pymethods]
+impl RecoverySecret {
+    /// imports a uniformly random 32-byte secret and clears the supplied bytearray.
+    #[staticmethod]
+    fn from_bytearray(py: Python<'_>, material: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let mut bytes = take_secret_bytes(
+            py,
+            material,
+            "recovery secret material must contain 32 bytes",
+        )?;
+        Ok(Self::new(core::RecoverySecret::import(&mut bytes)))
+    }
+
+    /// returns one writable copy for application-defined storage.
+    fn export<'py>(&self, py: Python<'py>) -> Bound<'py, PyByteArray> {
+        self.core
+            .expose(|bytes| PyByteArray::new(py, bytes.as_slice()))
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "RecoverySecret([REDACTED])"
+    }
+
+    fn __copy__(&self) -> PyResult<()> {
+        Err(PyTypeError::new_err("recovery secrets cannot be copied"))
+    }
+
+    fn __deepcopy__(&self, _memo: &Bound<'_, PyAny>) -> PyResult<()> {
+        Err(PyTypeError::new_err("recovery secrets cannot be copied"))
+    }
+
+    fn __reduce__(&self) -> PyResult<()> {
+        Err(PyTypeError::new_err("recovery secrets cannot be pickled"))
+    }
+
+    fn __reduce_ex__(&self, _protocol: i32) -> PyResult<()> {
+        Err(PyTypeError::new_err("recovery secrets cannot be pickled"))
+    }
+}
+
+/// a newly generated recovery route and its separately stored secret.
+#[pyclass(
+    name = "RecoverySecretRecipient",
+    frozen,
+    module = "fido_key_wrap._native"
+)]
+pub struct RecoverySecretRecipient {
+    recipient_id: core::RecipientId,
+    secret: Arc<core::RecoverySecret>,
+}
+
+impl RecoverySecretRecipient {
+    pub fn new(core: core::RecoverySecretRecipient) -> Self {
+        let recipient_id = core.recipient_id();
+        Self {
+            recipient_id,
+            secret: Arc::new(core.into_secret()),
+        }
+    }
+}
+
+#[allow(clippy::unused_self)]
+#[pymethods]
+impl RecoverySecretRecipient {
+    #[getter]
+    fn recipient_id(&self) -> RecipientId {
+        RecipientId {
+            core: self.recipient_id,
+        }
+    }
+
+    #[getter]
+    fn secret(&self) -> RecoverySecret {
+        RecoverySecret {
+            core: Arc::clone(&self.secret),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RecoverySecretRecipient(recipient_id=RecipientId('{}'), secret=[REDACTED])",
+            self.recipient_id
+        )
+    }
+
+    fn __copy__(&self) -> PyResult<()> {
+        Err(PyTypeError::new_err(
+            "recovery secret recipients cannot be copied",
+        ))
+    }
+
+    fn __deepcopy__(&self, _memo: &Bound<'_, PyAny>) -> PyResult<()> {
+        Err(PyTypeError::new_err(
+            "recovery secret recipients cannot be copied",
+        ))
+    }
+
+    fn __reduce__(&self) -> PyResult<()> {
+        Err(PyTypeError::new_err(
+            "recovery secret recipients cannot be pickled",
+        ))
+    }
+
+    fn __reduce_ex__(&self, _protocol: i32) -> PyResult<()> {
+        Err(PyTypeError::new_err(
+            "recovery secret recipients cannot be pickled",
+        ))
+    }
+}
+
 impl RootKey {
     pub fn new(core: core::RootKey) -> Self {
         Self {
@@ -455,17 +660,7 @@ impl RootKey {
     /// imports a uniformly random 32-byte root and clears the supplied bytearray.
     #[staticmethod]
     fn from_bytearray(py: Python<'_>, material: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let mut material = take_exact_bytearray(py, material, 32, || {
-            PyTypeError::new_err("root key material must contain 32 bytes")
-        })?;
-        if material.len() != 32 {
-            return Err(PyTypeError::new_err(
-                "root key material must contain 32 bytes",
-            ));
-        }
-        let mut bytes = Zeroizing::new([0u8; 32]);
-        bytes.copy_from_slice(&material);
-        material.fill(0);
+        let mut bytes = take_secret_bytes(py, material, "root key material must contain 32 bytes")?;
         Ok(Self::new(core::RootKey::import(&mut bytes)))
     }
 
@@ -494,6 +689,20 @@ impl RootKey {
     fn __reduce_ex__(&self, _protocol: i32) -> PyResult<()> {
         Err(PyTypeError::new_err("root keys cannot be pickled"))
     }
+}
+
+fn take_secret_bytes(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    invalid_message: &'static str,
+) -> PyResult<Zeroizing<[u8; 32]>> {
+    let material = take_exact_bytearray(py, value, 32, || PyTypeError::new_err(invalid_message))?;
+    if material.len() != 32 {
+        return Err(PyTypeError::new_err(invalid_message));
+    }
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    bytes.copy_from_slice(&material);
+    Ok(bytes)
 }
 
 pub fn take_exact_bytearray(

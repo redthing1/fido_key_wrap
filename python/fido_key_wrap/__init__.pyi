@@ -6,6 +6,7 @@ from ._native import Error as Error
 from ._native import ErrorCode as ErrorCode
 from ._native import FIDO_SUPPORT as FIDO_SUPPORT
 from ._native import FidoCeremony as FidoCeremony
+from ._native import FidoConfig as FidoConfig
 from ._native import FidoPolicy as FidoPolicy
 from ._native import KeyEnvelope as KeyEnvelope
 from ._native import KeyProtector as KeyProtector
@@ -18,6 +19,8 @@ from ._native import PinPrompt as PinPrompt
 from ._native import Policy as Policy
 from ._native import RecipientId as RecipientId
 from ._native import RecipientSummary as RecipientSummary
+from ._native import RecoverySecret as RecoverySecret
+from ._native import RecoverySecretRecipient as RecoverySecretRecipient
 from ._native import RootKey as RootKey
 from ._native import SelectionPrompt as SelectionPrompt
 from ._native import TouchPrompt as TouchPrompt

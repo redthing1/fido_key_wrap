@@ -1,6 +1,6 @@
 use fido_key_wrap_libfido2 as native;
 
-use crate::{Error, Result};
+use crate::{AuthenticatorFailure, Error, Result};
 
 /// one bounded read-only authenticator capability report.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,12 +53,12 @@ pub enum AuthenticatorIssue {
 ///
 /// # errors
 ///
-/// returns [`Error::AuthenticatorOperationFailed`] when discovery itself
+/// returns [`Error::Authenticator`] when discovery itself
 /// cannot complete.
 pub fn inspect_authenticators() -> Result<Vec<AuthenticatorReport>> {
     Ok(native::Backend::default()
         .doctor()
-        .map_err(|_| Error::AuthenticatorOperationFailed)?
+        .map_err(|_| Error::Authenticator(AuthenticatorFailure::OperationFailed))?
         .into_iter()
         .map(|report| match report.status {
             native::DeviceStatus::Compatible(capabilities)

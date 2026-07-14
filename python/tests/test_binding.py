@@ -31,6 +31,15 @@ class BindingTests(unittest.TestCase):
     def enrollment(self, label: str = "primary") -> fkw.Enrollment:
         return fkw.Enrollment(label, fkw.Policy.PASSPHRASE, PARAMETERS)
 
+    def assert_root_equal(self, expected: fkw.RootKey, actual: fkw.RootKey) -> None:
+        expected_bytes = expected.export()
+        actual_bytes = actual.export()
+        try:
+            self.assertEqual(expected_bytes, actual_bytes)
+        finally:
+            expected_bytes[:] = b"\0" * len(expected_bytes)
+            actual_bytes[:] = b"\0" * len(actual_bytes)
+
     def test_complete_passphrase_lifecycle(self) -> None:
         protector = fkw.KeyProtector("tests.example")
         create = Passphrases(b"first passphrase", b"first passphrase")
@@ -66,11 +75,7 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(unlock.prompts[0].operation, fkw.Operation.UNLOCK)
         self.assertEqual(unlock.prompts[0].purpose, fkw.PassphrasePurpose.UNLOCK)
         self.assertEqual(unlock.prompts[0].label, "primary")
-        expected = root.export()
-        actual = recovered.export()
-        self.assertEqual(expected, actual)
-        expected[:] = b"\0" * len(expected)
-        actual[:] = b"\0" * len(actual)
+        self.assert_root_equal(root, recovered)
 
         add = Passphrases(b"second passphrase", b"second passphrase")
         expanded, second = protector.add_recipient(
@@ -126,11 +131,7 @@ class BindingTests(unittest.TestCase):
         unlock = Passphrases(b"passphrase")
         recovered = protector.unlock(envelope, recipient, unlock)
         unlock.assert_cleared()
-        expected = root.export()
-        actual = recovered.export()
-        self.assertEqual(expected, actual)
-        expected[:] = b"\0" * len(expected)
-        actual[:] = b"\0" * len(actual)
+        self.assert_root_equal(root, recovered)
 
         with self.assertRaises(TypeError):
             fkw.RootKey.from_bytearray(bytes(32))
@@ -150,6 +151,89 @@ class BindingTests(unittest.TestCase):
             pickle.dumps(root)
         with self.assertRaises(TypeError):
             hash(root)
+
+    def test_recovery_secret_lifecycle(self) -> None:
+        protector = fkw.KeyProtector("recovery.example")
+        root, original, first = protector.create_root_with_recovery_secret("primary")
+
+        self.assertEqual(first.recipient_id, original.recipients[0].id)
+        self.assertEqual(original.recipients[0].policy, fkw.Policy.RECOVERY_SECRET)
+        self.assert_root_equal(
+            root,
+            protector.unlock_with_recovery_secret(
+                original, first.recipient_id, first.secret
+            ),
+        )
+
+        protected, protected_recipient = protector.protect_root_with_recovery_secret(
+            root, "protected"
+        )
+        self.assert_root_equal(
+            root,
+            protector.unlock_with_recovery_secret(
+                protected,
+                protected_recipient.recipient_id,
+                protected_recipient.secret,
+            ),
+        )
+
+        expanded, second = protector.add_recovery_secret(
+            original, root, "secondary"
+        )
+        self.assertEqual(len(original.recipients), 1)
+        self.assertEqual(len(expanded.recipients), 2)
+        protector.unlock_with_recovery_secret(
+            expanded, second.recipient_id, second.secret
+        )
+
+        reduced = protector.remove_recipient(expanded, root, first.recipient_id)
+        self.assertEqual(
+            tuple(item.id for item in reduced.recipients), (second.recipient_id,)
+        )
+
+    def test_recovery_secret_boundary(self) -> None:
+        protector = fkw.KeyProtector("recovery-boundary.example")
+        _, envelope, recovery = protector.create_root_with_recovery_secret("primary")
+        self.assertEqual(repr(recovery.secret), "RecoverySecret([REDACTED])")
+
+        exported = recovery.secret.export()
+        imported = fkw.RecoverySecret.from_bytearray(exported)
+        self.assertEqual(exported, bytearray(32))
+        protector.unlock_with_recovery_secret(
+            envelope, recovery.recipient_id, imported
+        )
+
+        wrong_material = bytearray(range(32))
+        wrong = fkw.RecoverySecret.from_bytearray(wrong_material)
+        self.assertEqual(wrong_material, bytearray(32))
+        with self.assertRaises(fkw.Error) as caught:
+            protector.unlock_with_recovery_secret(
+                envelope, recovery.recipient_id, wrong
+            )
+        self.assertEqual(caught.exception.code, fkw.ErrorCode.UNLOCK_FAILED)
+        self.assertIsNone(caught.exception.pin_retries)
+
+        short = bytearray(b"short")
+        with self.assertRaises(TypeError):
+            fkw.RecoverySecret.from_bytearray(short)
+        self.assertEqual(short, bytearray(len(short)))
+
+        for value in (recovery.secret, recovery):
+            for operation in (copy.copy, copy.deepcopy, pickle.dumps, hash):
+                with self.assertRaises(TypeError):
+                    operation(value)
+
+    def test_recovery_secret_requires_explicit_unlock(self) -> None:
+        protector = fkw.KeyProtector("recovery-explicit.example")
+        _, envelope, recovery = protector.create_root_with_recovery_secret("primary")
+
+        class Unexpected:
+            def __getattr__(self, _name):
+                raise AssertionError("interaction was requested")
+
+        with self.assertRaises(fkw.Error) as caught:
+            protector.unlock(envelope, recovery.recipient_id, Unexpected())
+        self.assertEqual(caught.exception.code, fkw.ErrorCode.UNLOCK_FAILED)
 
     def test_callback_failures_are_preserved_and_inputs_are_cleared(self) -> None:
         protector = fkw.KeyProtector("callbacks.example")
@@ -310,6 +394,7 @@ class BindingTests(unittest.TestCase):
         with self.assertRaises(fkw.Error) as caught:
             fkw.KeyProtector("invalid")
         self.assertEqual(caught.exception.code, fkw.ErrorCode.INVALID_APPLICATION_ID)
+        self.assertIsNone(caught.exception.pin_retries)
 
         with self.assertRaises(TypeError):
             fkw.Enrollment(
@@ -317,14 +402,19 @@ class BindingTests(unittest.TestCase):
                 fkw.Policy.FIDO_PRESENCE,
                 PARAMETERS,
             )
+        with self.assertRaises(TypeError):
+            fkw.Enrollment("recovery", fkw.Policy.RECOVERY_SECRET)
         policies = (
             fkw.Policy.PASSPHRASE,
+            fkw.Policy.RECOVERY_SECRET,
             fkw.Policy.FIDO_PRESENCE,
             fkw.Policy.FIDO_USER_VERIFICATION,
             fkw.Policy.FIDO_PRESENCE_AND_PASSPHRASE,
             fkw.Policy.FIDO_USER_VERIFICATION_AND_PASSPHRASE,
         )
-        for index, policy in enumerate(policies):
+        for index, policy in enumerate(
+            policy for policy in policies if policy != fkw.Policy.RECOVERY_SECRET
+        ):
             enrollment = fkw.Enrollment(f"policy {index}", policy, None)
             self.assertEqual(enrollment.policy, policy)
         self.assertEqual(len(set(policies)), len(policies))
@@ -345,12 +435,56 @@ class BindingTests(unittest.TestCase):
             parameters,
         )
         self.assertEqual(
-            fkw.KeyProtector("values.example", limits).passphrase_limits,
+            fkw.KeyProtector(
+                "values.example", passphrase_limits=limits
+            ).passphrase_limits,
             limits,
         )
         self.assertTrue(limits.accepts(parameters))
         with self.assertRaises(AttributeError):
             parameters.memory_kib = 1
+
+    def test_fido_config_is_validated_and_visible(self) -> None:
+        config = fkw.FidoConfig.standard()
+        self.assertEqual(config, fkw.FidoConfig.standard())
+        self.assertEqual(config.operation_timeout_ms, 30_000)
+        self.assertEqual(config.selection_timeout_ms, 20_000)
+        self.assertEqual(config.max_devices, 16)
+        maximum_timeout = 2_147_483_647
+        self.assertEqual(
+            fkw.FidoConfig(1, maximum_timeout, 32).selection_timeout_ms,
+            maximum_timeout,
+        )
+
+        if fkw.FIDO_SUPPORT:
+            self.assertEqual(
+                fkw.KeyProtector(
+                    "fido-config.example", fido_config=config
+                ).fido_config,
+                config,
+            )
+        else:
+            with self.assertRaises(fkw.Error) as caught:
+                fkw.KeyProtector(
+                    "fido-config.example", fido_config=config
+                )
+            self.assertEqual(
+                caught.exception.code, fkw.ErrorCode.FIDO_SUPPORT_UNAVAILABLE
+            )
+        for values in (
+            (0, 1, 1),
+            (1, 0, 1),
+            (maximum_timeout + 1, 1, 1),
+            (1, maximum_timeout + 1, 1),
+            (1, 1, 0),
+            (1, 1, 33),
+        ):
+            with self.assertRaises(fkw.Error) as caught:
+                fkw.FidoConfig(*values)
+            self.assertEqual(caught.exception.code, fkw.ErrorCode.INVALID_FIDO_CONFIG)
+            self.assertIsNone(caught.exception.pin_retries)
+        with self.assertRaises(AttributeError):
+            config.max_devices = 1
 
 
 if __name__ == "__main__":

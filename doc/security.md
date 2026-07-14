@@ -13,9 +13,10 @@ exact envelope bytes are authenticated with that ciphertext.
 ## construction in brief
 
 a passphrase recipient derives a wrapping key with argon2id followed by
-hkdf-sha-256. a fido recipient obtains a signed and verified `hmac-secret`
-result from its dedicated non-discoverable credential, then derives a wrapping
-key with hkdf-sha-256.
+hkdf-sha-256. a recovery-secret recipient derives its wrapping key from a
+library-generated 256-bit secret with hkdf-sha-256. a fido recipient obtains a
+signed and verified `hmac-secret` result from its dedicated non-discoverable
+credential, then derives a wrapping key with hkdf-sha-256.
 
 a combined recipient encrypts the root under the passphrase key and encrypts
 that result under the fido key. unlock verifies and removes the fido layer
@@ -30,6 +31,12 @@ returned.
 the exact construction and wire format are in [protocol.md](protocol.md).
 
 ## recovery policies
+
+`recovery secret` requires the exact 32-byte secret returned when the recipient
+was created. the envelope contains no copy or verifier of that secret. the
+application must store it separately and treat it as sufficient to recover the
+root through this route. it is generated binary key material, not a passphrase
+or a human recovery code.
 
 `fido presence` requires the recorded credential and a signed assertion with
 user presence set and user verification clear. in ordinary use this means the
@@ -70,7 +77,8 @@ joined by **or**.
 the least demanding available route determines the minimum protection of the
 root. for example, a passphrase-only recovery recipient permits offline
 guessing even when another recipient requires both a security key and a
-passphrase.
+passphrase. a recovery-secret recipient permits recovery by anyone who obtains
+that secret and the envelope.
 
 the library evaluates exactly the selected `RecipientId`. it does not search
 for a working recipient or fall back after failure.
@@ -91,6 +99,13 @@ been copied.
 
 argon2 increases the cost of each guess but does not add entropy. a strong,
 unique application passphrase remains necessary.
+
+### recovery-secret recipient
+
+a copied envelope does not permit practical guessing of a uniformly random
+256-bit recovery secret. disclosure of the separately stored secret permits
+immediate recovery through that recipient. the library does not define its
+storage, encoding, export, or transfer policy.
 
 ### fido recipient
 
@@ -187,10 +202,11 @@ a bounded blocking pool and limit simultaneous work.
 
 ## secret lifetime
 
-`RootKey`, `Passphrase`, and `Pin` have no `Clone` or `Display`, redact `Debug`,
-and use zeroizing storage. `RootKey::expose` can still let application code copy
-or print the root. owned argon2 memory, kdf output, prf result, derived keys,
-decrypted layers, and transient root buffers are cleared when dropped.
+`RootKey`, `RecoverySecret`, `Passphrase`, and `Pin` have no `Clone` or
+`Display`, redact `Debug`, and use zeroizing storage. their explicit exposure
+methods can still let application code copy or print secrets. owned argon2
+memory, kdf output, prf result, derived keys, decrypted layers, and transient
+root buffers are cleared when dropped.
 
 zeroization reduces ordinary secret lifetime; it is not forensic erasure. it
 cannot guarantee removal from registers, compiler temporaries, allocator

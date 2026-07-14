@@ -13,10 +13,10 @@ use zeroize::Zeroizing;
 use std::cell::Cell;
 
 use crate::{
-    ApplicationId, Error, KeyEnvelope, Passphrase, Result, RootKey,
+    ApplicationId, Error, KeyEnvelope, Passphrase, RecoverySecret, Result, RootKey,
     envelope::{
         FidoAndPassphraseRecipient, FidoRecipient, KdfDescriptor, PassphraseRecipient,
-        RecipientRecord,
+        RecipientRecord, RecoverySecretRecord,
     },
     transcript,
 };
@@ -25,6 +25,7 @@ const FORMAT: [u8; 1] = [1];
 const PASSPHRASE_SUITE: [u8; 1] = [1];
 const FIDO_SUITE: [u8; 1] = [2];
 const COMBINED_SUITE: [u8; 1] = [3];
+const RECOVERY_SECRET_SUITE: [u8; 1] = [4];
 const ARGON2ID_KDF: [u8; 1] = [1];
 const ROOT_BYTES: usize = 32;
 const TAG_BYTES: usize = 16;
@@ -35,8 +36,10 @@ const RECIPIENT_CONTEXT_DOMAIN: &[u8] = b"fido_key_wrap/format_1/recipient_conte
 const PRF_INPUT_DOMAIN: &[u8] = b"fido_key_wrap/format_1/prf_input";
 const PASSPHRASE_KEY_DOMAIN: &[u8] = b"fido_key_wrap/format_1/passphrase_key";
 const FIDO_KEY_DOMAIN: &[u8] = b"fido_key_wrap/format_1/fido_key";
+const RECOVERY_SECRET_KEY_DOMAIN: &[u8] = b"fido_key_wrap/format_1/recovery_secret_key";
 const PASSPHRASE_AAD_DOMAIN: &[u8] = b"fido_key_wrap/format_1/passphrase_aad";
 const FIDO_AAD_DOMAIN: &[u8] = b"fido_key_wrap/format_1/fido_aad";
+const RECOVERY_SECRET_AAD_DOMAIN: &[u8] = b"fido_key_wrap/format_1/recovery_secret_aad";
 const COMBINED_PASSPHRASE_AAD_DOMAIN: &[u8] = b"fido_key_wrap/format_1/combined_passphrase_aad";
 const COMBINED_FIDO_AAD_DOMAIN: &[u8] = b"fido_key_wrap/format_1/combined_fido_aad";
 const ENVELOPE_MAC_KEY_DOMAIN: &[u8] = b"fido_key_wrap/format_1/envelope_mac_key";
@@ -74,7 +77,10 @@ pub(crate) fn prf_input(
     application: &ApplicationId,
     envelope_id: &[u8; 32],
 ) -> Result<[u8; 32]> {
-    if matches!(recipient, RecipientRecord::Passphrase(_)) {
+    if matches!(
+        recipient,
+        RecipientRecord::Passphrase(_) | RecipientRecord::RecoverySecret(_)
+    ) {
         return Err(Error::InvalidEnvelope);
     }
     let context = recipient_context(recipient, application, envelope_id)?;
@@ -99,12 +105,26 @@ pub(crate) fn derive_fido_key(
     envelope_id: &[u8; 32],
     verified_prf_result: &[u8; 32],
 ) -> Result<DerivedKey> {
-    if matches!(recipient, RecipientRecord::Passphrase(_)) {
+    if matches!(
+        recipient,
+        RecipientRecord::Passphrase(_) | RecipientRecord::RecoverySecret(_)
+    ) {
         return Err(Error::InvalidEnvelope);
     }
     let context = recipient_context(recipient, application, envelope_id)?;
     let info = transcript::encode(&[FIDO_KEY_DOMAIN, &context])?;
     derive_key(verified_prf_result, envelope_id, &info)
+}
+
+pub(crate) fn derive_recovery_secret_key(
+    recipient: &RecoverySecretRecord,
+    application: &ApplicationId,
+    envelope_id: &[u8; 32],
+    secret: &RecoverySecret,
+) -> Result<DerivedKey> {
+    let context = recovery_secret_context(recipient, application, envelope_id)?;
+    let info = transcript::encode(&[RECOVERY_SECRET_KEY_DOMAIN, &context])?;
+    derive_key(secret.bytes(), envelope_id, &info)
 }
 
 pub(crate) fn wrap_passphrase_root(
@@ -130,6 +150,35 @@ pub(crate) fn unwrap_passphrase_root(
     let root = decrypt_fixed(
         key,
         &recipient.passphrase_nonce,
+        &recipient.wrapped_root,
+        &aad,
+    )?;
+    Ok(RootKey::from_zeroizing(root))
+}
+
+pub(crate) fn wrap_recovery_secret_root(
+    recipient: &RecoverySecretRecord,
+    application: &ApplicationId,
+    envelope_id: &[u8; 32],
+    root: &RootKey,
+    key: &DerivedKey,
+) -> Result<[u8; WRAPPED_ROOT_BYTES]> {
+    let context = recovery_secret_context(recipient, application, envelope_id)?;
+    let aad = transcript::encode(&[RECOVERY_SECRET_AAD_DOMAIN, &context])?;
+    encrypt_fixed(key, &recipient.recovery_nonce, root.bytes(), &aad)
+}
+
+pub(crate) fn unwrap_recovery_secret_root(
+    recipient: &RecoverySecretRecord,
+    application: &ApplicationId,
+    envelope_id: &[u8; 32],
+    key: &DerivedKey,
+) -> Result<RootKey> {
+    let context = recovery_secret_context(recipient, application, envelope_id)?;
+    let aad = transcript::encode(&[RECOVERY_SECRET_AAD_DOMAIN, &context])?;
+    let root = decrypt_fixed(
+        key,
+        &recipient.recovery_nonce,
         &recipient.wrapped_root,
         &aad,
     )?;
@@ -271,11 +320,31 @@ fn recipient_context_transcript(
         RecipientRecord::Passphrase(record) => {
             passphrase_context_transcript(record, application, envelope_id)
         }
+        RecipientRecord::RecoverySecret(record) => {
+            recovery_secret_context_transcript(record, application, envelope_id)
+        }
         RecipientRecord::Fido(record) => fido_context_transcript(record, application, envelope_id),
         RecipientRecord::FidoAndPassphrase(record) => {
             combined_context_transcript(record, application, envelope_id)
         }
     }
+}
+
+fn recovery_secret_context_transcript(
+    recipient: &RecoverySecretRecord,
+    application: &ApplicationId,
+    envelope_id: &[u8; 32],
+) -> Result<Vec<u8>> {
+    transcript::encode(&[
+        RECIPIENT_CONTEXT_DOMAIN,
+        &FORMAT,
+        &RECOVERY_SECRET_SUITE,
+        application.as_str().as_bytes(),
+        envelope_id,
+        recipient.id.as_bytes(),
+        recipient.label.as_bytes(),
+        &recipient.recovery_nonce,
+    ])
 }
 
 fn passphrase_context_transcript(
@@ -379,6 +448,19 @@ fn fido_context(
     .into())
 }
 
+fn recovery_secret_context(
+    recipient: &RecoverySecretRecord,
+    application: &ApplicationId,
+    envelope_id: &[u8; 32],
+) -> Result<[u8; 32]> {
+    Ok(Sha256::digest(recovery_secret_context_transcript(
+        recipient,
+        application,
+        envelope_id,
+    )?)
+    .into())
+}
+
 fn combined_context(
     recipient: &FidoAndPassphraseRecipient,
     application: &ApplicationId,
@@ -405,7 +487,9 @@ fn derive_passphrase_key_inner(
 ) -> Result<DerivedKey> {
     let kdf = match recipient {
         RecipientRecord::Passphrase(record) => record.kdf,
-        RecipientRecord::Fido(_) => return Err(Error::InvalidEnvelope),
+        RecipientRecord::RecoverySecret(_) | RecipientRecord::Fido(_) => {
+            return Err(Error::InvalidEnvelope);
+        }
         RecipientRecord::FidoAndPassphrase(record) => record.kdf,
     };
     let context = recipient_context(recipient, application, envelope_id)?;
@@ -527,6 +611,8 @@ mod tests {
     use super::*;
 
     const PASSPHRASE_VECTOR: &str = include_str!("../../../test-vectors/format-1-passphrase.txt");
+    const RECOVERY_SECRET_VECTOR: &str =
+        include_str!("../../../test-vectors/format-1-recovery-secret.txt");
     const FIDO_PRESENCE_VECTOR: &str =
         include_str!("../../../test-vectors/format-1-fido-presence.txt");
     const FIDO_UV_VECTOR: &str =
@@ -677,6 +763,72 @@ mod tests {
             ),
             Err(Error::UnlockFailed)
         ));
+    }
+
+    #[test]
+    fn recovery_secret_vector_matches_every_intermediate() {
+        let envelope = envelope(RECOVERY_SECRET_VECTOR);
+        let recipient = &envelope.recipients[0];
+        let RecipientRecord::RecoverySecret(record) = recipient else {
+            panic!("vector must contain a recovery-secret recipient");
+        };
+
+        let context_transcript = recovery_secret_context_transcript(
+            record,
+            &envelope.application_id,
+            &envelope.envelope_id,
+        )
+        .unwrap();
+        assert_eq!(
+            context_transcript,
+            hex(RECOVERY_SECRET_VECTOR, "recipient_context_transcript")
+        );
+        let context =
+            recipient_context(recipient, &envelope.application_id, &envelope.envelope_id).unwrap();
+        assert_eq!(context, array(RECOVERY_SECRET_VECTOR, "recipient_context"));
+
+        let mut secret_bytes = array(RECOVERY_SECRET_VECTOR, "recovery_secret");
+        let secret = RecoverySecret::import(&mut secret_bytes);
+        assert_eq!(secret_bytes, [0; 32]);
+        let key = derive_recovery_secret_key(
+            record,
+            &envelope.application_id,
+            &envelope.envelope_id,
+            &secret,
+        )
+        .unwrap();
+        assert_eq!(
+            key.as_bytes(),
+            &array(RECOVERY_SECRET_VECTOR, "recovery_key")
+        );
+        assert_eq!(
+            transcript::encode(&[RECOVERY_SECRET_KEY_DOMAIN, &context]).unwrap(),
+            hex(RECOVERY_SECRET_VECTOR, "recovery_key_info")
+        );
+        assert_eq!(
+            transcript::encode(&[RECOVERY_SECRET_AAD_DOMAIN, &context]).unwrap(),
+            hex(RECOVERY_SECRET_VECTOR, "recovery_aad")
+        );
+
+        let expected_root = root(RECOVERY_SECRET_VECTOR);
+        check_envelope_mac_intermediates(RECOVERY_SECRET_VECTOR, &envelope, &expected_root);
+        let wrapped = wrap_recovery_secret_root(
+            record,
+            &envelope.application_id,
+            &envelope.envelope_id,
+            &expected_root,
+            &key,
+        )
+        .unwrap();
+        assert_eq!(wrapped, array(RECOVERY_SECRET_VECTOR, "wrapped_root"));
+        let recovered = unwrap_recovery_secret_root(
+            record,
+            &envelope.application_id,
+            &envelope.envelope_id,
+            &key,
+        )
+        .unwrap();
+        assert_eq!(recovered.bytes(), expected_root.bytes());
     }
 
     #[test]
@@ -1142,6 +1294,7 @@ mod tests {
             let mut candidate = envelope.clone();
             match &mut candidate.recipients[index] {
                 RecipientRecord::Passphrase(record) => record.label.push('x'),
+                RecipientRecord::RecoverySecret(record) => record.label.push('x'),
                 RecipientRecord::Fido(record) => record.label.push('x'),
                 RecipientRecord::FidoAndPassphrase(record) => record.label.push('x'),
             }
@@ -1164,7 +1317,7 @@ mod tests {
     #[test]
     fn mixed_recipient_body_and_whole_envelope_mac_match_vector() {
         let envelope = envelope(MIXED_VECTOR);
-        assert_eq!(envelope.recipients.len(), 5);
+        assert_eq!(envelope.recipients.len(), 6);
         let root = root(MIXED_VECTOR);
         check_envelope_mac_intermediates(MIXED_VECTOR, &envelope, &root);
         verify_envelope_mac(&envelope, &root).unwrap();

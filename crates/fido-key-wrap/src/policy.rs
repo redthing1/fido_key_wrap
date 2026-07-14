@@ -43,6 +43,8 @@ impl FidoPolicy {
 pub enum RecipientPolicy {
     /// an application passphrase.
     Passphrase,
+    /// one uniformly random recovery secret.
+    RecoverySecret,
     /// one exact security-key ceremony.
     Fido(FidoPolicy),
     /// one exact security-key ceremony followed by an application passphrase.
@@ -282,7 +284,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exposes_exact_five_policy_model() {
+    fn exposes_five_interactive_enrollments_and_separate_recovery_policy() {
         let policies = [
             Enrollment::passphrase("passphrase").unwrap().policy(),
             Enrollment::fido("presence", FidoPolicy::Presence)
@@ -299,6 +301,8 @@ mod tests {
                 .policy(),
         ];
         assert_eq!(policies.len(), 5);
+        assert!(!policies.contains(&RecipientPolicy::RecoverySecret));
+        assert!(!RecipientPolicy::RecoverySecret.uses_passphrase());
         assert!(policies[0].uses_passphrase());
         assert_eq!(policies[1], RecipientPolicy::Fido(FidoPolicy::Presence));
     }

@@ -3,6 +3,39 @@ use crate::InteractionError;
 /// result type returned by this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// actionable, identity-free failure from a security-key operation.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum AuthenticatorFailure {
+    /// the supplied pin was incorrect.
+    #[error("the security-key pin was incorrect")]
+    PinInvalid {
+        /// remaining attempts reported by the authenticator, when available.
+        retries: Option<u8>,
+    },
+    /// the authenticator's pin is permanently blocked.
+    #[error("the security-key pin is blocked")]
+    PinBlocked,
+    /// pin authentication is temporarily blocked until the authenticator reconnects.
+    #[error("security-key pin authentication is temporarily blocked")]
+    PinTemporarilyBlocked,
+    /// selection or an authenticator operation timed out.
+    #[error("the security-key operation timed out")]
+    TimedOut,
+    /// the authenticator is occupied by another operation.
+    #[error("the security key is busy")]
+    Busy,
+    /// the selected credential is not available on the presented authenticator.
+    #[error("the security-key credential is unavailable")]
+    CredentialUnavailable,
+    /// communication with the authenticator failed.
+    #[error("security-key transport failed")]
+    Transport,
+    /// the authenticator operation failed without a more useful safe category.
+    #[error("the security-key operation failed")]
+    OperationFailed,
+}
+
 /// bounded public failures from root-key protection operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -28,6 +61,9 @@ pub enum Error {
     /// local argon2 resource ceilings were invalid.
     #[error("invalid passphrase limits")]
     InvalidPassphraseLimits,
+    /// native security-key operation limits were invalid.
+    #[error("invalid security-key configuration")]
+    InvalidFidoConfig,
     /// an encoded envelope was malformed, noncanonical, or unsupported.
     #[error("invalid key envelope")]
     InvalidEnvelope,
@@ -62,8 +98,8 @@ pub enum Error {
     #[error("no compatible security key was found")]
     NoCompatibleAuthenticator,
     /// a security-key operation failed without trusted cryptographic output.
-    #[error("the security-key operation failed")]
-    AuthenticatorOperationFailed,
+    #[error("{0}")]
+    Authenticator(#[from] AuthenticatorFailure),
     /// an authenticator response was malformed, contradictory, or cryptographically invalid.
     #[error("the security key returned an invalid response")]
     AuthenticatorResponseInvalid,

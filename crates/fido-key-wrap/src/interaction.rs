@@ -139,7 +139,7 @@ pub struct SelectionPrompt {
 }
 
 impl SelectionPrompt {
-    #[cfg(any(feature = "fido", test))]
+    #[cfg(any(feature = "fido", feature = "testing", test))]
     pub(crate) fn new(operation: Operation, label: &str, policy: FidoPolicy) -> Self {
         Self {
             operation,
@@ -176,7 +176,7 @@ pub struct PinPrompt {
 }
 
 impl PinPrompt {
-    #[cfg(any(feature = "fido", test))]
+    #[cfg(any(feature = "fido", feature = "testing", test))]
     pub(crate) fn new(operation: Operation, label: &str, ceremony: FidoCeremony) -> Self {
         Self {
             operation,
@@ -250,7 +250,7 @@ pub struct TouchPrompt {
 }
 
 impl TouchPrompt {
-    #[cfg(any(feature = "fido", test))]
+    #[cfg(any(feature = "fido", feature = "testing", test))]
     pub(crate) fn new(
         operation: Operation,
         label: &str,

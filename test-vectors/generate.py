@@ -25,6 +25,7 @@ FORMAT = 1
 SUITE_PASSPHRASE = 1
 SUITE_FIDO = 2
 SUITE_COMBINED = 3
+SUITE_RECOVERY_SECRET = 4
 POLICY_PRESENCE = 1
 POLICY_USER_VERIFICATION = 2
 KDF_ARGON2ID = 1
@@ -32,15 +33,24 @@ KDF_ARGON2ID = 1
 APPLICATION_ID = "vectors.fido-key-wrap.example"
 ROOT_KEY = hashlib.sha256(b"fido-key-wrap independent vector root").digest()
 PASSPHRASE = b"correct horse battery staple"
+RECOVERY_SECRET = hashlib.sha256(
+    b"fido-key-wrap independent vector recovery secret"
+).digest()
 DESKTOP_KDF = (262_144, 3, 4)
 NON_DEFAULT_KDF = (65_536, 4, 2)
 
 DOMAIN_RECIPIENT_CONTEXT = b"fido_key_wrap/format_1/recipient_context"
 DOMAIN_PASSPHRASE_KEY = b"fido_key_wrap/format_1/passphrase_key"
 DOMAIN_FIDO_KEY = b"fido_key_wrap/format_1/fido_key"
+DOMAIN_RECOVERY_SECRET_KEY = (
+    b"fido_key_wrap/format_1/recovery_secret_key"
+)
 DOMAIN_PRF_INPUT = b"fido_key_wrap/format_1/prf_input"
 DOMAIN_PASSPHRASE_AAD = b"fido_key_wrap/format_1/passphrase_aad"
 DOMAIN_FIDO_AAD = b"fido_key_wrap/format_1/fido_aad"
+DOMAIN_RECOVERY_SECRET_AAD = (
+    b"fido_key_wrap/format_1/recovery_secret_aad"
+)
 DOMAIN_COMBINED_PASSPHRASE_AAD = (
     b"fido_key_wrap/format_1/combined_passphrase_aad"
 )
@@ -68,6 +78,8 @@ class RecordSpec:
     kdf: tuple[int, int, int] | None = None
     salt: bytes | None = None
     passphrase_nonce: bytes | None = None
+    recovery_secret: bytes | None = None
+    recovery_nonce: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -186,6 +198,19 @@ def build_record(
             spec.salt,
             spec.passphrase_nonce,
         )
+    elif spec.suite == SUITE_RECOVERY_SECRET:
+        assert spec.recovery_secret is not None
+        assert spec.recovery_nonce is not None
+        context_transcript = transcript(
+            DOMAIN_RECIPIENT_CONTEXT,
+            bytes([FORMAT]),
+            bytes([spec.suite]),
+            application,
+            envelope_id,
+            spec.recipient_id,
+            spec.label.encode("utf-8"),
+            spec.recovery_nonce,
+        )
     elif spec.suite in (SUITE_FIDO, SUITE_COMBINED):
         credential_id = require(spec.credential_id)
         public_key = require(spec.public_key)
@@ -271,6 +296,23 @@ def build_record(
             )
         )
 
+    recovery_key: bytes | None = None
+    if spec.suite == SUITE_RECOVERY_SECRET:
+        assert spec.recovery_secret is not None
+        assert spec.recovery_nonce is not None
+        recovery_key_info = transcript(DOMAIN_RECOVERY_SECRET_KEY, context)
+        recovery_key = hkdf_sha256(
+            spec.recovery_secret, envelope_id, recovery_key_info
+        )
+        fields.extend(
+            (
+                ("recovery_secret", spec.recovery_secret),
+                ("recovery_nonce", spec.recovery_nonce),
+                ("recovery_key_info", recovery_key_info),
+                ("recovery_key", recovery_key),
+            )
+        )
+
     fido_key: bytes | None = None
     if spec.suite in (SUITE_FIDO, SUITE_COMBINED):
         credential_id = require(spec.credential_id)
@@ -342,6 +384,31 @@ def build_record(
                 ("passphrase_aad", aad),
                 ("wrapped_root", wrapped_root),
             )
+        )
+    elif spec.suite == SUITE_RECOVERY_SECRET:
+        assert recovery_key is not None
+        assert spec.recovery_nonce is not None
+        aad = transcript(DOMAIN_RECOVERY_SECRET_AAD, context)
+        wrapped_root = AESGCM(recovery_key).encrypt(
+            spec.recovery_nonce, root_key, aad
+        )
+        assert (
+            AESGCM(recovery_key).decrypt(
+                spec.recovery_nonce, wrapped_root, aad
+            )
+            == root_key
+        )
+        encoded = cbor_array(
+            [
+                cbor_uint(spec.suite),
+                cbor_bytes(spec.recipient_id),
+                cbor_text(spec.label),
+                cbor_bytes(spec.recovery_nonce),
+                cbor_bytes(wrapped_root),
+            ]
+        )
+        fields.extend(
+            (("recovery_aad", aad), ("wrapped_root", wrapped_root))
         )
     elif spec.suite == SUITE_FIDO:
         assert fido_key is not None
@@ -522,7 +589,10 @@ def render_fixture(
         f"# {title}",
         "# deterministic correctness vector; byte values are lowercase hexadecimal.",
     ]
-    if any(record.spec.suite != SUITE_PASSPHRASE for record in records):
+    if any(
+        record.spec.suite in (SUITE_FIDO, SUITE_COMBINED)
+        for record in records
+    ):
         lines.append(
             "# verified_prf_result values are synthetic fixed inputs, not an authenticator simulation."
         )
@@ -606,6 +676,14 @@ def specs() -> list[RecordSpec]:
             kdf=NON_DEFAULT_KDF,
             salt=sequence(0xC0, 16),
             passphrase_nonce=sequence(0xD0, 12),
+        ),
+        RecordSpec(
+            name="recovery-secret",
+            suite=SUITE_RECOVERY_SECRET,
+            recipient_id=sequence(0xB0, 32),
+            label="recovery secret",
+            recovery_secret=RECOVERY_SECRET,
+            recovery_nonce=sequence(0xE0, 12),
         ),
     ]
 
@@ -696,7 +774,7 @@ def main() -> None:
     )
     (output_directory / "format-1-mixed.txt").write_text(
         render_fixture(
-            "fido-key-wrap format 1, five-recipient mixed envelope",
+            "fido-key-wrap format 1, six-recipient mixed envelope",
             mixed_records,
             mixed_common,
         ),

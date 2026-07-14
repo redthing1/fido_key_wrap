@@ -15,6 +15,7 @@ pub(crate) const MAX_CREDENTIAL_ID: usize = 1_024;
 const PASSPHRASE_SUITE: u8 = 1;
 const FIDO_SUITE: u8 = 2;
 const FIDO_AND_PASSPHRASE_SUITE: u8 = 3;
+const RECOVERY_SECRET_SUITE: u8 = 4;
 const ARGON2ID_KDF: u8 = 1;
 
 const ROOT_BYTES: usize = 32;
@@ -61,6 +62,14 @@ pub(crate) struct PassphraseRecipient {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecoverySecretRecord {
+    pub(crate) id: RecipientId,
+    pub(crate) label: String,
+    pub(crate) recovery_nonce: [u8; GCM_NONCE_BYTES],
+    pub(crate) wrapped_root: [u8; WRAPPED_ROOT_BYTES],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FidoRecipient {
     pub(crate) id: RecipientId,
     pub(crate) label: String,
@@ -90,6 +99,7 @@ pub(crate) struct FidoAndPassphraseRecipient {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RecipientRecord {
     Passphrase(PassphraseRecipient),
+    RecoverySecret(RecoverySecretRecord),
     Fido(FidoRecipient),
     FidoAndPassphrase(FidoAndPassphraseRecipient),
 }
@@ -98,6 +108,7 @@ impl RecipientRecord {
     pub(crate) const fn id(&self) -> RecipientId {
         match self {
             Self::Passphrase(record) => record.id,
+            Self::RecoverySecret(record) => record.id,
             Self::Fido(record) => record.id,
             Self::FidoAndPassphrase(record) => record.id,
         }
@@ -106,6 +117,7 @@ impl RecipientRecord {
     pub(crate) fn label(&self) -> &str {
         match self {
             Self::Passphrase(record) => &record.label,
+            Self::RecoverySecret(record) => &record.label,
             Self::Fido(record) => &record.label,
             Self::FidoAndPassphrase(record) => &record.label,
         }
@@ -114,6 +126,7 @@ impl RecipientRecord {
     pub(crate) const fn policy(&self) -> RecipientPolicy {
         match self {
             Self::Passphrase(_) => RecipientPolicy::Passphrase,
+            Self::RecoverySecret(_) => RecipientPolicy::RecoverySecret,
             Self::Fido(record) => RecipientPolicy::Fido(record.policy),
             Self::FidoAndPassphrase(record) => RecipientPolicy::FidoAndPassphrase(record.policy),
         }
@@ -122,14 +135,14 @@ impl RecipientRecord {
     pub(crate) const fn passphrase_parameters(&self) -> Option<PassphraseParameters> {
         match self {
             Self::Passphrase(record) => Some(record.kdf.parameters),
-            Self::Fido(_) => None,
+            Self::RecoverySecret(_) | Self::Fido(_) => None,
             Self::FidoAndPassphrase(record) => Some(record.kdf.parameters),
         }
     }
 
     fn credential_id(&self) -> Option<&[u8]> {
         match self {
-            Self::Passphrase(_) => None,
+            Self::Passphrase(_) | Self::RecoverySecret(_) => None,
             Self::Fido(record) => Some(&record.credential_id),
             Self::FidoAndPassphrase(record) => Some(&record.credential_id),
         }
@@ -138,7 +151,7 @@ impl RecipientRecord {
     fn passphrase_salt(&self) -> Option<&[u8; ARGON2_SALT_BYTES]> {
         match self {
             Self::Passphrase(record) => Some(&record.kdf.salt),
-            Self::Fido(_) => None,
+            Self::RecoverySecret(_) | Self::Fido(_) => None,
             Self::FidoAndPassphrase(record) => Some(&record.kdf.salt),
         }
     }
@@ -346,6 +359,13 @@ fn encode_recipient<W: minicbor::encode::Write>(
             encoder.bytes(&record.passphrase_nonce)?;
             encoder.bytes(&record.wrapped_root)?;
         }
+        RecipientRecord::RecoverySecret(record) => {
+            encoder.array(5)?.u8(RECOVERY_SECRET_SUITE)?;
+            encoder.bytes(record.id.as_bytes())?;
+            encoder.str(&record.label)?;
+            encoder.bytes(&record.recovery_nonce)?;
+            encoder.bytes(&record.wrapped_root)?;
+        }
         RecipientRecord::Fido(record) => {
             encoder.array(9)?.u8(FIDO_SUITE)?;
             encoder.bytes(record.id.as_bytes())?;
@@ -393,10 +413,24 @@ fn decode_recipient(decoder: &mut Decoder<'_>) -> Result<RecipientRecord> {
     let suite = decoder.u8().map_err(invalid)?;
     match suite {
         PASSPHRASE_SUITE if length == 6 => decode_passphrase_recipient(decoder),
+        RECOVERY_SECRET_SUITE if length == 5 => decode_recovery_secret_recipient(decoder),
         FIDO_SUITE if length == 9 => decode_fido_recipient(decoder),
         FIDO_AND_PASSPHRASE_SUITE if length == 11 => decode_fido_and_passphrase_recipient(decoder),
         _ => Err(Error::InvalidEnvelope),
     }
+}
+
+fn decode_recovery_secret_recipient(decoder: &mut Decoder<'_>) -> Result<RecipientRecord> {
+    let id = RecipientId::from_bytes(exact_bytes::<RECIPIENT_ID_BYTES>(decoder)?);
+    let label = decode_label(decoder)?;
+    let recovery_nonce = exact_bytes::<GCM_NONCE_BYTES>(decoder)?;
+    let wrapped_root = exact_bytes::<WRAPPED_ROOT_BYTES>(decoder)?;
+    Ok(RecipientRecord::RecoverySecret(RecoverySecretRecord {
+        id,
+        label,
+        recovery_nonce,
+        wrapped_root,
+    }))
 }
 
 fn decode_passphrase_recipient(decoder: &mut Decoder<'_>) -> Result<RecipientRecord> {
@@ -577,6 +611,12 @@ mod tests {
                     passphrase_nonce: [0x12; GCM_NONCE_BYTES],
                     wrapped_root: [0x13; WRAPPED_ROOT_BYTES],
                 }),
+                RecipientRecord::RecoverySecret(RecoverySecretRecord {
+                    id: RecipientId::from_bytes([0x18; RECIPIENT_ID_BYTES]),
+                    label: "recovery secret".to_owned(),
+                    recovery_nonce: [0x19; GCM_NONCE_BYTES],
+                    wrapped_root: [0x1a; WRAPPED_ROOT_BYTES],
+                }),
                 RecipientRecord::Fido(FidoRecipient {
                     id: RecipientId::from_bytes([0x20; RECIPIENT_ID_BYTES]),
                     label: "security key".to_owned(),
@@ -612,7 +652,7 @@ mod tests {
 
     fn single_fido_envelope() -> KeyEnvelope {
         let mut envelope = sample_envelope();
-        envelope.recipients = vec![envelope.recipients[1].clone()];
+        envelope.recipients = vec![envelope.recipients[2].clone()];
         envelope
     }
 
@@ -727,6 +767,13 @@ mod tests {
                     fixed_bytes!();
                     fixed_bytes!();
                 }
+                RECOVERY_SECRET_SUITE => {
+                    assert_eq!(record_length, 5);
+                    fixed_bytes!();
+                    text!();
+                    fixed_bytes!();
+                    fixed_bytes!();
+                }
                 FIDO_SUITE => {
                     assert_eq!(record_length, 9);
                     fixed_bytes!();
@@ -769,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn all_three_structural_suites_round_trip_canonically() {
+    fn all_four_structural_suites_round_trip_canonically() {
         let envelope = sample_envelope();
         let encoded = envelope.encode();
         assert!(encoded.starts_with(MAGIC));
@@ -778,14 +825,15 @@ mod tests {
         assert_eq!(decoded.encode(), encoded);
 
         let summaries = decoded.recipients();
-        assert_eq!(summaries.len(), 3);
+        assert_eq!(summaries.len(), 4);
         assert_eq!(summaries[0].policy(), RecipientPolicy::Passphrase);
+        assert_eq!(summaries[1].policy(), RecipientPolicy::RecoverySecret);
         assert_eq!(
-            summaries[1].policy(),
+            summaries[2].policy(),
             RecipientPolicy::Fido(FidoPolicy::Presence)
         );
         assert_eq!(
-            summaries[2].policy(),
+            summaries[3].policy(),
             RecipientPolicy::FidoAndPassphrase(FidoPolicy::UserVerification)
         );
         assert_eq!(
@@ -793,12 +841,14 @@ mod tests {
             Some(PassphraseParameters::DESKTOP)
         );
         assert_eq!(summaries[1].passphrase_parameters(), None);
+        assert_eq!(summaries[2].passphrase_parameters(), None);
     }
 
     #[test]
     fn independent_format_1_envelopes_decode_and_reencode_exactly() {
         let vectors = [
             include_str!("../../../test-vectors/format-1-passphrase.txt"),
+            include_str!("../../../test-vectors/format-1-recovery-secret.txt"),
             include_str!("../../../test-vectors/format-1-fido-presence.txt"),
             include_str!("../../../test-vectors/format-1-fido-user-verification.txt"),
             include_str!("../../../test-vectors/format-1-fido-presence-plus-passphrase.txt"),
@@ -901,7 +951,7 @@ mod tests {
             MAGIC.len() + decoder.position()
         };
         assert_eq!(unknown_suite[suite_offset], PASSPHRASE_SUITE);
-        unknown_suite[suite_offset] = 4;
+        unknown_suite[suite_offset] = u8::MAX;
         assert!(matches!(
             KeyEnvelope::decode(&unknown_suite),
             Err(Error::InvalidEnvelope)
@@ -997,24 +1047,24 @@ mod tests {
         assert!(KeyEnvelope::decode(&unsorted.encode()).is_err());
 
         let mut duplicate_id = sample_envelope();
-        if let RecipientRecord::Fido(record) = &mut duplicate_id.recipients[1] {
+        if let RecipientRecord::Fido(record) = &mut duplicate_id.recipients[2] {
             record.id = RecipientId::from_bytes([0x10; RECIPIENT_ID_BYTES]);
         }
         assert!(KeyEnvelope::decode(&duplicate_id.encode()).is_err());
 
         let mut duplicate_salt = sample_envelope();
         let first_salt = *duplicate_salt.recipients[0].passphrase_salt().unwrap();
-        if let RecipientRecord::FidoAndPassphrase(record) = &mut duplicate_salt.recipients[2] {
+        if let RecipientRecord::FidoAndPassphrase(record) = &mut duplicate_salt.recipients[3] {
             record.kdf.salt = first_salt;
         }
         assert!(KeyEnvelope::decode(&duplicate_salt.encode()).is_err());
 
         let mut duplicate_credential = sample_envelope();
-        let first_credential = duplicate_credential.recipients[1]
+        let first_credential = duplicate_credential.recipients[2]
             .credential_id()
             .unwrap()
             .to_vec();
-        if let RecipientRecord::FidoAndPassphrase(record) = &mut duplicate_credential.recipients[2]
+        if let RecipientRecord::FidoAndPassphrase(record) = &mut duplicate_credential.recipients[3]
         {
             record.credential_id = first_credential;
         }
@@ -1030,19 +1080,19 @@ mod tests {
         assert!(KeyEnvelope::decode(&invalid_label.encode()).is_err());
 
         let mut empty_credential = sample_envelope();
-        if let RecipientRecord::Fido(record) = &mut empty_credential.recipients[1] {
+        if let RecipientRecord::Fido(record) = &mut empty_credential.recipients[2] {
             record.credential_id.clear();
         }
         assert!(KeyEnvelope::decode(&empty_credential.encode()).is_err());
 
         let mut oversized_credential = sample_envelope();
-        if let RecipientRecord::Fido(record) = &mut oversized_credential.recipients[1] {
+        if let RecipientRecord::Fido(record) = &mut oversized_credential.recipients[2] {
             record.credential_id = vec![0; MAX_CREDENTIAL_ID + 1];
         }
         assert!(KeyEnvelope::decode(&oversized_credential.encode()).is_err());
 
         let mut invalid_point = sample_envelope();
-        if let RecipientRecord::Fido(record) = &mut invalid_point.recipients[1] {
+        if let RecipientRecord::Fido(record) = &mut invalid_point.recipients[2] {
             record.public_key = PublicKey64([0; PUBLIC_KEY_BYTES]);
         }
         assert!(KeyEnvelope::decode(&invalid_point.encode()).is_err());

@@ -77,9 +77,10 @@ operation returns to python.
 
 ## recovery policies
 
-`Policy` contains the complete five-route model:
+`Policy` contains the complete six-route model:
 
 - `PASSPHRASE`
+- `RECOVERY_SECRET`
 - `FIDO_PRESENCE`
 - `FIDO_USER_VERIFICATION`
 - `FIDO_PRESENCE_AND_PASSPHRASE`
@@ -94,6 +95,33 @@ fido policies use the system backend in a fido-capable build. they fail with
 `ErrorCode.FIDO_SUPPORT_UNAVAILABLE` before interaction in a passphrase-only
 build. `inspect_authenticators()` returns bounded capability reports without
 device identity.
+
+recovery-secret routes use explicit methods instead of `Enrollment`:
+
+```python
+root, envelope, recovery = protector.create_root_with_recovery_secret("recovery")
+
+stored_secret = recovery.secret.export()
+try:
+    store_secret_separately(stored_secret)
+finally:
+    stored_secret[:] = b"\0" * len(stored_secret)
+
+secret_bytes = load_stored_secret_as_bytearray()
+secret = fkw.RecoverySecret.from_bytearray(secret_bytes)
+root = protector.unlock_with_recovery_secret(
+    envelope, recovery.recipient_id, secret
+)
+```
+
+`from_bytearray` requires exactly 32 bytes and clears its input. the application
+stores the secret separately from the envelope. it is generated binary key
+material, not a passphrase or a human recovery code.
+
+`FidoConfig` supplies trusted operation timeout, selection timeout, and device
+count limits. pass it as the `fido_config` keyword when constructing a
+fido-capable protector. supplying it to a passphrase-only build fails before
+any interaction.
 
 ## interaction
 
@@ -167,11 +195,13 @@ route after a failed unlock.
 
 ## errors and concurrency
 
-library failures raise `Error`. its `code` is an `ErrorCode` value with no native
-device text or secret input. wrong application passphrases and candidate roots
-that do not authenticate the envelope remain one generic
-`ErrorCode.UNLOCK_FAILED` result. validation, resource, fido, authenticator, and
-interaction failures retain their bounded codes.
+library failures raise `Error`. its `code` is an `ErrorCode` value with no
+native device text or secret input. `pin_retries` is an integer only when an
+incorrect-pin response supplies a count and is otherwise `None`. blocked pin
+states, timeout, authenticator busy, unavailable credential, and transport
+failure have distinct codes. wrong passphrases, recovery secrets, and candidate
+roots that do not authenticate the envelope remain one generic
+`ErrorCode.UNLOCK_FAILED` result.
 
 operations are synchronous and release the python interpreter while rust runs
 argon2 or fido work. different protectors may run concurrently. overlapping or

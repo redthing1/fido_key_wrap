@@ -348,7 +348,7 @@ impl<'a> Application<'a> {
             bail!("the note belongs to another application identity");
         }
         for recipient in envelope.recipients() {
-            ensure_allowed_policy(recipient.policy());
+            ensure_allowed_policy(recipient.policy())?;
         }
         Ok(())
     }
@@ -508,12 +508,16 @@ fn optional_parameters(options: KdfOptions) -> Result<Option<PassphraseParameter
     }
 }
 
-fn ensure_allowed_policy(policy: RecipientPolicy) {
+fn ensure_allowed_policy(policy: RecipientPolicy) -> Result<()> {
     match policy {
         RecipientPolicy::Passphrase
         | RecipientPolicy::Fido(FidoPolicy::Presence | FidoPolicy::UserVerification)
-        | RecipientPolicy::FidoAndPassphrase(FidoPolicy::Presence | FidoPolicy::UserVerification) =>
-            {}
+        | RecipientPolicy::FidoAndPassphrase(FidoPolicy::Presence | FidoPolicy::UserVerification) => {
+            Ok(())
+        }
+        RecipientPolicy::RecoverySecret => {
+            bail!("this application does not support recovery-secret recipients")
+        }
     }
 }
 
@@ -528,6 +532,7 @@ fn validate_plaintext(plaintext: &[u8]) -> Result<()> {
 pub(crate) const fn policy_text(policy: RecipientPolicy) -> &'static str {
     match policy {
         RecipientPolicy::Passphrase => "application passphrase",
+        RecipientPolicy::RecoverySecret => "recovery secret",
         RecipientPolicy::Fido(FidoPolicy::Presence) => "security key: presence",
         RecipientPolicy::Fido(FidoPolicy::UserVerification) => "security key: user verification",
         RecipientPolicy::FidoAndPassphrase(FidoPolicy::Presence) => {
@@ -560,8 +565,8 @@ mod tests {
     };
 
     use fido_key_wrap::{
-        Interaction, InteractionError, Passphrase, PassphrasePrompt, PinPrompt, SelectionPrompt,
-        TouchPrompt,
+        Interaction, InteractionError, KeyProtector, Passphrase, PassphrasePrompt, PinPrompt,
+        SelectionPrompt, TouchPrompt,
     };
 
     use super::*;
@@ -586,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_policy_allow_list_contains_all_five_shapes() {
+    fn policy_allow_list_accepts_the_five_demo_routes() {
         for policy in [
             RecipientPolicy::Passphrase,
             RecipientPolicy::Fido(FidoPolicy::Presence),
@@ -594,8 +599,9 @@ mod tests {
             RecipientPolicy::FidoAndPassphrase(FidoPolicy::Presence),
             RecipientPolicy::FidoAndPassphrase(FidoPolicy::UserVerification),
         ] {
-            ensure_allowed_policy(policy);
+            ensure_allowed_policy(policy).unwrap();
         }
+        assert!(ensure_allowed_policy(RecipientPolicy::RecoverySecret).is_err());
     }
 
     #[test]
@@ -1065,8 +1071,7 @@ mod tests {
             enrollment: Enrollment,
         ) -> Result<RecipientId> {
             self.additions += 1;
-            let mixed = include_str!("../../../test-vectors/format-1-mixed.txt");
-            *envelope = KeyEnvelope::decode(&vector_bytes(mixed, "envelope"))?;
+            *envelope = mixed_demo_envelope();
             envelope
                 .recipients()
                 .into_iter()
@@ -1125,20 +1130,42 @@ mod tests {
                     "../../../test-vectors/format-1-fido-user-verification-plus-passphrase.txt"
                 ),
             )),
-            RecipientPolicy::Passphrase => bail!("expected a fido policy"),
+            RecipientPolicy::Passphrase | RecipientPolicy::RecoverySecret => {
+                bail!("expected a fido policy")
+            }
         }
     }
 
     fn vector_root() -> RootKey {
-        let mut bytes = std::array::from_fn(|index| {
-            0x60 + u8::try_from(index).expect("root vector index fits in u8")
-        });
+        let vector = include_str!("../../../test-vectors/format-1-fido-presence.txt");
+        root_from_vector(vector)
+    }
+
+    fn root_from_vector(vector: &str) -> RootKey {
+        let mut bytes: [u8; 32] = vector_bytes(vector, "root_key")
+            .try_into()
+            .expect("root vector contains 32 bytes");
         RootKey::import(&mut bytes)
     }
 
     fn mixed_envelope() -> KeyEnvelope {
         let vector = include_str!("../../../test-vectors/format-1-mixed.txt");
         KeyEnvelope::decode(&vector_bytes(vector, "envelope")).unwrap()
+    }
+
+    fn mixed_demo_envelope() -> KeyEnvelope {
+        let vector = include_str!("../../../test-vectors/format-1-mixed.txt");
+        let mut envelope = KeyEnvelope::decode(&vector_bytes(vector, "envelope")).unwrap();
+        let recovery = envelope
+            .recipients()
+            .into_iter()
+            .find(|recipient| recipient.policy() == RecipientPolicy::RecoverySecret)
+            .unwrap()
+            .id();
+        KeyProtector::new(envelope.application_id().clone())
+            .remove_recipient(&mut envelope, &root_from_vector(vector), recovery)
+            .unwrap();
+        envelope
     }
 
     fn envelope_with_ambiguous_id_prefix() -> KeyEnvelope {

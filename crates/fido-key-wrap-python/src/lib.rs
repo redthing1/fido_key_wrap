@@ -15,6 +15,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<errors::ErrorCode>()?;
     module.add_class::<types::Policy>()?;
     module.add_class::<types::FidoPolicy>()?;
+    module.add_class::<types::FidoConfig>()?;
     module.add_class::<types::PassphraseParameters>()?;
     module.add_class::<types::PassphraseLimits>()?;
     module.add_class::<types::Enrollment>()?;
@@ -22,8 +23,16 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<types::RecipientSummary>()?;
     module.add_class::<types::KeyEnvelope>()?;
     module.add_class::<types::RootKey>()?;
+    module.add_class::<types::RecoverySecret>()?;
+    module.add_class::<types::RecoverySecretRecipient>()?;
     module
         .getattr("RootKey")?
+        .setattr("__hash__", module.py().None())?;
+    module
+        .getattr("RecoverySecret")?
+        .setattr("__hash__", module.py().None())?;
+    module
+        .getattr("RecoverySecretRecipient")?
         .setattr("__hash__", module.py().None())?;
     module.add_class::<prompts::Operation>()?;
     module.add_class::<prompts::FidoCeremony>()?;

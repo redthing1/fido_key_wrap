@@ -1,5 +1,5 @@
-//! protect one random 32-byte application root with a passphrase, a security
-//! key, or both.
+//! protect one random 32-byte application root with a passphrase, a generated
+//! recovery secret, a security key, or a combined route.
 //!
 //! the crate owns factor-specific wrapping and a strict authenticated key
 //! envelope. applications own their data encryption, persistence, trusted
@@ -10,8 +10,9 @@
 //! construct [`ApplicationId`] from trusted configuration. after decoding an
 //! envelope, compare its application id and enforce the application's policy
 //! allowlist before asking the user for a factor. pass the selected
-//! [`RecipientId`] to [`KeyProtector::unlock`]; the library never falls back to
-//! another route.
+//! [`RecipientId`] to [`KeyProtector::unlock`], or to
+//! [`KeyProtector::unlock_with_recovery_secret`] for a recovery-secret route.
+//! the library never falls back to another route.
 //!
 //! the application derives its own data key from the recovered root with a
 //! domain unique to that application and format. its authenticated container
@@ -105,6 +106,7 @@
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 mod backend;
+mod config;
 mod crypto;
 #[cfg(feature = "fido")]
 mod diagnostic;
@@ -115,12 +117,15 @@ mod interaction;
 mod policy;
 mod protector;
 mod secret;
+#[cfg(feature = "testing")]
+pub mod testing;
 mod transcript;
 
+pub use config::FidoConfig;
 #[cfg(feature = "fido")]
 pub use diagnostic::{AuthenticatorIssue, AuthenticatorReport, inspect_authenticators};
 pub use envelope::{KeyEnvelope, RecipientSummary};
-pub use error::{Error, Result};
+pub use error::{AuthenticatorFailure, Error, Result};
 pub use id::{ApplicationId, RecipientId};
 pub use interaction::{
     FidoCeremony, Interaction, InteractionError, Operation, Passphrase, PassphrasePrompt,
@@ -128,4 +133,4 @@ pub use interaction::{
 };
 pub use policy::{Enrollment, FidoPolicy, PassphraseLimits, PassphraseParameters, RecipientPolicy};
 pub use protector::KeyProtector;
-pub use secret::RootKey;
+pub use secret::{RecoverySecret, RecoverySecretRecipient, RootKey};

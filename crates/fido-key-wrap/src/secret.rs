@@ -2,11 +2,96 @@ use std::fmt;
 
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{Error, Result};
+use crate::{Error, RecipientId, Result};
+
+const SECRET_BYTES: usize = 32;
 
 /// uniformly random 256-bit application root key.
 pub struct RootKey {
-    bytes: Zeroizing<[u8; 32]>,
+    bytes: Zeroizing<[u8; SECRET_BYTES]>,
+}
+
+/// uniformly random 256-bit recovery secret for one recovery recipient.
+pub struct RecoverySecret {
+    bytes: Zeroizing<[u8; SECRET_BYTES]>,
+}
+
+impl RecoverySecret {
+    /// imports an existing recovery secret and clears the source.
+    #[must_use]
+    pub fn import(source: &mut [u8; SECRET_BYTES]) -> Self {
+        let mut bytes = Zeroizing::new([0u8; SECRET_BYTES]);
+        bytes.copy_from_slice(source);
+        source.zeroize();
+        Self { bytes }
+    }
+
+    /// borrows the recovery secret for one application-defined storage operation.
+    ///
+    /// the closure can copy or return these bytes. any such copy is owned and
+    /// must be cleared by the application.
+    pub fn expose<T>(&self, use_secret: impl FnOnce(&[u8; SECRET_BYTES]) -> T) -> T {
+        use_secret(&self.bytes)
+    }
+
+    pub(crate) fn random() -> Result<Self> {
+        let mut bytes = Zeroizing::new([0u8; SECRET_BYTES]);
+        getrandom::fill(bytes.as_mut()).map_err(|_| Error::RandomUnavailable)?;
+        Ok(Self { bytes })
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8; SECRET_BYTES] {
+        &self.bytes
+    }
+}
+
+impl fmt::Debug for RecoverySecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RecoverySecret([REDACTED])")
+    }
+}
+
+/// newly created recovery-secret route and its separately stored secret.
+pub struct RecoverySecretRecipient {
+    recipient_id: RecipientId,
+    secret: RecoverySecret,
+}
+
+impl RecoverySecretRecipient {
+    pub(crate) const fn new(recipient_id: RecipientId, secret: RecoverySecret) -> Self {
+        Self {
+            recipient_id,
+            secret,
+        }
+    }
+
+    /// returns the recipient selected by this recovery secret.
+    #[must_use]
+    pub const fn recipient_id(&self) -> RecipientId {
+        self.recipient_id
+    }
+
+    /// borrows the newly generated recovery secret.
+    #[must_use]
+    pub const fn secret(&self) -> &RecoverySecret {
+        &self.secret
+    }
+
+    /// consumes the enrollment result and returns its recovery secret.
+    #[must_use]
+    pub fn into_secret(self) -> RecoverySecret {
+        self.secret
+    }
+}
+
+impl fmt::Debug for RecoverySecretRecipient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoverySecretRecipient")
+            .field("recipient_id", &self.recipient_id)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl RootKey {
@@ -61,5 +146,19 @@ mod tests {
         let key = RootKey::import(&mut source);
         assert_eq!(source, [0; 32]);
         assert_eq!(format!("{key:?}"), "RootKey([REDACTED])");
+    }
+
+    #[test]
+    fn recovery_import_clears_source_and_debug_is_redacted() {
+        let mut source = [0x24; SECRET_BYTES];
+        let secret = RecoverySecret::import(&mut source);
+        assert_eq!(source, [0; SECRET_BYTES]);
+        assert_eq!(format!("{secret:?}"), "RecoverySecret([REDACTED])");
+
+        let recipient =
+            RecoverySecretRecipient::new(RecipientId::from_bytes([0x42; SECRET_BYTES]), secret);
+        let rendered = format!("{recipient:?}");
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("RecoverySecret(["));
     }
 }

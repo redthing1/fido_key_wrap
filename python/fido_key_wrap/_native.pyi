@@ -10,6 +10,7 @@ class ErrorCode:
     INVALID_PIN: Final[ErrorCode]
     INVALID_PASSPHRASE_PARAMETERS: Final[ErrorCode]
     INVALID_PASSPHRASE_LIMITS: Final[ErrorCode]
+    INVALID_FIDO_CONFIG: Final[ErrorCode]
     INVALID_ENVELOPE: Final[ErrorCode]
     APPLICATION_MISMATCH: Final[ErrorCode]
     RECIPIENT_NOT_FOUND: Final[ErrorCode]
@@ -21,7 +22,14 @@ class ErrorCode:
     KDF_RESOURCE_UNAVAILABLE: Final[ErrorCode]
     FIDO_SUPPORT_UNAVAILABLE: Final[ErrorCode]
     NO_COMPATIBLE_AUTHENTICATOR: Final[ErrorCode]
-    AUTHENTICATOR_OPERATION_FAILED: Final[ErrorCode]
+    FIDO_PIN_INVALID: Final[ErrorCode]
+    FIDO_PIN_BLOCKED: Final[ErrorCode]
+    FIDO_PIN_TEMPORARILY_BLOCKED: Final[ErrorCode]
+    FIDO_TIMEOUT: Final[ErrorCode]
+    FIDO_BUSY: Final[ErrorCode]
+    FIDO_CREDENTIAL_UNAVAILABLE: Final[ErrorCode]
+    FIDO_TRANSPORT: Final[ErrorCode]
+    FIDO_OPERATION_FAILED: Final[ErrorCode]
     AUTHENTICATOR_RESPONSE_INVALID: Final[ErrorCode]
     INTERACTION_CANCELLED: Final[ErrorCode]
     INTERACTION_UNSUPPORTED: Final[ErrorCode]
@@ -34,11 +42,13 @@ class ErrorCode:
 
 class Error(Exception):
     code: ErrorCode
+    pin_retries: int | None
 
 class Cancelled(Exception): ...
 
 class Policy:
     PASSPHRASE: Final[Policy]
+    RECOVERY_SECRET: Final[Policy]
     FIDO_PRESENCE: Final[Policy]
     FIDO_USER_VERIFICATION: Final[Policy]
     FIDO_PRESENCE_AND_PASSPHRASE: Final[Policy]
@@ -47,6 +57,22 @@ class Policy:
 class FidoPolicy:
     PRESENCE: Final[FidoPolicy]
     USER_VERIFICATION: Final[FidoPolicy]
+
+class FidoConfig:
+    def __init__(
+        self,
+        operation_timeout_ms: int,
+        selection_timeout_ms: int,
+        max_devices: int,
+    ) -> None: ...
+    @staticmethod
+    def standard() -> FidoConfig: ...
+    @property
+    def operation_timeout_ms(self) -> int: ...
+    @property
+    def selection_timeout_ms(self) -> int: ...
+    @property
+    def max_devices(self) -> int: ...
 
 class Operation:
     CREATE_ROOT: Final[Operation]
@@ -129,6 +155,17 @@ class RootKey:
     def from_bytearray(material: bytearray) -> RootKey: ...
     def export(self) -> bytearray: ...
 
+class RecoverySecret:
+    @staticmethod
+    def from_bytearray(material: bytearray) -> RecoverySecret: ...
+    def export(self) -> bytearray: ...
+
+class RecoverySecretRecipient:
+    @property
+    def recipient_id(self) -> RecipientId: ...
+    @property
+    def secret(self) -> RecoverySecret: ...
+
 class SelectionPrompt:
     @property
     def operation(self) -> Operation: ...
@@ -167,12 +204,16 @@ class KeyProtector:
     def __init__(
         self,
         application_id: str,
+        *,
         passphrase_limits: PassphraseLimits | None = None,
+        fido_config: FidoConfig | None = None,
     ) -> None: ...
     @property
     def application_id(self) -> str: ...
     @property
     def passphrase_limits(self) -> PassphraseLimits: ...
+    @property
+    def fido_config(self) -> FidoConfig: ...
     def create_root(
         self, enrollment: Enrollment, interaction: object
     ) -> tuple[RootKey, KeyEnvelope, RecipientId]: ...
@@ -206,6 +247,24 @@ class KeyProtector:
         interaction: object,
         parameters: PassphraseParameters | None = None,
     ) -> KeyEnvelope: ...
+    def create_root_with_recovery_secret(
+        self, label: str
+    ) -> tuple[RootKey, KeyEnvelope, RecoverySecretRecipient]: ...
+    def protect_root_with_recovery_secret(
+        self, root: RootKey, label: str
+    ) -> tuple[KeyEnvelope, RecoverySecretRecipient]: ...
+    def unlock_with_recovery_secret(
+        self,
+        envelope: KeyEnvelope,
+        recipient: RecipientId,
+        secret: RecoverySecret,
+    ) -> RootKey: ...
+    def add_recovery_secret(
+        self,
+        envelope: KeyEnvelope,
+        root: RootKey,
+        label: str,
+    ) -> tuple[KeyEnvelope, RecoverySecretRecipient]: ...
 
 class AuthenticatorIssue:
     UNAVAILABLE: Final[AuthenticatorIssue]

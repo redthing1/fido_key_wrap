@@ -4,7 +4,12 @@ use crate::{
     ApplicationId, Error, Interaction, Operation, Result, envelope::PublicKey64, policy::FidoPolicy,
 };
 
-#[cfg(any(feature = "fido", test))]
+#[cfg(any(feature = "fido", feature = "testing", test))]
+use crate::AuthenticatorFailure;
+#[cfg(feature = "fido")]
+use crate::FidoConfig;
+
+#[cfg(any(feature = "fido", feature = "testing", test))]
 use crate::interaction::{FidoCeremony, PinPrompt, SelectionPrompt, TouchPrompt};
 
 #[cfg(feature = "fido")]
@@ -17,7 +22,10 @@ pub(crate) struct CredentialMaterial {
     pub(crate) public_key: PublicKey64,
 }
 
-#[cfg_attr(not(any(feature = "fido", test)), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "fido", feature = "testing", test)),
+    allow(dead_code)
+)]
 pub(crate) struct PrfRequest<'a> {
     pub(crate) application_id: &'a ApplicationId,
     pub(crate) credential_id: &'a [u8],
@@ -32,7 +40,7 @@ pub(crate) enum AuthenticatorBackend {
     Unavailable,
     #[cfg(feature = "fido")]
     Native(NativeBackend),
-    #[cfg(test)]
+    #[cfg(any(feature = "testing", test))]
     Fake(fake::FakeBackend),
 }
 
@@ -42,11 +50,11 @@ impl AuthenticatorBackend {
     }
 
     #[cfg(feature = "fido")]
-    pub(crate) fn system() -> Self {
-        Self::Native(NativeBackend::new())
+    pub(crate) fn system(config: FidoConfig) -> Self {
+        Self::Native(NativeBackend::new(config))
     }
 
-    #[cfg(test)]
+    #[cfg(any(feature = "testing", test))]
     pub(crate) fn fake() -> Self {
         Self::Fake(fake::FakeBackend::new())
     }
@@ -59,7 +67,7 @@ impl AuthenticatorBackend {
         operation: Operation,
         interaction: &mut dyn Interaction,
     ) -> Result<CredentialMaterial> {
-        #[cfg(not(any(feature = "fido", test)))]
+        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
         let _ = (application_id, policy, label, operation, &interaction);
         match self {
             Self::Unavailable => Err(Error::FidoSupportUnavailable),
@@ -67,7 +75,7 @@ impl AuthenticatorBackend {
             Self::Native(backend) => {
                 backend.enroll(application_id, policy, label, operation, interaction)
             }
-            #[cfg(test)]
+            #[cfg(any(feature = "testing", test))]
             Self::Fake(backend) => {
                 backend.enroll(application_id, policy, label, operation, interaction)
             }
@@ -79,18 +87,18 @@ impl AuthenticatorBackend {
         request: &PrfRequest<'_>,
         interaction: &mut dyn Interaction,
     ) -> Result<Zeroizing<[u8; PRF_RESULT_BYTES]>> {
-        #[cfg(not(any(feature = "fido", test)))]
+        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
         let _ = (request, &interaction);
         match self {
             Self::Unavailable => Err(Error::FidoSupportUnavailable),
             #[cfg(feature = "fido")]
             Self::Native(backend) => backend.evaluate(request, interaction),
-            #[cfg(test)]
+            #[cfg(any(feature = "testing", test))]
             Self::Fake(backend) => backend.evaluate(request, interaction),
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(feature = "testing", test))]
     pub(crate) fn fake_mut(&mut self) -> &mut fake::FakeBackend {
         match self {
             Self::Fake(backend) => backend,
@@ -108,9 +116,15 @@ pub(crate) struct NativeBackend {
 
 #[cfg(feature = "fido")]
 impl NativeBackend {
-    fn new() -> Self {
+    fn new(config: FidoConfig) -> Self {
+        let native_config = native::Config::new(
+            config.operation_timeout(),
+            config.selection_timeout(),
+            config.max_devices(),
+        )
+        .expect("safe fido configuration satisfies native bounds");
         Self {
-            backend: native::Backend::default(),
+            backend: native::Backend::new(native_config),
         }
     }
 
@@ -265,11 +279,22 @@ fn map_native_error(error: &native::Error) -> Error {
             Error::AuthenticatorResponseInvalid
         }
         native::Error::RandomUnavailable => Error::RandomUnavailable,
-        _ => Error::AuthenticatorOperationFailed,
+        native::Error::PinInvalid { retries } => {
+            AuthenticatorFailure::PinInvalid { retries: *retries }.into()
+        }
+        native::Error::PinBlocked => AuthenticatorFailure::PinBlocked.into(),
+        native::Error::PinAuthBlocked => AuthenticatorFailure::PinTemporarilyBlocked.into(),
+        native::Error::SelectionTimedOut | native::Error::TimedOut => {
+            AuthenticatorFailure::TimedOut.into()
+        }
+        native::Error::Busy => AuthenticatorFailure::Busy.into(),
+        native::Error::CredentialNotFound => AuthenticatorFailure::CredentialUnavailable.into(),
+        native::Error::Transport => AuthenticatorFailure::Transport.into(),
+        _ => AuthenticatorFailure::OperationFailed.into(),
     }
 }
 
-#[cfg(test)]
+#[cfg(any(feature = "testing", test))]
 pub(crate) mod fake {
     use std::collections::HashMap;
 
@@ -277,7 +302,11 @@ pub(crate) mod fake {
     use p256::{ProjectivePoint, elliptic_curve::sec1::ToSec1Point};
     use sha2::{Digest, Sha256};
 
-    use super::*;
+    use super::{
+        ApplicationId, AuthenticatorFailure, CredentialMaterial, Error, FidoCeremony, FidoPolicy,
+        Interaction, Operation, PRF_RESULT_BYTES, PinPrompt, PrfRequest, PublicKey64, Result,
+        SelectionPrompt, TouchPrompt, Zeroizing,
+    };
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     pub(crate) struct Counters {
@@ -294,6 +323,23 @@ pub(crate) mod fake {
         VerifiedResponse,
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) enum FailureKind {
+        NoCompatibleAuthenticator,
+        Authenticator(AuthenticatorFailure),
+        InvalidResponse,
+    }
+
+    impl FailureKind {
+        fn into_error(self) -> Error {
+            match self {
+                Self::NoCompatibleAuthenticator => Error::NoCompatibleAuthenticator,
+                Self::Authenticator(failure) => Error::Authenticator(failure),
+                Self::InvalidResponse => Error::AuthenticatorResponseInvalid,
+            }
+        }
+    }
+
     struct FakeCredential {
         application_id: String,
         public_key: PublicKey64,
@@ -307,7 +353,7 @@ pub(crate) mod fake {
         compatible_authenticators: usize,
         credentials: HashMap<Vec<u8>, FakeCredential>,
         counters: Counters,
-        fail_next: Option<FailurePoint>,
+        fail_next: Option<(FailurePoint, FailureKind)>,
     }
 
     impl FakeBackend {
@@ -325,8 +371,20 @@ pub(crate) mod fake {
             self.counters
         }
 
+        #[cfg(test)]
         pub(crate) fn fail_next(&mut self, point: FailurePoint) {
-            self.fail_next = Some(point);
+            let failure = match point {
+                FailurePoint::Selection => FailureKind::NoCompatibleAuthenticator,
+                FailurePoint::Enrollment | FailurePoint::Assertion => {
+                    FailureKind::Authenticator(AuthenticatorFailure::OperationFailed)
+                }
+                FailurePoint::VerifiedResponse => FailureKind::InvalidResponse,
+            };
+            self.fail_next_with(point, failure);
+        }
+
+        pub(crate) fn fail_next_with(&mut self, point: FailurePoint, failure: FailureKind) {
+            self.fail_next = Some((point, failure));
         }
 
         pub(crate) fn set_compatible_authenticators(&mut self, count: usize) {
@@ -335,6 +393,11 @@ pub(crate) mod fake {
 
         pub(crate) fn forget_credential(&mut self, credential_id: &[u8]) {
             self.credentials.remove(credential_id);
+        }
+
+        #[cfg(feature = "testing")]
+        pub(crate) fn reset(&mut self) {
+            *self = Self::new();
         }
 
         pub(crate) fn seed_credential(
@@ -381,7 +444,10 @@ pub(crate) mod fake {
             interaction: &mut dyn Interaction,
         ) -> Result<()> {
             self.counters.selections += 1;
-            if self.take_failure(FailurePoint::Selection) || self.compatible_authenticators == 0 {
+            if let Some(failure) = self.take_failure(FailurePoint::Selection) {
+                return Err(failure.into_error());
+            }
+            if self.compatible_authenticators == 0 {
                 return Err(Error::NoCompatibleAuthenticator);
             }
             if self.compatible_authenticators > 1 {
@@ -414,11 +480,11 @@ pub(crate) mod fake {
                 policy,
             ))?;
             self.counters.enrollments += 1;
-            if self.take_failure(FailurePoint::Enrollment) {
-                return Err(Error::AuthenticatorOperationFailed);
+            if let Some(failure) = self.take_failure(FailurePoint::Enrollment) {
+                return Err(failure.into_error());
             }
-            if self.take_failure(FailurePoint::VerifiedResponse) {
-                return Err(Error::AuthenticatorResponseInvalid);
+            if let Some(failure) = self.take_failure(FailurePoint::VerifiedResponse) {
+                return Err(failure.into_error());
             }
             Ok(self.seed_credential(application_id, policy))
         }
@@ -449,16 +515,19 @@ pub(crate) mod fake {
                 request.policy,
             ))?;
             self.counters.assertions += 1;
-            if self.take_failure(FailurePoint::Assertion) {
-                return Err(Error::AuthenticatorOperationFailed);
+            if let Some(failure) = self.take_failure(FailurePoint::Assertion) {
+                return Err(failure.into_error());
+            }
+            if let Some(failure) = self.take_failure(FailurePoint::VerifiedResponse) {
+                return Err(failure.into_error());
             }
 
             let credential = self
                 .credentials
                 .get(request.credential_id)
-                .ok_or(Error::AuthenticatorOperationFailed)?;
+                .ok_or(AuthenticatorFailure::CredentialUnavailable)?;
             if credential.application_id != request.application_id.as_str() {
-                return Err(Error::AuthenticatorOperationFailed);
+                return Err(AuthenticatorFailure::OperationFailed.into());
             }
             if credential.public_key != *request.public_key {
                 return Err(Error::AuthenticatorResponseInvalid);
@@ -466,13 +535,8 @@ pub(crate) mod fake {
             if credential.enrollment_policy == FidoPolicy::UserVerification
                 && request.policy == FidoPolicy::Presence
             {
-                return Err(Error::AuthenticatorOperationFailed);
+                return Err(AuthenticatorFailure::OperationFailed.into());
             }
-            if self.fail_next == Some(FailurePoint::VerifiedResponse) {
-                self.fail_next = None;
-                return Err(Error::AuthenticatorResponseInvalid);
-            }
-
             let root = match request.policy {
                 FidoPolicy::Presence => &credential.presence_root,
                 FidoPolicy::UserVerification => &credential.verified_root,
@@ -483,12 +547,11 @@ pub(crate) mod fake {
             Ok(Zeroizing::new(mac.finalize().into_bytes().into()))
         }
 
-        fn take_failure(&mut self, point: FailurePoint) -> bool {
-            if self.fail_next == Some(point) {
-                self.fail_next = None;
-                true
+        fn take_failure(&mut self, point: FailurePoint) -> Option<FailureKind> {
+            if self.fail_next.as_ref().map(|(next, _)| *next) == Some(point) {
+                self.fail_next.take().map(|(_, failure)| failure)
             } else {
-                false
+                None
             }
         }
     }
@@ -561,6 +624,62 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fido")]
+    #[test]
+    fn native_errors_map_to_curated_identity_free_failures() {
+        assert!(matches!(
+            map_native_error(&native::Error::PinInvalid { retries: Some(3) }),
+            Error::Authenticator(AuthenticatorFailure::PinInvalid { retries: Some(3) })
+        ));
+        assert!(matches!(
+            map_native_error(&native::Error::PinBlocked),
+            Error::Authenticator(AuthenticatorFailure::PinBlocked)
+        ));
+        assert!(matches!(
+            map_native_error(&native::Error::PinAuthBlocked),
+            Error::Authenticator(AuthenticatorFailure::PinTemporarilyBlocked)
+        ));
+        for error in [native::Error::SelectionTimedOut, native::Error::TimedOut] {
+            assert!(matches!(
+                map_native_error(&error),
+                Error::Authenticator(AuthenticatorFailure::TimedOut)
+            ));
+        }
+        assert!(matches!(
+            map_native_error(&native::Error::Busy),
+            Error::Authenticator(AuthenticatorFailure::Busy)
+        ));
+        assert!(matches!(
+            map_native_error(&native::Error::CredentialNotFound),
+            Error::Authenticator(AuthenticatorFailure::CredentialUnavailable)
+        ));
+        assert!(matches!(
+            map_native_error(&native::Error::Transport),
+            Error::Authenticator(AuthenticatorFailure::Transport)
+        ));
+        assert!(matches!(
+            map_native_error(&native::Error::Native {
+                operation: "private operation",
+                code: 12_345,
+            }),
+            Error::Authenticator(AuthenticatorFailure::OperationFailed)
+        ));
+        for error in [native::Error::VerificationFailed, native::Error::Protocol] {
+            assert!(matches!(
+                map_native_error(&error),
+                Error::AuthenticatorResponseInvalid
+            ));
+        }
+
+        let rendered = map_native_error(&native::Error::Native {
+            operation: "sensitive/native/path",
+            code: 54_321,
+        })
+        .to_string();
+        assert!(!rendered.contains("sensitive"));
+        assert!(!rendered.contains("54321"));
+    }
+
     #[test]
     fn unavailable_backend_fails_before_interaction() {
         let application_id = ApplicationId::new("org.example.backend-test").unwrap();
@@ -625,7 +744,7 @@ mod tests {
                 &request(&application_id, &credential, FidoPolicy::Presence, &input,),
                 &mut interaction,
             ),
-            Err(Error::AuthenticatorOperationFailed)
+            Err(Error::Authenticator(AuthenticatorFailure::OperationFailed))
         ));
     }
 
@@ -676,7 +795,9 @@ mod tests {
         };
         assert!(matches!(
             backend.evaluate(&wrong_credential, &mut interaction),
-            Err(Error::AuthenticatorOperationFailed)
+            Err(Error::Authenticator(
+                AuthenticatorFailure::CredentialUnavailable
+            ))
         ));
 
         let alternate_point = ProjectivePoint::GENERATOR
