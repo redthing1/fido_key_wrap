@@ -10,7 +10,8 @@ pub struct AuthenticatorReport {
 }
 
 impl AuthenticatorReport {
-    /// reports whether the authenticator supports every recovery policy.
+    /// reports whether the authenticator supports every security-key recovery
+    /// policy.
     #[must_use]
     pub const fn compatible(&self) -> bool {
         self.compatible
@@ -37,6 +38,10 @@ pub enum AuthenticatorIssue {
     HmacSecretUnavailable,
     /// credential protection is unavailable.
     CredentialProtectionUnavailable,
+    /// discoverable credential storage is unavailable.
+    DiscoverableCredentialsUnavailable,
+    /// exact credential management is unavailable.
+    CredentialManagementUnavailable,
     /// pin-backed user verification is unavailable.
     UserVerificationUnavailable,
     /// user verification is supported but not configured.
@@ -85,6 +90,12 @@ fn report_for(capabilities: &native::Capabilities) -> AuthenticatorReport {
     if !capabilities.credential_protection {
         issues.push(AuthenticatorIssue::CredentialProtectionUnavailable);
     }
+    if !capabilities.discoverable_credentials {
+        issues.push(AuthenticatorIssue::DiscoverableCredentialsUnavailable);
+    }
+    if !capabilities.credential_management {
+        issues.push(AuthenticatorIssue::CredentialManagementUnavailable);
+    }
     if !capabilities.client_pin_supported {
         issues.push(AuthenticatorIssue::UserVerificationUnavailable);
     } else if !capabilities.client_pin_configured {
@@ -108,6 +119,8 @@ mod tests {
             fido2: true,
             hmac_secret: true,
             credential_protection: true,
+            discoverable_credentials: true,
+            credential_management: true,
             es256: true,
             client_pin_supported: true,
             client_pin_configured: true,
@@ -126,12 +139,16 @@ mod tests {
         let mut limited = complete();
         limited.hmac_secret = false;
         limited.always_uv = true;
+        limited.discoverable_credentials = false;
+        limited.credential_management = false;
         let report = report_for(&limited);
         assert!(!report.compatible());
         assert_eq!(
             report.issues(),
             [
                 AuthenticatorIssue::HmacSecretUnavailable,
+                AuthenticatorIssue::DiscoverableCredentialsUnavailable,
+                AuthenticatorIssue::CredentialManagementUnavailable,
                 AuthenticatorIssue::PresenceRecoveryUnavailable
             ]
         );

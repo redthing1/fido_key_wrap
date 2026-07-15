@@ -38,6 +38,7 @@ allocation.
 | suite | fido | `2` |
 | suite | fido and passphrase | `3` |
 | suite | recovery secret | `4` |
+| suite | managed fido | `5` |
 | fido policy | presence | `1` |
 | fido policy | user verification | `2` |
 | kdf | argon2id | `1` |
@@ -129,7 +130,7 @@ c = sha256(t(
 ))
 ```
 
-for a fido recipient:
+for an ordinary or managed fido recipient:
 
 ```text
 c = sha256(t(
@@ -191,17 +192,32 @@ krecovery = hkdf-sha-256(
 
 ## fido credential and prf key
 
-### enrollment
+### ordinary enrollment
 
-each fido-bearing recipient creates one dedicated non-discoverable es256
-credential under relying-party id `app`. creation uses fresh random
-client-data and user-id values, requests `hmac-secret` and credential
-protection, and requires user verification.
+each ordinary fido or combined recipient creates one dedicated
+non-discoverable es256 credential under relying-party id `app`. creation uses
+fresh random client-data and user-id values, requests `hmac-secret` and
+credential protection, and requires user verification.
 
 presence credentials use protection optional with the credential id. user
 verification credentials require user verification. the result is accepted
 only after packed attestation, es256, the requested protection, and signed
 `up=1`, `uv=1`, `be=0`, `bs=0` have been verified.
+
+### managed enrollment
+
+a managed fido recipient creates one discoverable es256 credential with
+`rk=true`, user id `rid`, and relying-party id `app`. its authenticator-visible
+user name is fixed and contains no recipient label. managed enrollment requires
+`hmac-secret`, credential management, discoverable storage, and
+`credProtect=userVerificationRequired`.
+
+the creation response is accepted under the same attestation, key, and signed
+flag checks as ordinary enrollment. the new credential is then exercised by a
+user-verified `hmac-secret` assertion on the same open authenticator. before the
+recipient is returned, complete relying-party enumeration must find exactly the
+record with user id `rid`, credential id `cid`, public key `pk`, and required
+credential protection.
 
 ### assertion
 
@@ -221,6 +237,11 @@ binding, fresh client-data hash, exact credential id, exact signed
 `up`/`uv`/`be`/`bs` flags, single assertion count, and 32-byte extension result
 have been verified. call the verified extension result `r`.
 
+for the managed suite, the verified assertion is followed by complete
+relying-party enumeration on the same open authenticator. no prf result is
+released unless the record exactly matches `rid`, `cid`, `pk`, and required
+credential protection.
+
 ```text
 kfido = hkdf-sha-256(
   ikm  = r,
@@ -229,6 +250,20 @@ kfido = hkdf-sha-256(
   len  = 32
 )
 ```
+
+### managed verification and retirement
+
+managed verification first authenticates the complete envelope with `root`.
+it then obtains a fresh user-verified signed assertion for `cid` without
+requesting `hmac-secret`, and completes exact relying-party enumeration on the
+same open authenticator.
+
+managed retirement performs that verification, deletes exactly `cid`, then
+completes another enumeration proving that the exact record is absent. a
+complete absence check can confirm retirement after a lost deletion response.
+an inconclusive check reports uncertain retirement. a missing or unavailable
+authenticator is not successful retirement. no operation resets an
+authenticator.
 
 ## wrapping
 
@@ -350,6 +385,9 @@ recovery secret:
 fido:
 [2, rid, label, cid, pk, fp, np, nf, wrapped_root]
 
+managed fido:
+[5, rid, label, cid, pk, 2, np, nf, wrapped_root]
+
 fido and passphrase:
 [3, rid, label, cid, pk, fp, np, nf,
  [1, memory_kib, passes, lanes, s], npass, wrapped_root]
@@ -369,6 +407,6 @@ input is rejected before factor interaction.
 
 `test-vectors/` contains deterministic format-1 fixtures for passphrase,
 recovery secret, presence, user verification, both combined policies, a mixed
-envelope, and the demo container. `test-vectors/generate.py` implements
-transcript framing, hkdf, cbor, and envelope construction independently from
-the rust code.
+envelope, managed fido, and the demo container. `test-vectors/generate.py`
+implements transcript framing, hkdf, cbor, and envelope construction
+independently from the rust code.

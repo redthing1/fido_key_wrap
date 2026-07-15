@@ -1,8 +1,9 @@
 # demo application
 
-`fkw` is a small encrypted-note application. it demonstrates all five recovery
-policies, recipient changes, passphrase changes, and root rotation while keeping
-application encryption outside the library.
+`fkw` is a small encrypted-note application. it demonstrates the library's
+interactive recovery routes, recipient changes, managed-key retirement,
+passphrase changes, and root rotation while keeping application encryption
+outside the library.
 
 passphrases and pins are read from the terminal with echo disabled.
 
@@ -63,6 +64,7 @@ or creating a credential.
 application-passphrase
 fido-presence
 fido-user-verification
+fido-managed
 fido-presence-plus-passphrase
 fido-user-verification-plus-passphrase
 ```
@@ -71,6 +73,7 @@ examples:
 
 ```text
 printf 'a private note\n' | fkw new note.fkd -a fido-presence
+printf 'a private note\n' | fkw new note.fkd -a fido-managed
 printf 'a private note\n' | fkw new note.fkd -a fido-user-verification-plus-passphrase
 ```
 
@@ -80,6 +83,10 @@ enrollment requires the security-key pin and a touch. the assertion follows the
 recipient policy: presence requires a touch, while user verification requires
 the pin and a touch. combined policies authenticate the security-key layer
 before asking for the application passphrase.
+
+ordinary fido routes use non-discoverable credentials and take no resident
+credential slot. `fido-managed` uses one discoverable slot and requires user
+verification. it supports exact verification and deletion of that credential.
 
 the application passphrase and security-key pin are different factors.
 
@@ -129,8 +136,39 @@ fkw remove-recipient note.fkd backup -u primary
 the last route cannot be removed. an old complete file retains the removed
 route and remains usable.
 
-removal does not contact or delete the removed credential. the command first
-unlocks through `--using`, which may itself be a security-key route.
+removal does not contact or delete an ordinary fido credential. managed routes
+must use `retire-key` instead. the command first unlocks through `--using`,
+which may itself be a security-key route.
+
+## managed keys
+
+verify that the exact managed credential is present on the selected key:
+
+```text
+fkw verify-key note.fkd primary -u primary
+```
+
+retire it and confirm deletion:
+
+```text
+fkw retire-key note.fkd primary -u primary
+```
+
+retirement requires confirmation unless `--yes` is supplied. it authenticates
+the note first, proves the exact credential, deletes it, and confirms that it
+is absent. deletion frees its discoverable slot and does not reset the key or
+create a permanent blacklist.
+
+when other routes remain, the demo prepares the updated note before deleting
+the credential and publishes it only after deletion succeeds. retiring the
+final route leaves the file in place with no working recovery route. retained
+copies also lose this managed route, but any other recipient in those copies
+remains usable.
+
+once deletion succeeds, it cannot be rolled back. if publishing the prepared
+note then fails or cannot be confirmed, the command reports that the credential
+was retired. the file may still name the dead route or may already contain the
+replacement; its other original routes remain usable.
 
 ## changing a passphrase
 
@@ -186,8 +224,9 @@ recipient changes re-encrypt the note and replace the file atomically. note and
 lock files must be mode `0600` regular files; symbolic links are rejected. the
 [demo format](demo-format.md) specifies the container and update procedure.
 
-the security key alone is not a backup: a non-discoverable credential cannot
-recover the envelope, wrapped root, or note ciphertext. back up the complete
-`.fkd` file together with access to at least one working recovery route.
+the security key alone is not a backup: no security-key credential can recover
+the envelope, wrapped root, or note ciphertext without the complete `.fkd`
+file. back up that file together with access to at least one working recovery
+route.
 
 see the [security model](security.md) for the library guarantees.

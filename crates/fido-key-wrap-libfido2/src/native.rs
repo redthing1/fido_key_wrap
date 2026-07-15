@@ -13,6 +13,8 @@ const HARD_MAX_DEVICES: usize = 32;
 const MAX_RP_ID_BYTES: usize = 253;
 const MAX_NAME_BYTES: usize = 128;
 const MAX_CREDENTIAL_ID_BYTES: usize = 1024;
+const MAX_USER_ID_BYTES: usize = 64;
+const MAX_MANAGED_CREDENTIALS_PER_RP: usize = 1024;
 const ES256_PUBLIC_KEY_BYTES: usize = 64;
 const SECRET_BYTES: usize = 32;
 
@@ -32,6 +34,17 @@ pub enum CredentialProtection {
     OptionalWithCredentialId,
     /// ctap `userVerificationRequired` (level 3).
     UserVerificationRequired,
+}
+
+/// capability required for one managed-credential operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedCapability {
+    /// create and validate a new managed credential.
+    Enrollment,
+    /// recover a wrapping key through an existing managed credential.
+    Recovery,
+    /// verify or retire an existing managed credential.
+    Management,
 }
 
 impl ExactPolicy {
@@ -161,6 +174,8 @@ pub struct Capabilities {
     pub fido2: bool,
     pub hmac_secret: bool,
     pub credential_protection: bool,
+    pub discoverable_credentials: bool,
+    pub credential_management: bool,
     pub es256: bool,
     pub client_pin_supported: bool,
     pub client_pin_configured: bool,
@@ -191,6 +206,26 @@ impl Capabilities {
     #[must_use]
     pub fn supports_verified_policy(&self) -> bool {
         self.compatible()
+    }
+
+    /// whether the device satisfies one managed-credential operation.
+    #[must_use]
+    pub fn supports_managed(&self, capability: ManagedCapability) -> bool {
+        let management = self.fido2
+            && self.es256
+            && self.client_pin_supported
+            && self.client_pin_configured
+            && self.credential_management;
+        match capability {
+            ManagedCapability::Enrollment => {
+                management
+                    && self.hmac_secret
+                    && self.credential_protection
+                    && self.discoverable_credentials
+            }
+            ManagedCapability::Recovery => management && self.hmac_secret,
+            ManagedCapability::Management => management,
+        }
     }
 
     fn supports_policy(&self, policy: ExactPolicy) -> bool {
@@ -241,6 +276,16 @@ pub struct EnrollmentRequest<'a> {
     pub relying_party_id: &'a str,
     pub relying_party_name: &'a str,
     pub policy: ExactPolicy,
+    pub storage: CredentialStorage<'a>,
+}
+
+/// where an enrolled credential is maintained.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CredentialStorage<'a> {
+    /// the RP must supply the credential ID whenever it uses the credential.
+    NonDiscoverable,
+    /// the authenticator retains a manageable credential under this opaque ID.
+    ManagedDiscoverable { user_id: &'a [u8] },
 }
 
 /// a newly enrolled credential.
@@ -270,6 +315,15 @@ pub struct PrfRequest<'a> {
     pub es256_public_key: &'a [u8; ES256_PUBLIC_KEY_BYTES],
     pub salt: &'a [u8; SECRET_BYTES],
     pub policy: ExactPolicy,
+}
+
+/// the complete identity of one managed discoverable credential.
+#[derive(Clone, Copy)]
+pub struct ManagedCredential<'a> {
+    pub relying_party_id: &'a str,
+    pub user_id: &'a [u8],
+    pub credential_id: &'a [u8],
+    pub es256_public_key: &'a [u8; ES256_PUBLIC_KEY_BYTES],
 }
 
 /// entry point for system-backed operations.
@@ -328,6 +382,27 @@ impl Backend {
     ///
     /// returns a discovery, exact-policy compatibility, or transport error.
     pub fn prepare_selection(&self, policy: ExactPolicy) -> Result<PreparedSelection> {
+        self.prepare_selection_matching(|capabilities| capabilities.supports_policy(policy))
+    }
+
+    /// opens only devices satisfying one managed-credential operation.
+    ///
+    /// managed credentials always use the exact user-verified policy.
+    ///
+    /// # Errors
+    ///
+    /// returns a discovery, managed-compatibility, or transport error.
+    pub fn prepare_managed_selection(
+        &self,
+        capability: ManagedCapability,
+    ) -> Result<PreparedSelection> {
+        self.prepare_selection_matching(|capabilities| capabilities.supports_managed(capability))
+    }
+
+    fn prepare_selection_matching(
+        &self,
+        supports: impl Fn(&Capabilities) -> bool,
+    ) -> Result<PreparedSelection> {
         initialize_thread();
         let candidates = manifest(self.config.max_devices)?;
         if candidates.is_empty() {
@@ -352,7 +427,7 @@ impl Backend {
                     continue;
                 }
             };
-            if capabilities.supports_policy(policy) {
+            if supports(&capabilities) {
                 devices.push((device, capabilities));
             } else {
                 found_incompatible = true;
@@ -360,17 +435,20 @@ impl Backend {
         }
 
         if devices.is_empty() {
-            return if found_incompatible {
-                Err(Error::NoCompatibleAuthenticators)
-            } else {
-                Err(first_unavailable.unwrap_or(Error::NoCompatibleAuthenticators))
-            };
+            return Err(no_candidate_error(first_unavailable, found_incompatible));
         }
         Ok(PreparedSelection {
             devices,
             config: self.config,
         })
     }
+}
+
+fn no_candidate_error(first_unavailable: Option<Error>, found_incompatible: bool) -> Error {
+    first_unavailable.unwrap_or_else(|| {
+        debug_assert!(found_incompatible);
+        Error::NoCompatibleAuthenticators
+    })
 }
 
 /// open exact-policy candidates prepared for one selection ceremony.
@@ -444,25 +522,16 @@ impl Authenticator {
         &self.capabilities
     }
 
-    /// enrolls a non-discoverable, non-backup es256 credential using uv and
-    /// verifies packed attestation. the high-level caller must immediately
-    /// evaluate its final transcript-derived prf salt before persisting the
-    /// recipient.
+    /// enrolls a non-backup es256 credential and verifies packed attestation.
+    /// the high-level caller must immediately evaluate its final
+    /// transcript-derived PRF salt before persisting the recipient.
     ///
     /// # Errors
     ///
     /// returns a sanitized validation, capability, pin, transport, timeout,
     /// protocol, or verification error. an incorrect pin is never retried.
     pub fn enroll(&mut self, request: EnrollmentRequest<'_>, pin: &Pin) -> Result<Enrollment> {
-        validate_rp_id(request.relying_party_id)?;
-        validate_name(request.relying_party_name)?;
-        if request.policy == ExactPolicy::Presence && !self.capabilities.supports_presence_policy()
-        {
-            return Err(Error::Unsupported);
-        }
-        if !self.capabilities.supports_verified_policy() {
-            return Err(Error::Unsupported);
-        }
+        let managed = self.validate_enrollment(request)?;
 
         let rp_id = c_string(
             request.relying_party_id,
@@ -474,7 +543,16 @@ impl Authenticator {
         )?;
         let user_name = c_string("fido-key-wrap", "fixed user name is invalid")?;
         let client_data_hash = Zeroizing::new(random_array()?);
-        let user_id = Zeroizing::new(random_array()?);
+        let generated_user_id = match request.storage {
+            CredentialStorage::NonDiscoverable => Some(Zeroizing::new(random_array()?)),
+            CredentialStorage::ManagedDiscoverable { .. } => None,
+        };
+        let user_id = match request.storage {
+            CredentialStorage::NonDiscoverable => {
+                generated_user_id.as_deref().ok_or(Error::Protocol)?
+            }
+            CredentialStorage::ManagedDiscoverable { user_id } => user_id,
+        };
         let mut credential = Credential::new()?;
 
         credential.call("set client-data hash", |raw| unsafe {
@@ -509,8 +587,15 @@ impl Authenticator {
         credential.call("set credential protection", |raw| unsafe {
             ffi::fido_cred_set_prot(raw, request.policy.native_protection())
         })?;
-        credential.call("set non-discoverable credential", |raw| unsafe {
-            ffi::fido_cred_set_rk(raw, ffi::FIDO_OPT_FALSE)
+        credential.call("set credential storage", |raw| unsafe {
+            ffi::fido_cred_set_rk(
+                raw,
+                if managed {
+                    ffi::FIDO_OPT_TRUE
+                } else {
+                    ffi::FIDO_OPT_FALSE
+                },
+            )
         })?;
         credential.call("require user verification", |raw| unsafe {
             ffi::fido_cred_set_uv(raw, ffi::FIDO_OPT_TRUE)
@@ -519,19 +604,56 @@ impl Authenticator {
             ffi::fido_dev_make_cred(self.device.as_ptr(), credential.as_ptr(), pin.as_ptr())
         };
         if result != ffi::FIDO_OK {
+            if managed && managed_enrollment_status_is_uncertain(result) {
+                return Err(Error::CredentialMayRemain);
+            }
             return Err(self.device.translate(result, "make credential"));
         }
         drop(client_data_hash);
-        drop(user_id);
+        drop(generated_user_id);
 
-        credential.verify(request.policy)?;
-        let credential_id = credential.copy_id()?;
-        let es256_public_key = credential.copy_public_key()?;
-        Ok(Enrollment {
-            credential_id,
-            es256_public_key,
-            protection: request.policy.protection(),
-        })
+        let enrollment = (|| {
+            credential.verify(request.policy)?;
+            let credential_id = credential.copy_id()?;
+            let es256_public_key = credential.copy_public_key()?;
+            Ok(Enrollment {
+                credential_id,
+                es256_public_key,
+                protection: request.policy.protection(),
+            })
+        })();
+        match enrollment {
+            Err(_) if managed => Err(Error::CredentialMayRemain),
+            result => result,
+        }
+    }
+
+    fn validate_enrollment(&self, request: EnrollmentRequest<'_>) -> Result<bool> {
+        validate_rp_id(request.relying_party_id)?;
+        validate_name(request.relying_party_name)?;
+        let managed = matches!(
+            request.storage,
+            CredentialStorage::ManagedDiscoverable { .. }
+        );
+        if let CredentialStorage::ManagedDiscoverable { user_id } = request.storage {
+            validate_user_id(user_id)?;
+        }
+        if managed && request.policy != ExactPolicy::UserVerified {
+            return Err(Error::InvalidInput(
+                "managed credentials require user verification",
+            ));
+        }
+        if managed
+            && !self
+                .capabilities
+                .supports_managed(ManagedCapability::Enrollment)
+        {
+            return Err(Error::CredentialManagementUnsupported);
+        }
+        if !self.capabilities.supports_policy(request.policy) {
+            return Err(Error::Unsupported);
+        }
+        Ok(managed)
     }
 
     /// evaluates `hmac-secret` only after complete es256 verification and
@@ -622,6 +744,194 @@ impl Authenticator {
             request.policy,
         )
     }
+
+    /// evaluates a managed credential's PRF and confirms its exact management
+    /// record without asking for a second assertion.
+    ///
+    /// # Errors
+    ///
+    /// returns a validation, capability, assertion, management, or identity
+    /// error. no secret is returned unless both checks succeed.
+    pub fn evaluate_managed(
+        &mut self,
+        request: PrfRequest<'_>,
+        credential: ManagedCredential<'_>,
+        pin: &Pin,
+    ) -> Result<Zeroizing<[u8; SECRET_BYTES]>> {
+        self.validate_managed(credential, ManagedCapability::Recovery)?;
+        if request.policy != ExactPolicy::UserVerified
+            || request.relying_party_id != credential.relying_party_id
+            || request.credential_id != credential.credential_id
+            || request.es256_public_key != credential.es256_public_key
+        {
+            return Err(Error::CredentialMismatch);
+        }
+
+        let secret = self.evaluate(request, Some(pin))?;
+        match self.managed_presence(credential, pin)? {
+            ManagedPresence::Present => Ok(secret),
+            ManagedPresence::Absent => Err(Error::CredentialNotFound),
+        }
+    }
+
+    /// proves control of the exact managed credential, then confirms its
+    /// stored user ID, credential ID, and public key through credential
+    /// management on this open authenticator.
+    ///
+    /// # Errors
+    ///
+    /// returns a validation, capability, assertion, management, or identity
+    /// error.
+    pub fn verify_managed(&mut self, credential: ManagedCredential<'_>, pin: &Pin) -> Result<()> {
+        self.validate_managed(credential, ManagedCapability::Management)?;
+        self.verify_managed_assertion(credential, pin)?;
+        match self.managed_presence(credential, pin)? {
+            ManagedPresence::Present => Ok(()),
+            ManagedPresence::Absent => Err(Error::CredentialNotFound),
+        }
+    }
+
+    /// retires one exact managed credential on this open authenticator.
+    ///
+    /// retirement never resets the authenticator. success requires a fresh
+    /// signed UV assertion, an exact management match before deletion, an
+    /// attempted deletion, and a complete enumeration showing absence. the
+    /// final absence check can confirm retirement after a lost response.
+    ///
+    /// # Errors
+    ///
+    /// returns a validation, capability, assertion, management, identity, or
+    /// uncertain-retirement error.
+    pub fn retire_managed(&mut self, credential: ManagedCredential<'_>, pin: &Pin) -> Result<()> {
+        self.verify_managed(credential, pin)?;
+
+        let status = unsafe {
+            ffi::fido_credman_del_dev_rk(
+                self.device.as_ptr(),
+                credential.credential_id.as_ptr(),
+                credential.credential_id.len(),
+                pin.as_ptr(),
+            )
+        };
+        let uncertain_delete = retirement_status_is_uncertain(status);
+        if status != ffi::FIDO_OK && !uncertain_delete {
+            return Err(self
+                .device
+                .translate_management(status, "delete managed credential"));
+        }
+        let delete = if status == ffi::FIDO_OK {
+            Ok(())
+        } else {
+            Err(self
+                .device
+                .translate_management(status, "delete managed credential"))
+        };
+        retirement_outcome(delete, self.managed_presence(credential, pin))
+    }
+
+    fn validate_managed(
+        &self,
+        credential: ManagedCredential<'_>,
+        capability: ManagedCapability,
+    ) -> Result<()> {
+        if !self.capabilities.supports_managed(capability) {
+            return Err(Error::CredentialManagementUnsupported);
+        }
+        validate_rp_id(credential.relying_party_id)?;
+        validate_user_id(credential.user_id)?;
+        validate_credential_id(credential.credential_id)
+    }
+
+    fn verify_managed_assertion(
+        &mut self,
+        credential: ManagedCredential<'_>,
+        pin: &Pin,
+    ) -> Result<()> {
+        let rp_id = c_string(
+            credential.relying_party_id,
+            "relying-party ID contains a NUL byte",
+        )?;
+        let client_data_hash = Zeroizing::new(random_array()?);
+        let mut assertion = Assertion::new()?;
+        assertion.call("set relying party", |raw| unsafe {
+            ffi::fido_assert_set_rp(raw, rp_id.as_ptr())
+        })?;
+        assertion.call("set client-data hash", |raw| unsafe {
+            ffi::fido_assert_set_clientdata_hash(
+                raw,
+                client_data_hash.as_ptr(),
+                client_data_hash.len(),
+            )
+        })?;
+        assertion.call("set allowed credential", |raw| unsafe {
+            ffi::fido_assert_allow_cred(
+                raw,
+                credential.credential_id.as_ptr(),
+                credential.credential_id.len(),
+            )
+        })?;
+        assertion.call("require user presence", |raw| unsafe {
+            ffi::fido_assert_set_up(raw, ffi::FIDO_OPT_TRUE)
+        })?;
+        assertion.call("require user verification", |raw| unsafe {
+            ffi::fido_assert_set_uv(raw, ffi::FIDO_OPT_TRUE)
+        })?;
+
+        let status = unsafe {
+            ffi::fido_dev_get_assert(self.device.as_ptr(), assertion.as_ptr(), pin.as_ptr())
+        };
+        if status != ffi::FIDO_OK {
+            return Err(self.device.translate(status, "verify managed credential"));
+        }
+        drop(client_data_hash);
+
+        assertion.verify_identity(
+            credential.credential_id,
+            credential.es256_public_key,
+            ExactPolicy::UserVerified,
+        )
+    }
+
+    fn managed_presence(
+        &mut self,
+        credential: ManagedCredential<'_>,
+        pin: &Pin,
+    ) -> Result<ManagedPresence> {
+        let rp_id = c_string(
+            credential.relying_party_id,
+            "relying-party ID contains a NUL byte",
+        )?;
+        let credentials = ManagedCredentials::new()?;
+        let status = unsafe {
+            ffi::fido_credman_get_dev_rk(
+                self.device.as_ptr(),
+                rp_id.as_ptr(),
+                credentials.as_ptr(),
+                pin.as_ptr(),
+            )
+        };
+        if status == ffi::FIDO_ERR_NO_CREDENTIALS {
+            return Ok(ManagedPresence::Absent);
+        }
+        if status != ffi::FIDO_OK {
+            return Err(self
+                .device
+                .translate_management(status, "enumerate managed credentials"));
+        }
+        credentials.find(credential)
+    }
+}
+
+fn retirement_outcome(delete: Result<()>, presence: Result<ManagedPresence>) -> Result<()> {
+    match (delete, presence) {
+        (_, Ok(ManagedPresence::Absent)) => Ok(()),
+        (Ok(()) | Err(Error::CredentialNotFound), Ok(ManagedPresence::Present)) => {
+            Err(Error::Protocol)
+        }
+        (Err(error), Ok(ManagedPresence::Present)) => Err(error),
+        (_, Err(Error::CredentialMismatch)) => Err(Error::CredentialMismatch),
+        _ => Err(Error::RetirementUncertain),
+    }
 }
 
 fn initialize_thread() {
@@ -657,6 +967,20 @@ fn validate_name(value: &str) -> Result<()> {
         return Err(Error::InvalidInput(
             "relying-party name contains a NUL byte",
         ));
+    }
+    Ok(())
+}
+
+fn validate_user_id(value: &[u8]) -> Result<()> {
+    if value.is_empty() || value.len() > MAX_USER_ID_BYTES {
+        return Err(Error::InvalidInput("managed user ID length is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_credential_id(value: &[u8]) -> Result<()> {
+    if value.is_empty() || value.len() > MAX_CREDENTIAL_ID_BYTES {
+        return Err(Error::InvalidInput("credential ID length is invalid"));
     }
     Ok(())
 }
@@ -812,6 +1136,8 @@ impl RawDevice {
             )?
         };
         let always_uv = unsafe { option_value(info.as_ptr(), "alwaysUv")? }.unwrap_or(false);
+        let discoverable_credentials =
+            unsafe { option_value(info.as_ptr(), "rk")? }.unwrap_or(false);
         let algorithm_count = unsafe { ffi::fido_cbor_info_algorithm_count(info.as_ptr()) };
         if algorithm_count > 64 {
             return Err(Error::Protocol);
@@ -830,6 +1156,8 @@ impl RawDevice {
                 && extensions
                     .iter()
                     .any(|extension| extension == "credProtect"),
+            discoverable_credentials,
+            credential_management: unsafe { ffi::fido_dev_supports_credman(self.raw.as_ptr()) },
             es256,
             client_pin_supported: unsafe { ffi::fido_dev_supports_pin(self.raw.as_ptr()) },
             client_pin_configured: unsafe { ffi::fido_dev_has_pin(self.raw.as_ptr()) },
@@ -850,6 +1178,17 @@ impl RawDevice {
             Error::PinInvalid { retries }
         } else {
             translate_status(status, operation)
+        }
+    }
+
+    fn translate_management(&mut self, status: i32, operation: &'static str) -> Error {
+        match status {
+            ffi::FIDO_ERR_INVALID_COMMAND
+            | ffi::FIDO_ERR_UNSUPPORTED_EXTENSION
+            | ffi::FIDO_ERR_UNSUPPORTED_OPTION
+            | ffi::FIDO_ERR_INVALID_OPTION
+            | ffi::FIDO_ERR_UNSUPPORTED_ALGORITHM => Error::CredentialManagementUnsupported,
+            _ => self.translate(status, operation),
         }
     }
 }
@@ -1048,6 +1387,111 @@ fn cancel_all(devices: &mut [(RawDevice, Capabilities)]) {
 
 struct Credential(NonNull<ffi::fido_cred_t>);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedPresence {
+    Present,
+    Absent,
+}
+
+struct ManagedCredentials(NonNull<ffi::fido_credman_rk_t>);
+
+impl ManagedCredentials {
+    fn new() -> Result<Self> {
+        NonNull::new(unsafe { ffi::fido_credman_rk_new() })
+            .map(Self)
+            .ok_or(Error::AllocationFailed)
+    }
+
+    fn as_ptr(&self) -> *mut ffi::fido_credman_rk_t {
+        self.0.as_ptr()
+    }
+
+    fn find(&self, expected: ManagedCredential<'_>) -> Result<ManagedPresence> {
+        let count = unsafe { ffi::fido_credman_rk_count(self.0.as_ptr()) };
+        if count > MAX_MANAGED_CREDENTIALS_PER_RP {
+            return Err(Error::Protocol);
+        }
+
+        let mut found = false;
+        for index in 0..count {
+            let credential = unsafe { ffi::fido_credman_rk(self.0.as_ptr(), index) };
+            let credential = NonNull::new(credential.cast_mut()).ok_or(Error::Protocol)?;
+            let credential = credential.as_ptr();
+            let id = copy_native_bytes(
+                unsafe { ffi::fido_cred_id_ptr(credential) },
+                unsafe { ffi::fido_cred_id_len(credential) },
+                MAX_CREDENTIAL_ID_BYTES,
+            )?;
+            let user_id = copy_native_bytes(
+                unsafe { ffi::fido_cred_user_id_ptr(credential) },
+                unsafe { ffi::fido_cred_user_id_len(credential) },
+                MAX_USER_ID_BYTES,
+            )?;
+
+            if !managed_identity_matches(&id, &user_id, expected)? {
+                continue;
+            }
+            if unsafe { ffi::fido_cred_type(credential) } != ffi::COSE_ES256
+                || unsafe { ffi::fido_cred_prot(credential) } != ffi::FIDO_CRED_PROT_UV_REQUIRED
+            {
+                return Err(Error::CredentialMismatch);
+            }
+            let public_key = copy_native_bytes(
+                unsafe { ffi::fido_cred_pubkey_ptr(credential) },
+                unsafe { ffi::fido_cred_pubkey_len(credential) },
+                ES256_PUBLIC_KEY_BYTES,
+            )?;
+            include_managed_match(&mut found, &public_key, expected.es256_public_key)?;
+        }
+
+        Ok(if found {
+            ManagedPresence::Present
+        } else {
+            ManagedPresence::Absent
+        })
+    }
+}
+
+fn managed_identity_matches(
+    actual_id: &[u8],
+    actual_user_id: &[u8],
+    expected: ManagedCredential<'_>,
+) -> Result<bool> {
+    let id_matches = actual_id == expected.credential_id;
+    let user_matches = actual_user_id == expected.user_id;
+    match (id_matches, user_matches) {
+        (false, false) => Ok(false),
+        (true, true) => Ok(true),
+        _ => Err(Error::CredentialMismatch),
+    }
+}
+
+fn include_managed_match(
+    found: &mut bool,
+    actual_public_key: &[u8],
+    expected_public_key: &[u8; ES256_PUBLIC_KEY_BYTES],
+) -> Result<()> {
+    if *found || actual_public_key != expected_public_key {
+        return Err(Error::CredentialMismatch);
+    }
+    *found = true;
+    Ok(())
+}
+
+impl Drop for ManagedCredentials {
+    fn drop(&mut self) {
+        let mut raw = self.0.as_ptr();
+        unsafe { ffi::fido_credman_rk_free(&raw mut raw) };
+    }
+}
+
+fn copy_native_bytes(pointer: *const u8, len: usize, max_len: usize) -> Result<Vec<u8>> {
+    if len == 0 || len > max_len || pointer.is_null() {
+        return Err(Error::Protocol);
+    }
+    Ok(unsafe { std::slice::from_raw_parts(pointer, len) }.to_vec())
+}
+
 impl Credential {
     fn new() -> Result<Self> {
         NonNull::new(unsafe { ffi::fido_cred_new() })
@@ -1204,6 +1648,29 @@ impl Assertion {
         public_key: &[u8; ES256_PUBLIC_KEY_BYTES],
         policy: ExactPolicy,
     ) -> Result<Zeroizing<[u8; SECRET_BYTES]>> {
+        self.verify_identity(expected_id, public_key, policy)?;
+
+        let raw = self.0.as_ptr();
+        // libfido2 parses the encrypted hmac-secret result from this assertion's
+        // raw authenticator data and decrypts it into the same assertion
+        // statement. verify_identity above authenticates that raw data. Do not
+        // fetch or copy the decrypted result before every identity check.
+        let secret_len = unsafe { ffi::fido_assert_hmac_secret_len(raw, 0) };
+        let secret_pointer = unsafe { ffi::fido_assert_hmac_secret_ptr(raw, 0) };
+        let secret_pointer = exact_secret_pointer(secret_pointer, secret_len)?;
+        let mut secret = Zeroizing::new([0_u8; SECRET_BYTES]);
+        secret.copy_from_slice(unsafe {
+            std::slice::from_raw_parts(secret_pointer.as_ptr(), SECRET_BYTES)
+        });
+        Ok(secret)
+    }
+
+    fn verify_identity(
+        &self,
+        expected_id: &[u8],
+        public_key: &[u8; ES256_PUBLIC_KEY_BYTES],
+        policy: ExactPolicy,
+    ) -> Result<()> {
         let raw = self.0.as_ptr();
         if unsafe { ffi::fido_assert_count(raw) } != 1 {
             return Err(Error::VerificationFailed);
@@ -1231,20 +1698,7 @@ impl Assertion {
         {
             return Err(Error::VerificationFailed);
         }
-
-        // libfido2 parses the encrypted hmac-secret result from this assertion's
-        // raw authenticator data and decrypts it into the same assertion
-        // statement. fido_assert_verify above authenticates that raw data. Do
-        // not fetch or copy the decrypted result before signature, exact flags,
-        // and credential identity have all been verified.
-        let secret_len = unsafe { ffi::fido_assert_hmac_secret_len(raw, 0) };
-        let secret_pointer = unsafe { ffi::fido_assert_hmac_secret_ptr(raw, 0) };
-        let secret_pointer = exact_secret_pointer(secret_pointer, secret_len)?;
-        let mut secret = Zeroizing::new([0_u8; SECRET_BYTES]);
-        secret.copy_from_slice(unsafe {
-            std::slice::from_raw_parts(secret_pointer.as_ptr(), SECRET_BYTES)
-        });
-        Ok(secret)
+        Ok(())
     }
 }
 
@@ -1299,10 +1753,41 @@ fn translate_status(status: i32, operation: &'static str) -> Error {
         ffi::FIDO_ERR_UNSUPPORTED_EXTENSION
         | ffi::FIDO_ERR_UNSUPPORTED_ALGORITHM
         | ffi::FIDO_ERR_UNSUPPORTED_OPTION => Error::Unsupported,
+        ffi::FIDO_ERR_KEY_STORE_FULL => Error::CredentialStoreFull,
         ffi::FIDO_ERR_NO_CREDENTIALS => Error::CredentialNotFound,
         ffi::FIDO_ERR_INVALID_SIG => Error::VerificationFailed,
+        ffi::FIDO_ERR_RX_NOT_CBOR | ffi::FIDO_ERR_RX_INVALID_CBOR => Error::Protocol,
         code => Error::Native { operation, code },
     }
+}
+
+fn retirement_status_is_uncertain(status: i32) -> bool {
+    matches!(
+        status,
+        ffi::FIDO_ERR_TIMEOUT
+            | ffi::FIDO_ERR_USER_ACTION_TIMEOUT
+            | ffi::FIDO_ERR_ACTION_TIMEOUT
+            | ffi::FIDO_ERR_TX
+            | ffi::FIDO_ERR_RX
+            | ffi::FIDO_ERR_RX_NOT_CBOR
+            | ffi::FIDO_ERR_RX_INVALID_CBOR
+            | ffi::FIDO_ERR_INTERNAL
+            | ffi::FIDO_ERR_NO_CREDENTIALS
+    )
+}
+
+fn managed_enrollment_status_is_uncertain(status: i32) -> bool {
+    matches!(
+        status,
+        ffi::FIDO_ERR_TIMEOUT
+            | ffi::FIDO_ERR_USER_ACTION_TIMEOUT
+            | ffi::FIDO_ERR_ACTION_TIMEOUT
+            | ffi::FIDO_ERR_TX
+            | ffi::FIDO_ERR_RX
+            | ffi::FIDO_ERR_RX_NOT_CBOR
+            | ffi::FIDO_ERR_RX_INVALID_CBOR
+            | ffi::FIDO_ERR_INTERNAL
+    )
 }
 
 fn translate_open_status(status: i32) -> Error {
@@ -1567,6 +2052,8 @@ mod tests {
             fido2: true,
             hmac_secret: true,
             credential_protection: true,
+            discoverable_credentials: true,
+            credential_management: true,
             es256: true,
             client_pin_supported: true,
             client_pin_configured: true,
@@ -1578,6 +2065,9 @@ mod tests {
         assert!(capabilities.supports_presence_policy());
         assert!(capabilities.supports_policy(ExactPolicy::Presence));
         assert!(capabilities.supports_policy(ExactPolicy::UserVerified));
+        assert!(capabilities.supports_managed(ManagedCapability::Enrollment));
+        assert!(capabilities.supports_managed(ManagedCapability::Recovery));
+        assert!(capabilities.supports_managed(ManagedCapability::Management));
 
         let mut always_uv = capabilities.clone();
         always_uv.always_uv = true;
@@ -1603,6 +2093,209 @@ mod tests {
         let mut missing_es256 = capabilities;
         missing_es256.es256 = false;
         assert!(!missing_es256.compatible());
+        assert!(!missing_es256.supports_managed(ManagedCapability::Enrollment));
+        assert!(!missing_es256.supports_managed(ManagedCapability::Recovery));
+        assert!(!missing_es256.supports_managed(ManagedCapability::Management));
+
+        let mut missing_rk = always_uv.clone();
+        missing_rk.discoverable_credentials = false;
+        assert!(missing_rk.supports_verified_policy());
+        assert!(!missing_rk.supports_managed(ManagedCapability::Enrollment));
+        assert!(missing_rk.supports_managed(ManagedCapability::Recovery));
+        assert!(missing_rk.supports_managed(ManagedCapability::Management));
+
+        let mut missing_management = always_uv;
+        missing_management.credential_management = false;
+        assert!(missing_management.supports_verified_policy());
+        assert!(!missing_management.supports_managed(ManagedCapability::Enrollment));
+        assert!(!missing_management.supports_managed(ManagedCapability::Recovery));
+        assert!(!missing_management.supports_managed(ManagedCapability::Management));
+
+        let mut missing_hmac_secret = missing_rk;
+        missing_hmac_secret.hmac_secret = false;
+        assert!(!missing_hmac_secret.supports_managed(ManagedCapability::Enrollment));
+        assert!(!missing_hmac_secret.supports_managed(ManagedCapability::Recovery));
+        assert!(missing_hmac_secret.supports_managed(ManagedCapability::Management));
+    }
+
+    #[test]
+    fn unavailable_candidate_takes_precedence_over_known_incompatibility() {
+        assert_eq!(
+            no_candidate_error(Some(Error::Transport), true),
+            Error::Transport
+        );
+        assert_eq!(
+            no_candidate_error(None, true),
+            Error::NoCompatibleAuthenticators
+        );
+    }
+
+    #[test]
+    fn managed_identity_matching_is_exact() {
+        let expected = ManagedCredential {
+            relying_party_id: "managed.example",
+            user_id: b"opaque-user",
+            credential_id: b"credential-id",
+            es256_public_key: &SIGNED_EXTENSION_PUBLIC_KEY,
+        };
+
+        assert!(!managed_identity_matches(b"other", b"other", expected).unwrap());
+        assert!(managed_identity_matches(b"credential-id", b"opaque-user", expected).unwrap());
+        assert!(matches!(
+            managed_identity_matches(b"credential-id", b"other", expected),
+            Err(Error::CredentialMismatch)
+        ));
+        assert!(matches!(
+            managed_identity_matches(b"other", b"opaque-user", expected),
+            Err(Error::CredentialMismatch)
+        ));
+
+        let mut found = false;
+        include_managed_match(
+            &mut found,
+            &SIGNED_EXTENSION_PUBLIC_KEY,
+            expected.es256_public_key,
+        )
+        .unwrap();
+        assert!(found);
+        assert!(matches!(
+            include_managed_match(
+                &mut found,
+                &SIGNED_EXTENSION_PUBLIC_KEY,
+                expected.es256_public_key
+            ),
+            Err(Error::CredentialMismatch)
+        ));
+
+        let mut found = false;
+        assert!(matches!(
+            include_managed_match(
+                &mut found,
+                &ALTERED_VALID_PUBLIC_KEY,
+                expected.es256_public_key
+            ),
+            Err(Error::CredentialMismatch)
+        ));
+    }
+
+    #[test]
+    fn managed_identifiers_are_bounded() {
+        assert!(validate_user_id(&[1]).is_ok());
+        assert!(validate_user_id(&[1; MAX_USER_ID_BYTES]).is_ok());
+        assert!(validate_user_id(&[]).is_err());
+        assert!(validate_user_id(&[1; MAX_USER_ID_BYTES + 1]).is_err());
+
+        assert!(validate_credential_id(&[1]).is_ok());
+        assert!(validate_credential_id(&[1; MAX_CREDENTIAL_ID_BYTES]).is_ok());
+        assert!(validate_credential_id(&[]).is_err());
+        assert!(validate_credential_id(&[1; MAX_CREDENTIAL_ID_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn managed_credential_container_starts_empty() {
+        initialize_thread();
+        let credentials = ManagedCredentials::new().unwrap();
+        assert_eq!(
+            unsafe { ffi::fido_credman_rk_count(credentials.as_ptr()) },
+            0
+        );
+    }
+
+    #[test]
+    fn retirement_uncertainty_is_limited_to_ambiguous_delete_outcomes() {
+        for status in [
+            ffi::FIDO_ERR_TIMEOUT,
+            ffi::FIDO_ERR_USER_ACTION_TIMEOUT,
+            ffi::FIDO_ERR_ACTION_TIMEOUT,
+            ffi::FIDO_ERR_TX,
+            ffi::FIDO_ERR_RX,
+            ffi::FIDO_ERR_RX_NOT_CBOR,
+            ffi::FIDO_ERR_RX_INVALID_CBOR,
+            ffi::FIDO_ERR_INTERNAL,
+            ffi::FIDO_ERR_NO_CREDENTIALS,
+        ] {
+            assert!(retirement_status_is_uncertain(status));
+        }
+        for status in [
+            ffi::FIDO_ERR_PIN_INVALID,
+            ffi::FIDO_ERR_OPERATION_DENIED,
+            ffi::FIDO_ERR_CHANNEL_BUSY,
+        ] {
+            assert!(!retirement_status_is_uncertain(status));
+        }
+        assert_eq!(
+            translate_status(ffi::FIDO_ERR_KEY_STORE_FULL, "make credential"),
+            Error::CredentialStoreFull
+        );
+    }
+
+    #[test]
+    fn retirement_uses_the_verified_final_credential_state() {
+        for delete in [
+            Ok(()),
+            Err(Error::TimedOut),
+            Err(Error::Transport),
+            Err(Error::Protocol),
+        ] {
+            assert_eq!(
+                retirement_outcome(delete, Ok(ManagedPresence::Absent)),
+                Ok(())
+            );
+        }
+
+        assert_eq!(
+            retirement_outcome(Err(Error::TimedOut), Ok(ManagedPresence::Present)),
+            Err(Error::TimedOut)
+        );
+        assert_eq!(
+            retirement_outcome(Ok(()), Ok(ManagedPresence::Present)),
+            Err(Error::Protocol)
+        );
+        assert_eq!(
+            retirement_outcome(Err(Error::CredentialNotFound), Ok(ManagedPresence::Present)),
+            Err(Error::Protocol)
+        );
+        assert_eq!(
+            retirement_outcome(Ok(()), Err(Error::TimedOut)),
+            Err(Error::RetirementUncertain)
+        );
+        assert_eq!(
+            retirement_outcome(Ok(()), Err(Error::CredentialMismatch)),
+            Err(Error::CredentialMismatch)
+        );
+    }
+
+    #[test]
+    fn managed_enrollment_uncertainty_is_limited_to_ambiguous_outcomes() {
+        for status in [
+            ffi::FIDO_ERR_TIMEOUT,
+            ffi::FIDO_ERR_USER_ACTION_TIMEOUT,
+            ffi::FIDO_ERR_ACTION_TIMEOUT,
+            ffi::FIDO_ERR_TX,
+            ffi::FIDO_ERR_RX,
+            ffi::FIDO_ERR_RX_NOT_CBOR,
+            ffi::FIDO_ERR_RX_INVALID_CBOR,
+            ffi::FIDO_ERR_INTERNAL,
+        ] {
+            assert!(managed_enrollment_status_is_uncertain(status));
+        }
+        for status in [
+            ffi::FIDO_ERR_PIN_INVALID,
+            ffi::FIDO_ERR_OPERATION_DENIED,
+            ffi::FIDO_ERR_CHANNEL_BUSY,
+            ffi::FIDO_ERR_KEY_STORE_FULL,
+        ] {
+            assert!(!managed_enrollment_status_is_uncertain(status));
+        }
+
+        assert_eq!(
+            translate_status(ffi::FIDO_ERR_RX_NOT_CBOR, "get assertion"),
+            Error::Protocol
+        );
+        assert_eq!(
+            translate_status(ffi::FIDO_ERR_RX_INVALID_CBOR, "get assertion"),
+            Error::Protocol
+        );
     }
 
     #[test]

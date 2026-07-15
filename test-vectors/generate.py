@@ -26,6 +26,8 @@ SUITE_PASSPHRASE = 1
 SUITE_FIDO = 2
 SUITE_COMBINED = 3
 SUITE_RECOVERY_SECRET = 4
+SUITE_MANAGED_FIDO = 5
+FIDO_SUITES = (SUITE_FIDO, SUITE_COMBINED, SUITE_MANAGED_FIDO)
 POLICY_PRESENCE = 1
 POLICY_USER_VERIFICATION = 2
 KDF_ARGON2ID = 1
@@ -211,7 +213,7 @@ def build_record(
             spec.label.encode("utf-8"),
             spec.recovery_nonce,
         )
-    elif spec.suite in (SUITE_FIDO, SUITE_COMBINED):
+    elif spec.suite in FIDO_SUITES:
         credential_id = require(spec.credential_id)
         public_key = require(spec.public_key)
         policy = require(spec.policy)
@@ -314,7 +316,7 @@ def build_record(
         )
 
     fido_key: bytes | None = None
-    if spec.suite in (SUITE_FIDO, SUITE_COMBINED):
+    if spec.suite in FIDO_SUITES:
         credential_id = require(spec.credential_id)
         public_key = require(spec.public_key)
         policy = require(spec.policy)
@@ -410,7 +412,7 @@ def build_record(
         fields.extend(
             (("recovery_aad", aad), ("wrapped_root", wrapped_root))
         )
-    elif spec.suite == SUITE_FIDO:
+    elif spec.suite in (SUITE_FIDO, SUITE_MANAGED_FIDO):
         assert fido_key is not None
         credential_id = require(spec.credential_id)
         public_key = require(spec.public_key)
@@ -590,7 +592,7 @@ def render_fixture(
         "# deterministic correctness vector; byte values are lowercase hexadecimal.",
     ]
     if any(
-        record.spec.suite in (SUITE_FIDO, SUITE_COMBINED)
+        record.spec.suite in FIDO_SUITES
         for record in records
     ):
         lines.append(
@@ -685,6 +687,18 @@ def specs() -> list[RecordSpec]:
             recovery_secret=RECOVERY_SECRET,
             recovery_nonce=sequence(0xE0, 12),
         ),
+        RecordSpec(
+            name="managed-fido",
+            suite=SUITE_MANAGED_FIDO,
+            recipient_id=sequence(0xA0, 32),
+            label="managed fido",
+            credential_id=sequence(0xA0, 16),
+            public_key=p256_public_key(5),
+            policy=POLICY_USER_VERIFICATION,
+            prf_nonce=sequence(0xC0, 32),
+            fido_nonce=sequence(0xF0, 12),
+            prf_result=sequence(0x60, 32),
+        ),
     ]
 
 
@@ -774,7 +788,7 @@ def main() -> None:
     )
     (output_directory / "format-1-mixed.txt").write_text(
         render_fixture(
-            "fido-key-wrap format 1, six-recipient mixed envelope",
+            "fido-key-wrap format 1, seven-recipient mixed envelope",
             mixed_records,
             mixed_common,
         ),

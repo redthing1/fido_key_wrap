@@ -7,8 +7,7 @@ and application data encryption.
 
 ## installation
 
-source installation requires python 3.11 or later and rust 1.85 or later. pin
-the passphrase-only build to a full commit id:
+source installation requires python 3.11 or later and rust 1.85 or later:
 
 ```console
 uv add "fido-key-wrap @ git+https://github.com/redthing1/fido_key_wrap.git"
@@ -77,12 +76,13 @@ operation returns to python.
 
 ## recovery policies
 
-`Policy` contains the complete six-route model:
+`Policy` contains the complete seven-route model:
 
 - `PASSPHRASE`
 - `RECOVERY_SECRET`
 - `FIDO_PRESENCE`
 - `FIDO_USER_VERIFICATION`
+- `MANAGED_FIDO`
 - `FIDO_PRESENCE_AND_PASSPHRASE`
 - `FIDO_USER_VERIFICATION_AND_PASSPHRASE`
 
@@ -95,6 +95,20 @@ fido policies use the system backend in a fido-capable build. they fail with
 `ErrorCode.FIDO_SUPPORT_UNAVAILABLE` before interaction in a passphrase-only
 build. `inspect_authenticators()` returns bounded capability reports without
 device identity.
+
+`MANAGED_FIDO` uses one discoverable credential slot and requires user
+verification. verify or retire its exact credential with the authenticated
+envelope and root:
+
+```python
+protector.verify_managed_recipient(envelope, root, recipient, interaction)
+protector.retire_managed_recipient(envelope, root, recipient, interaction)
+```
+
+retirement deletes and confirms absence of the credential but leaves the
+immutable envelope unchanged. prepare the application state without that route,
+retire against the original envelope, then publish the prepared state. any
+other recipient remains an independent route to the root.
 
 recovery-secret routes use explicit methods instead of `Enrollment`:
 
@@ -151,8 +165,9 @@ without nul. the binding clears every exact bytearray received as secret input,
 including values with invalid lengths. selection and touch callbacks must
 return `None`.
 
-raising `Cancelled` cancels an operation. any other callback exception returns
-to the caller unchanged.
+raising `Cancelled` cancels an operation. other callback exceptions normally
+return unchanged. a later managed-credential state error takes precedence when
+cleanup cannot be confirmed.
 
 prompt objects contain the operation, recipient label, and the exact purpose or
 fido ceremony needed by the interface. labels decoded from envelopes are
@@ -175,13 +190,13 @@ the application re-encrypts its data with the new encoded envelope as associated
 data, then publishes both atomically. it keeps any backup needed for recovery.
 
 ```python
-expanded, recovery = protector.add_recipient(
-    envelope, root, recovery_enrollment, interaction
+expanded, added_recipient = protector.add_recipient(
+    envelope, root, new_enrollment, interaction
 )
 changed = protector.rewrap_passphrase(
-    expanded, root, recovery, interaction
+    expanded, root, added_recipient, interaction
 )
-reduced = protector.remove_recipient(changed, root, recovery)
+reduced = protector.remove_recipient(changed, root, added_recipient)
 ```
 
 the application derives its data-encryption key from the recovered root with a
@@ -199,8 +214,10 @@ library failures raise `Error`. its `code` is an `ErrorCode` value with no
 native device text or secret input. `pin_retries` is an integer only when an
 incorrect-pin response supplies a count and is otherwise `None`. blocked pin
 states, timeout, authenticator busy, unavailable credential, and transport
-failure have distinct codes. wrong passphrases, recovery secrets, and candidate
-roots that do not authenticate the envelope remain one generic
+failure have distinct codes. managed capacity exhaustion and uncertain
+retirement are also distinct. ambiguous managed enrollment or cleanup reports
+`ErrorCode.FIDO_CREDENTIAL_MAY_REMAIN`. wrong passphrases, recovery secrets,
+and candidate roots that do not authenticate the envelope remain one generic
 `ErrorCode.UNLOCK_FAILED` result.
 
 operations are synchronous and release the python interpreter while rust runs

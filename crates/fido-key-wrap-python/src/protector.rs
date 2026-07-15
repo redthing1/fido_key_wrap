@@ -202,6 +202,64 @@ impl KeyProtector {
         result.map_err(|error| map_error(py, &error))
     }
 
+    /// verifies the exact managed credential recorded by one authenticated recipient.
+    fn verify_managed_recipient(
+        &self,
+        py: Python<'_>,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        recipient: &RecipientId,
+        interaction: Py<PyAny>,
+    ) -> PyResult<()> {
+        let _busy = BusyGuard::enter(py, &self.busy)?;
+        let application_id = self.application_id.clone();
+        let limits = self.limits;
+        let fido_config = self.fido_config;
+        let envelope = envelope.core.clone();
+        let root = Arc::clone(&root.core);
+        let recipient = recipient.core;
+        let mut interaction = PythonInteraction::new(interaction);
+        let result = py.detach(|| {
+            let mut protector = protector(application_id, limits, fido_config);
+            protector.verify_managed_recipient(
+                &envelope,
+                root.as_ref(),
+                recipient,
+                &mut interaction,
+            )
+        });
+        finish(py, &mut interaction, result)
+    }
+
+    /// permanently retires the exact managed credential without changing the envelope.
+    fn retire_managed_recipient(
+        &self,
+        py: Python<'_>,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        recipient: &RecipientId,
+        interaction: Py<PyAny>,
+    ) -> PyResult<()> {
+        let _busy = BusyGuard::enter(py, &self.busy)?;
+        let application_id = self.application_id.clone();
+        let limits = self.limits;
+        let fido_config = self.fido_config;
+        let envelope = envelope.core.clone();
+        let root = Arc::clone(&root.core);
+        let recipient = recipient.core;
+        let mut interaction = PythonInteraction::new(interaction);
+        let result = py.detach(|| {
+            let mut protector = protector(application_id, limits, fido_config);
+            protector.retire_managed_recipient(
+                &envelope,
+                root.as_ref(),
+                recipient,
+                &mut interaction,
+            )
+        });
+        finish(py, &mut interaction, result)
+    }
+
     /// returns a new envelope with new passphrase protection for one recipient.
     #[pyo3(signature = (envelope, root, recipient, interaction, parameters=None))]
     fn rewrap_passphrase(
@@ -370,7 +428,7 @@ fn finish<T>(
     interaction: &mut PythonInteraction,
     result: core::Result<T>,
 ) -> PyResult<T> {
-    if let Some(error) = interaction.take_pending() {
+    if let Some(error) = interaction.take_pending_if_causal(&result) {
         return Err(error);
     }
     result.map_err(|error| map_error(py, &error))

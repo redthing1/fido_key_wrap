@@ -8,7 +8,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[non_exhaustive]
 pub enum AuthenticatorFailure {
     /// the supplied pin was incorrect.
-    #[error("the security-key pin was incorrect")]
+    #[error("the security-key pin was incorrect{suffix}", suffix = pin_retry_suffix(*retries))]
     PinInvalid {
         /// remaining attempts reported by the authenticator, when available.
         retries: Option<u8>,
@@ -28,12 +28,29 @@ pub enum AuthenticatorFailure {
     /// the selected credential is not available on the presented authenticator.
     #[error("the security-key credential is unavailable")]
     CredentialUnavailable,
+    /// the authenticator has no free managed-credential capacity.
+    #[error("the security key has no free managed-credential capacity")]
+    CredentialStoreFull,
+    /// a managed credential may remain after incomplete enrollment or cleanup.
+    #[error("a managed security-key credential may remain")]
+    CredentialMayRemain,
+    /// managed-credential deletion could not be confirmed.
+    #[error("managed security-key credential retirement could not be confirmed")]
+    RetirementUncertain,
     /// communication with the authenticator failed.
     #[error("security-key transport failed")]
     Transport,
     /// the authenticator operation failed without a more useful safe category.
     #[error("the security-key operation failed")]
     OperationFailed,
+}
+
+fn pin_retry_suffix(retries: Option<u8>) -> String {
+    match retries {
+        Some(1) => " (1 retry remains)".into(),
+        Some(count) => format!(" ({count} retries remain)"),
+        None => String::new(),
+    }
 }
 
 /// bounded public failures from root-key protection operations.
@@ -82,6 +99,9 @@ pub enum Error {
     /// the selected recipient has no passphrase layer to replace.
     #[error("the recipient does not use a passphrase")]
     RecipientDoesNotUsePassphrase,
+    /// the selected recipient is not backed by managed credential storage.
+    #[error("the recipient does not use a managed security-key credential")]
+    RecipientIsNotManaged,
     /// two entries of a new passphrase differed.
     #[error("passphrase confirmation did not match")]
     PassphraseConfirmationMismatch,
@@ -115,4 +135,25 @@ pub enum Error {
     /// a selected recovery route did not yield an authenticated root.
     #[error("the root key could not be unlocked")]
     UnlockFailed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pin_error_text_preserves_an_available_retry_count() {
+        assert_eq!(
+            AuthenticatorFailure::PinInvalid { retries: Some(3) }.to_string(),
+            "the security-key pin was incorrect (3 retries remain)"
+        );
+        assert_eq!(
+            AuthenticatorFailure::PinInvalid { retries: Some(1) }.to_string(),
+            "the security-key pin was incorrect (1 retry remains)"
+        );
+        assert_eq!(
+            AuthenticatorFailure::PinInvalid { retries: None }.to_string(),
+            "the security-key pin was incorrect"
+        );
+    }
 }

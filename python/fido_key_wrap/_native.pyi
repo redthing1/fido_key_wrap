@@ -39,6 +39,10 @@ class ErrorCode:
     UNLOCK_FAILED: Final[ErrorCode]
     BUSY: Final[ErrorCode]
     INTERNAL: Final[ErrorCode]
+    RECIPIENT_IS_NOT_MANAGED: Final[ErrorCode]
+    FIDO_CREDENTIAL_STORE_FULL: Final[ErrorCode]
+    FIDO_RETIREMENT_UNCERTAIN: Final[ErrorCode]
+    FIDO_CREDENTIAL_MAY_REMAIN: Final[ErrorCode]
 
 class Error(Exception):
     code: ErrorCode
@@ -53,6 +57,7 @@ class Policy:
     FIDO_USER_VERIFICATION: Final[Policy]
     FIDO_PRESENCE_AND_PASSPHRASE: Final[Policy]
     FIDO_USER_VERIFICATION_AND_PASSPHRASE: Final[Policy]
+    MANAGED_FIDO: Final[Policy]
 
 class FidoPolicy:
     PRESENCE: Final[FidoPolicy]
@@ -80,6 +85,8 @@ class Operation:
     UNLOCK: Final[Operation]
     ADD_RECIPIENT: Final[Operation]
     REWRAP_PASSPHRASE: Final[Operation]
+    VERIFY_MANAGED_RECIPIENT: Final[Operation]
+    RETIRE_MANAGED_RECIPIENT: Final[Operation]
 
 class FidoCeremony:
     ENROLLMENT: Final[FidoCeremony]
@@ -239,6 +246,20 @@ class KeyProtector:
         root: RootKey,
         recipient: RecipientId,
     ) -> KeyEnvelope: ...
+    def verify_managed_recipient(
+        self,
+        envelope: KeyEnvelope,
+        root: RootKey,
+        recipient: RecipientId,
+        interaction: object,
+    ) -> None: ...
+    def retire_managed_recipient(
+        self,
+        envelope: KeyEnvelope,
+        root: RootKey,
+        recipient: RecipientId,
+        interaction: object,
+    ) -> None: ...
     def rewrap_passphrase(
         self,
         envelope: KeyEnvelope,
@@ -275,6 +296,8 @@ class AuthenticatorIssue:
     USER_VERIFICATION_UNAVAILABLE: Final[AuthenticatorIssue]
     USER_VERIFICATION_NOT_CONFIGURED: Final[AuthenticatorIssue]
     PRESENCE_RECOVERY_UNAVAILABLE: Final[AuthenticatorIssue]
+    DISCOVERABLE_CREDENTIALS_UNAVAILABLE: Final[AuthenticatorIssue]
+    CREDENTIAL_MANAGEMENT_UNAVAILABLE: Final[AuthenticatorIssue]
 
 class AuthenticatorReport:
     @property

@@ -1,5 +1,8 @@
 use zeroize::Zeroizing;
 
+use crate::RecipientId;
+#[cfg(any(feature = "testing", test))]
+use crate::policy::FidoStorage;
 use crate::{
     ApplicationId, Error, Interaction, Operation, Result, envelope::PublicKey64, policy::FidoPolicy,
 };
@@ -20,6 +23,34 @@ const PRF_RESULT_BYTES: usize = 32;
 pub(crate) struct CredentialMaterial {
     pub(crate) credential_id: Vec<u8>,
     pub(crate) public_key: PublicKey64,
+}
+
+#[cfg_attr(
+    not(any(feature = "fido", feature = "testing", test)),
+    allow(dead_code)
+)]
+pub(crate) struct ManagedRequest<'a> {
+    pub(crate) application_id: &'a ApplicationId,
+    pub(crate) recipient_id: RecipientId,
+    pub(crate) credential_id: &'a [u8],
+    pub(crate) public_key: &'a PublicKey64,
+    pub(crate) label: &'a str,
+    pub(crate) operation: Operation,
+}
+
+pub(crate) struct ManagedEnrollment {
+    pub(crate) credential: CredentialMaterial,
+    session: ManagedSession,
+}
+
+enum ManagedSession {
+    #[cfg(feature = "fido")]
+    Native {
+        authenticator: native::Authenticator,
+        pin: native::Pin,
+    },
+    #[cfg(any(feature = "testing", test))]
+    Fake { device: usize },
 }
 
 #[cfg_attr(
@@ -82,6 +113,29 @@ impl AuthenticatorBackend {
         }
     }
 
+    pub(crate) fn enroll_managed(
+        &mut self,
+        application_id: &ApplicationId,
+        recipient_id: RecipientId,
+        label: &str,
+        operation: Operation,
+        interaction: &mut dyn Interaction,
+    ) -> Result<ManagedEnrollment> {
+        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
+        let _ = (application_id, recipient_id, label, operation, &interaction);
+        match self {
+            Self::Unavailable => Err(Error::FidoSupportUnavailable),
+            #[cfg(feature = "fido")]
+            Self::Native(backend) => {
+                backend.enroll_managed(application_id, recipient_id, label, operation, interaction)
+            }
+            #[cfg(any(feature = "testing", test))]
+            Self::Fake(backend) => {
+                backend.enroll_managed(application_id, recipient_id, label, operation, interaction)
+            }
+        }
+    }
+
     pub(crate) fn evaluate(
         &mut self,
         request: &PrfRequest<'_>,
@@ -95,6 +149,100 @@ impl AuthenticatorBackend {
             Self::Native(backend) => backend.evaluate(request, interaction),
             #[cfg(any(feature = "testing", test))]
             Self::Fake(backend) => backend.evaluate(request, interaction),
+        }
+    }
+
+    pub(crate) fn evaluate_managed(
+        &mut self,
+        request: &PrfRequest<'_>,
+        managed: &ManagedRequest<'_>,
+        interaction: &mut dyn Interaction,
+    ) -> Result<Zeroizing<[u8; PRF_RESULT_BYTES]>> {
+        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
+        let _ = (request, managed, &interaction);
+        match self {
+            Self::Unavailable => Err(Error::FidoSupportUnavailable),
+            #[cfg(feature = "fido")]
+            Self::Native(backend) => backend.evaluate_managed(request, managed, interaction),
+            #[cfg(any(feature = "testing", test))]
+            Self::Fake(backend) => backend.evaluate_managed(request, managed, interaction),
+        }
+    }
+
+    pub(crate) fn verify_managed(
+        &mut self,
+        request: &ManagedRequest<'_>,
+        interaction: &mut dyn Interaction,
+    ) -> Result<()> {
+        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
+        let _ = (request, &interaction);
+        match self {
+            Self::Unavailable => Err(Error::FidoSupportUnavailable),
+            #[cfg(feature = "fido")]
+            Self::Native(backend) => backend.verify_managed(request, interaction),
+            #[cfg(any(feature = "testing", test))]
+            Self::Fake(backend) => backend.verify_managed(request, interaction),
+        }
+    }
+
+    pub(crate) fn retire_managed(
+        &mut self,
+        request: &ManagedRequest<'_>,
+        interaction: &mut dyn Interaction,
+    ) -> Result<()> {
+        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
+        let _ = (request, &interaction);
+        match self {
+            Self::Unavailable => Err(Error::FidoSupportUnavailable),
+            #[cfg(feature = "fido")]
+            Self::Native(backend) => backend.retire_managed(request, interaction),
+            #[cfg(any(feature = "testing", test))]
+            Self::Fake(backend) => backend.retire_managed(request, interaction),
+        }
+    }
+
+    pub(crate) fn evaluate_managed_enrollment(
+        &mut self,
+        enrollment: &mut ManagedEnrollment,
+        request: &PrfRequest<'_>,
+        managed: &ManagedRequest<'_>,
+        interaction: &mut dyn Interaction,
+    ) -> Result<Zeroizing<[u8; PRF_RESULT_BYTES]>> {
+        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
+        let _ = (request, managed, interaction);
+        match (&mut enrollment.session, self) {
+            #[cfg(feature = "fido")]
+            (ManagedSession::Native { authenticator, pin }, Self::Native(_)) => {
+                evaluate_native_managed(authenticator, pin, request, managed, interaction)
+            }
+            #[cfg(any(feature = "testing", test))]
+            (ManagedSession::Fake { device }, Self::Fake(backend)) => {
+                backend.evaluate_managed_on_device(*device, request, managed, interaction)
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(Error::AuthenticatorResponseInvalid),
+        }
+    }
+
+    pub(crate) fn cleanup_managed_enrollment(
+        &mut self,
+        enrollment: &mut ManagedEnrollment,
+        request: &ManagedRequest<'_>,
+        interaction: &mut dyn Interaction,
+    ) -> Result<()> {
+        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
+        let _ = (request, interaction);
+        match (&mut enrollment.session, self) {
+            #[cfg(feature = "fido")]
+            (ManagedSession::Native { authenticator, pin }, Self::Native(_)) => {
+                retire_native_managed(authenticator, pin, request, interaction)
+            }
+            #[cfg(any(feature = "testing", test))]
+            (ManagedSession::Fake { device }, Self::Fake(backend)) => {
+                backend.retire_managed_on_device(*device, request, interaction)
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(Error::AuthenticatorResponseInvalid),
         }
     }
 
@@ -156,6 +304,27 @@ impl NativeBackend {
         Ok(authenticator)
     }
 
+    fn select_managed(
+        &self,
+        operation: Operation,
+        label: &str,
+        capability: native::ManagedCapability,
+        interaction: &mut dyn Interaction,
+    ) -> Result<native::Authenticator> {
+        let selection = self
+            .backend
+            .prepare_managed_selection(capability)
+            .map_err(|error| map_native_error(&error))?;
+        if selection.compatible_authenticators() > 1 {
+            interaction.select_authenticator_by_touch(&SelectionPrompt::new(
+                operation,
+                label,
+                FidoPolicy::UserVerification,
+            ))?;
+        }
+        selection.select().map_err(|error| map_native_error(&error))
+    }
+
     fn enroll(
         &mut self,
         application_id: &ApplicationId,
@@ -185,6 +354,7 @@ impl NativeBackend {
                     relying_party_id: application_id.as_str(),
                     relying_party_name: "fido key wrap",
                     policy: native_policy(policy),
+                    storage: native::CredentialStorage::NonDiscoverable,
                 },
                 &native_pin,
             )
@@ -209,6 +379,61 @@ impl NativeBackend {
         Ok(CredentialMaterial {
             credential_id: enrolled.credential_id,
             public_key,
+        })
+    }
+
+    fn enroll_managed(
+        &mut self,
+        application_id: &ApplicationId,
+        recipient_id: RecipientId,
+        label: &str,
+        operation: Operation,
+        interaction: &mut dyn Interaction,
+    ) -> Result<ManagedEnrollment> {
+        let mut authenticator = self.select_managed(
+            operation,
+            label,
+            native::ManagedCapability::Enrollment,
+            interaction,
+        )?;
+        let pin =
+            interaction.request_pin(&PinPrompt::new(operation, label, FidoCeremony::Enrollment))?;
+        let native_pin =
+            native::Pin::new(pin.as_str()).map_err(|error| map_native_error(&error))?;
+        drop(pin);
+        interaction.touch_required(&TouchPrompt::new(
+            operation,
+            label,
+            FidoCeremony::Enrollment,
+            FidoPolicy::UserVerification,
+        ))?;
+        let enrolled = authenticator
+            .enroll(
+                native::EnrollmentRequest {
+                    relying_party_id: application_id.as_str(),
+                    relying_party_name: "fido key wrap",
+                    policy: native::ExactPolicy::UserVerified,
+                    storage: native::CredentialStorage::ManagedDiscoverable {
+                        user_id: recipient_id.as_bytes(),
+                    },
+                },
+                &native_pin,
+            )
+            .map_err(|error| map_native_error(&error))?;
+        if enrolled.protection != native::CredentialProtection::UserVerificationRequired {
+            return Err(AuthenticatorFailure::CredentialMayRemain.into());
+        }
+        let public_key = PublicKey64::new(enrolled.es256_public_key)
+            .map_err(|_| AuthenticatorFailure::CredentialMayRemain)?;
+        Ok(ManagedEnrollment {
+            credential: CredentialMaterial {
+                credential_id: enrolled.credential_id,
+                public_key,
+            },
+            session: ManagedSession::Native {
+                authenticator,
+                pin: native_pin,
+            },
         })
     }
 
@@ -259,6 +484,128 @@ impl NativeBackend {
         drop(pin);
         result.map_err(|error| map_native_error(&error))
     }
+
+    fn evaluate_managed(
+        &mut self,
+        request: &PrfRequest<'_>,
+        managed: &ManagedRequest<'_>,
+        interaction: &mut dyn Interaction,
+    ) -> Result<Zeroizing<[u8; PRF_RESULT_BYTES]>> {
+        let mut authenticator = self.select_managed(
+            managed.operation,
+            managed.label,
+            native::ManagedCapability::Recovery,
+            interaction,
+        )?;
+        let pin = request_native_pin(managed, interaction)?;
+        evaluate_native_managed(&mut authenticator, &pin, request, managed, interaction)
+    }
+
+    fn verify_managed(
+        &mut self,
+        request: &ManagedRequest<'_>,
+        interaction: &mut dyn Interaction,
+    ) -> Result<()> {
+        let mut authenticator = self.select_managed(
+            request.operation,
+            request.label,
+            native::ManagedCapability::Management,
+            interaction,
+        )?;
+        let pin = request_native_pin(request, interaction)?;
+        touch_managed(request, interaction)?;
+        authenticator
+            .verify_managed(native_managed_credential(request), &pin)
+            .map_err(|error| map_native_error(&error))
+    }
+
+    fn retire_managed(
+        &mut self,
+        request: &ManagedRequest<'_>,
+        interaction: &mut dyn Interaction,
+    ) -> Result<()> {
+        let mut authenticator = self.select_managed(
+            request.operation,
+            request.label,
+            native::ManagedCapability::Management,
+            interaction,
+        )?;
+        let pin = request_native_pin(request, interaction)?;
+        retire_native_managed(&mut authenticator, &pin, request, interaction)
+    }
+}
+
+#[cfg(feature = "fido")]
+fn request_native_pin(
+    request: &ManagedRequest<'_>,
+    interaction: &mut dyn Interaction,
+) -> Result<native::Pin> {
+    let pin = interaction.request_pin(&PinPrompt::new(
+        request.operation,
+        request.label,
+        FidoCeremony::Assertion,
+    ))?;
+    let native_pin = native::Pin::new(pin.as_str()).map_err(|error| map_native_error(&error))?;
+    drop(pin);
+    Ok(native_pin)
+}
+
+#[cfg(feature = "fido")]
+fn touch_managed(request: &ManagedRequest<'_>, interaction: &mut dyn Interaction) -> Result<()> {
+    interaction.touch_required(&TouchPrompt::new(
+        request.operation,
+        request.label,
+        FidoCeremony::Assertion,
+        FidoPolicy::UserVerification,
+    ))?;
+    Ok(())
+}
+
+#[cfg(feature = "fido")]
+fn native_managed_credential<'a>(request: &'a ManagedRequest<'a>) -> native::ManagedCredential<'a> {
+    native::ManagedCredential {
+        relying_party_id: request.application_id.as_str(),
+        user_id: request.recipient_id.as_bytes(),
+        credential_id: request.credential_id,
+        es256_public_key: request.public_key.as_bytes(),
+    }
+}
+
+#[cfg(feature = "fido")]
+fn evaluate_native_managed(
+    authenticator: &mut native::Authenticator,
+    pin: &native::Pin,
+    request: &PrfRequest<'_>,
+    managed: &ManagedRequest<'_>,
+    interaction: &mut dyn Interaction,
+) -> Result<Zeroizing<[u8; PRF_RESULT_BYTES]>> {
+    touch_managed(managed, interaction)?;
+    authenticator
+        .evaluate_managed(
+            native::PrfRequest {
+                relying_party_id: request.application_id.as_str(),
+                credential_id: request.credential_id,
+                es256_public_key: request.public_key.as_bytes(),
+                salt: request.input,
+                policy: native::ExactPolicy::UserVerified,
+            },
+            native_managed_credential(managed),
+            pin,
+        )
+        .map_err(|error| map_native_error(&error))
+}
+
+#[cfg(feature = "fido")]
+fn retire_native_managed(
+    authenticator: &mut native::Authenticator,
+    pin: &native::Pin,
+    request: &ManagedRequest<'_>,
+    interaction: &mut dyn Interaction,
+) -> Result<()> {
+    touch_managed(request, interaction)?;
+    authenticator
+        .retire_managed(native_managed_credential(request), pin)
+        .map_err(|error| map_native_error(&error))
 }
 
 #[cfg(feature = "fido")]
@@ -289,6 +636,11 @@ fn map_native_error(error: &native::Error) -> Error {
         }
         native::Error::Busy => AuthenticatorFailure::Busy.into(),
         native::Error::CredentialNotFound => AuthenticatorFailure::CredentialUnavailable.into(),
+        native::Error::CredentialStoreFull => AuthenticatorFailure::CredentialStoreFull.into(),
+        native::Error::CredentialMayRemain => AuthenticatorFailure::CredentialMayRemain.into(),
+        native::Error::CredentialManagementUnsupported => Error::NoCompatibleAuthenticator,
+        native::Error::CredentialMismatch => Error::AuthenticatorResponseInvalid,
+        native::Error::RetirementUncertain => AuthenticatorFailure::RetirementUncertain.into(),
         native::Error::Transport => AuthenticatorFailure::Transport.into(),
         _ => AuthenticatorFailure::OperationFailed.into(),
     }
@@ -304,8 +656,9 @@ pub(crate) mod fake {
 
     use super::{
         ApplicationId, AuthenticatorFailure, CredentialMaterial, Error, FidoCeremony, FidoPolicy,
-        Interaction, Operation, PRF_RESULT_BYTES, PinPrompt, PrfRequest, PublicKey64, Result,
-        SelectionPrompt, TouchPrompt, Zeroizing,
+        FidoStorage, Interaction, ManagedEnrollment, ManagedRequest, ManagedSession, Operation,
+        PRF_RESULT_BYTES, PinPrompt, PrfRequest, PublicKey64, RecipientId, Result, SelectionPrompt,
+        TouchPrompt, Zeroizing,
     };
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -313,13 +666,17 @@ pub(crate) mod fake {
         pub(crate) selections: usize,
         pub(crate) enrollments: usize,
         pub(crate) assertions: usize,
+        pub(crate) retirements: usize,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum FailurePoint {
         Selection,
         Enrollment,
+        ManagedEnrollment,
         Assertion,
+        Retirement,
+        AbsenceCheck,
         VerifiedResponse,
     }
 
@@ -344,14 +701,31 @@ pub(crate) mod fake {
         application_id: String,
         public_key: PublicKey64,
         enrollment_policy: FidoPolicy,
+        storage: FidoStorage,
+        user_id: Option<RecipientId>,
         presence_root: [u8; PRF_RESULT_BYTES],
         verified_root: [u8; PRF_RESULT_BYTES],
     }
 
+    struct FakeDevice {
+        credentials: HashMap<Vec<u8>, FakeCredential>,
+        managed_capacity: usize,
+    }
+
+    impl FakeDevice {
+        fn new() -> Self {
+            Self {
+                credentials: HashMap::new(),
+                managed_capacity: 25,
+            }
+        }
+    }
+
     pub(crate) struct FakeBackend {
         next_id: u64,
-        compatible_authenticators: usize,
-        credentials: HashMap<Vec<u8>, FakeCredential>,
+        devices: Vec<FakeDevice>,
+        visible_devices: usize,
+        selected_device: usize,
         counters: Counters,
         fail_next: Option<(FailurePoint, FailureKind)>,
     }
@@ -360,8 +734,9 @@ pub(crate) mod fake {
         pub(crate) fn new() -> Self {
             Self {
                 next_id: 1,
-                compatible_authenticators: 1,
-                credentials: HashMap::new(),
+                devices: vec![FakeDevice::new()],
+                visible_devices: 1,
+                selected_device: 0,
                 counters: Counters::default(),
                 fail_next: None,
             }
@@ -375,24 +750,57 @@ pub(crate) mod fake {
         pub(crate) fn fail_next(&mut self, point: FailurePoint) {
             let failure = match point {
                 FailurePoint::Selection => FailureKind::NoCompatibleAuthenticator,
-                FailurePoint::Enrollment | FailurePoint::Assertion => {
+                FailurePoint::Enrollment
+                | FailurePoint::ManagedEnrollment
+                | FailurePoint::Assertion
+                | FailurePoint::Retirement => {
                     FailureKind::Authenticator(AuthenticatorFailure::OperationFailed)
+                }
+                FailurePoint::AbsenceCheck => {
+                    FailureKind::Authenticator(AuthenticatorFailure::RetirementUncertain)
                 }
                 FailurePoint::VerifiedResponse => FailureKind::InvalidResponse,
             };
-            self.fail_next_with(point, failure);
+            assert!(self.fail_next_with(point, failure));
         }
 
-        pub(crate) fn fail_next_with(&mut self, point: FailurePoint, failure: FailureKind) {
+        pub(crate) fn fail_next_with(&mut self, point: FailurePoint, failure: FailureKind) -> bool {
+            if self.fail_next.is_some() {
+                return false;
+            }
             self.fail_next = Some((point, failure));
+            true
         }
 
         pub(crate) fn set_compatible_authenticators(&mut self, count: usize) {
-            self.compatible_authenticators = count;
+            while self.devices.len() < count {
+                self.devices.push(FakeDevice::new());
+            }
+            self.visible_devices = count;
+            if self.selected_device >= count {
+                self.selected_device = 0;
+            }
+        }
+
+        #[cfg(feature = "testing")]
+        pub(crate) fn select_authenticator(&mut self, index: usize) -> Result<()> {
+            if index >= self.visible_devices {
+                return Err(Error::NoCompatibleAuthenticator);
+            }
+            self.selected_device = index;
+            Ok(())
+        }
+
+        pub(crate) fn set_managed_capacity(&mut self, capacity: usize) {
+            if let Some(device) = self.devices.get_mut(self.selected_device) {
+                device.managed_capacity = capacity;
+            }
         }
 
         pub(crate) fn forget_credential(&mut self, credential_id: &[u8]) {
-            self.credentials.remove(credential_id);
+            if let Some(device) = self.devices.get_mut(self.selected_device) {
+                device.credentials.remove(credential_id);
+            }
         }
 
         #[cfg(feature = "testing")]
@@ -400,10 +808,26 @@ pub(crate) mod fake {
             *self = Self::new();
         }
 
+        #[cfg(test)]
         pub(crate) fn seed_credential(
             &mut self,
             application_id: &ApplicationId,
             policy: FidoPolicy,
+        ) -> CredentialMaterial {
+            self.seed_credential_with_storage(
+                application_id,
+                policy,
+                FidoStorage::NonDiscoverable,
+                None,
+            )
+        }
+
+        fn seed_credential_with_storage(
+            &mut self,
+            application_id: &ApplicationId,
+            policy: FidoPolicy,
+            storage: FidoStorage,
+            user_id: Option<RecipientId>,
         ) -> CredentialMaterial {
             let id_number = self.next_id;
             self.next_id = self
@@ -420,12 +844,14 @@ pub(crate) mod fake {
             let public_key = PublicKey64::new(public_bytes).expect("generator is a valid point");
             let presence_root = credential_root(b"presence", id_number);
             let verified_root = credential_root(b"verified", id_number);
-            self.credentials.insert(
+            self.devices[self.selected_device].credentials.insert(
                 credential_id.clone(),
                 FakeCredential {
                     application_id: application_id.as_str().to_owned(),
                     public_key: public_key.clone(),
                     enrollment_policy: policy,
+                    storage,
+                    user_id,
                     presence_root,
                     verified_root,
                 },
@@ -442,20 +868,20 @@ pub(crate) mod fake {
             label: &str,
             policy: FidoPolicy,
             interaction: &mut dyn Interaction,
-        ) -> Result<()> {
+        ) -> Result<usize> {
             self.counters.selections += 1;
             if let Some(failure) = self.take_failure(FailurePoint::Selection) {
                 return Err(failure.into_error());
             }
-            if self.compatible_authenticators == 0 {
+            if self.visible_devices == 0 {
                 return Err(Error::NoCompatibleAuthenticator);
             }
-            if self.compatible_authenticators > 1 {
+            if self.visible_devices > 1 {
                 interaction.select_authenticator_by_touch(&SelectionPrompt::new(
                     operation, label, policy,
                 ))?;
             }
-            Ok(())
+            Ok(self.selected_device)
         }
 
         pub(super) fn enroll(
@@ -466,7 +892,7 @@ pub(crate) mod fake {
             operation: Operation,
             interaction: &mut dyn Interaction,
         ) -> Result<CredentialMaterial> {
-            self.select(operation, label, policy, interaction)?;
+            let device = self.select(operation, label, policy, interaction)?;
             let pin = interaction.request_pin(&PinPrompt::new(
                 operation,
                 label,
@@ -486,7 +912,68 @@ pub(crate) mod fake {
             if let Some(failure) = self.take_failure(FailurePoint::VerifiedResponse) {
                 return Err(failure.into_error());
             }
-            Ok(self.seed_credential(application_id, policy))
+            let _ = device;
+            Ok(self.seed_credential_with_storage(
+                application_id,
+                policy,
+                FidoStorage::NonDiscoverable,
+                None,
+            ))
+        }
+
+        pub(super) fn enroll_managed(
+            &mut self,
+            application_id: &ApplicationId,
+            recipient_id: RecipientId,
+            label: &str,
+            operation: Operation,
+            interaction: &mut dyn Interaction,
+        ) -> Result<ManagedEnrollment> {
+            let device =
+                self.select(operation, label, FidoPolicy::UserVerification, interaction)?;
+            let pin = interaction.request_pin(&PinPrompt::new(
+                operation,
+                label,
+                FidoCeremony::Enrollment,
+            ))?;
+            drop(pin);
+            interaction.touch_required(&TouchPrompt::new(
+                operation,
+                label,
+                FidoCeremony::Enrollment,
+                FidoPolicy::UserVerification,
+            ))?;
+            self.counters.enrollments += 1;
+            let used = self.devices[device]
+                .credentials
+                .values()
+                .filter(|credential| credential.storage == FidoStorage::Managed)
+                .count();
+            if used >= self.devices[device].managed_capacity {
+                return Err(AuthenticatorFailure::CredentialStoreFull.into());
+            }
+            if let Some(failure) = self.take_failure(FailurePoint::ManagedEnrollment) {
+                if failure == FailureKind::Authenticator(AuthenticatorFailure::CredentialMayRemain)
+                {
+                    self.seed_credential_with_storage(
+                        application_id,
+                        FidoPolicy::UserVerification,
+                        FidoStorage::Managed,
+                        Some(recipient_id),
+                    );
+                }
+                return Err(failure.into_error());
+            }
+            let credential = self.seed_credential_with_storage(
+                application_id,
+                FidoPolicy::UserVerification,
+                FidoStorage::Managed,
+                Some(recipient_id),
+            );
+            Ok(ManagedEnrollment {
+                credential,
+                session: ManagedSession::Fake { device },
+            })
         }
 
         pub(super) fn evaluate(
@@ -494,7 +981,7 @@ pub(crate) mod fake {
             request: &PrfRequest<'_>,
             interaction: &mut dyn Interaction,
         ) -> Result<Zeroizing<[u8; PRF_RESULT_BYTES]>> {
-            self.select(
+            let device = self.select(
                 request.operation,
                 request.label,
                 request.policy,
@@ -522,7 +1009,7 @@ pub(crate) mod fake {
                 return Err(failure.into_error());
             }
 
-            let credential = self
+            let credential = self.devices[device]
                 .credentials
                 .get(request.credential_id)
                 .ok_or(AuthenticatorFailure::CredentialUnavailable)?;
@@ -545,6 +1032,167 @@ pub(crate) mod fake {
                 .expect("HMAC accepts a 32-byte key");
             mac.update(request.input);
             Ok(Zeroizing::new(mac.finalize().into_bytes().into()))
+        }
+
+        pub(super) fn evaluate_managed(
+            &mut self,
+            request: &PrfRequest<'_>,
+            managed: &ManagedRequest<'_>,
+            interaction: &mut dyn Interaction,
+        ) -> Result<Zeroizing<[u8; PRF_RESULT_BYTES]>> {
+            let device = self.select(
+                managed.operation,
+                managed.label,
+                FidoPolicy::UserVerification,
+                interaction,
+            )?;
+            let pin = interaction.request_pin(&PinPrompt::new(
+                managed.operation,
+                managed.label,
+                FidoCeremony::Assertion,
+            ))?;
+            drop(pin);
+            self.evaluate_managed_on_device(device, request, managed, interaction)
+        }
+
+        pub(super) fn evaluate_managed_on_device(
+            &mut self,
+            device: usize,
+            request: &PrfRequest<'_>,
+            managed: &ManagedRequest<'_>,
+            interaction: &mut dyn Interaction,
+        ) -> Result<Zeroizing<[u8; PRF_RESULT_BYTES]>> {
+            if request.application_id != managed.application_id
+                || request.credential_id != managed.credential_id
+                || request.public_key != managed.public_key
+                || request.policy != FidoPolicy::UserVerification
+            {
+                return Err(Error::AuthenticatorResponseInvalid);
+            }
+            self.touch_and_verify_managed(device, managed, interaction)?;
+            let credential = self.managed_credential(device, managed)?;
+            let mut mac =
+                <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&credential.verified_root)
+                    .expect("HMAC accepts a 32-byte key");
+            mac.update(request.input);
+            Ok(Zeroizing::new(mac.finalize().into_bytes().into()))
+        }
+
+        pub(super) fn verify_managed(
+            &mut self,
+            request: &ManagedRequest<'_>,
+            interaction: &mut dyn Interaction,
+        ) -> Result<()> {
+            let device = self.select(
+                request.operation,
+                request.label,
+                FidoPolicy::UserVerification,
+                interaction,
+            )?;
+            let pin = interaction.request_pin(&PinPrompt::new(
+                request.operation,
+                request.label,
+                FidoCeremony::Assertion,
+            ))?;
+            drop(pin);
+            self.touch_and_verify_managed(device, request, interaction)
+        }
+
+        pub(super) fn retire_managed(
+            &mut self,
+            request: &ManagedRequest<'_>,
+            interaction: &mut dyn Interaction,
+        ) -> Result<()> {
+            let device = self.select(
+                request.operation,
+                request.label,
+                FidoPolicy::UserVerification,
+                interaction,
+            )?;
+            let pin = interaction.request_pin(&PinPrompt::new(
+                request.operation,
+                request.label,
+                FidoCeremony::Assertion,
+            ))?;
+            drop(pin);
+            self.retire_managed_on_device(device, request, interaction)
+        }
+
+        pub(super) fn retire_managed_on_device(
+            &mut self,
+            device: usize,
+            request: &ManagedRequest<'_>,
+            interaction: &mut dyn Interaction,
+        ) -> Result<()> {
+            self.touch_and_verify_managed(device, request, interaction)?;
+            self.counters.retirements += 1;
+            let deletion = if let Some(failure) = self.take_failure(FailurePoint::Retirement) {
+                Err(failure.into_error())
+            } else {
+                self.devices[device]
+                    .credentials
+                    .remove(request.credential_id);
+                Ok(())
+            };
+            let presence = if let Some(failure) = self.take_failure(FailurePoint::AbsenceCheck) {
+                Err(failure.into_error())
+            } else {
+                Ok(self.devices[device]
+                    .credentials
+                    .contains_key(request.credential_id))
+            };
+            match (deletion, presence) {
+                (_, Ok(false)) => Ok(()),
+                (Ok(()), Ok(true)) => Err(Error::AuthenticatorResponseInvalid),
+                (Err(error), Ok(true)) => Err(error),
+                (_, Err(Error::AuthenticatorResponseInvalid)) => {
+                    Err(Error::AuthenticatorResponseInvalid)
+                }
+                _ => Err(AuthenticatorFailure::RetirementUncertain.into()),
+            }
+        }
+
+        fn touch_and_verify_managed(
+            &mut self,
+            device: usize,
+            request: &ManagedRequest<'_>,
+            interaction: &mut dyn Interaction,
+        ) -> Result<()> {
+            interaction.touch_required(&TouchPrompt::new(
+                request.operation,
+                request.label,
+                FidoCeremony::Assertion,
+                FidoPolicy::UserVerification,
+            ))?;
+            self.counters.assertions += 1;
+            if let Some(failure) = self.take_failure(FailurePoint::Assertion) {
+                return Err(failure.into_error());
+            }
+            if let Some(failure) = self.take_failure(FailurePoint::VerifiedResponse) {
+                return Err(failure.into_error());
+            }
+            self.managed_credential(device, request).map(|_| ())
+        }
+
+        fn managed_credential(
+            &self,
+            device: usize,
+            request: &ManagedRequest<'_>,
+        ) -> Result<&FakeCredential> {
+            let credential = self.devices[device]
+                .credentials
+                .get(request.credential_id)
+                .ok_or(AuthenticatorFailure::CredentialUnavailable)?;
+            if credential.application_id != request.application_id.as_str()
+                || credential.storage != FidoStorage::Managed
+                || credential.user_id != Some(request.recipient_id)
+            {
+                return Err(AuthenticatorFailure::CredentialUnavailable.into());
+            }
+            if credential.public_key != *request.public_key {
+                return Err(Error::AuthenticatorResponseInvalid);
+            }
+            Ok(credential)
         }
 
         fn take_failure(&mut self, point: FailurePoint) -> Option<FailureKind> {
@@ -652,6 +1300,18 @@ mod tests {
         assert!(matches!(
             map_native_error(&native::Error::CredentialNotFound),
             Error::Authenticator(AuthenticatorFailure::CredentialUnavailable)
+        ));
+        assert!(matches!(
+            map_native_error(&native::Error::CredentialStoreFull),
+            Error::Authenticator(AuthenticatorFailure::CredentialStoreFull)
+        ));
+        assert!(matches!(
+            map_native_error(&native::Error::CredentialMayRemain),
+            Error::Authenticator(AuthenticatorFailure::CredentialMayRemain)
+        ));
+        assert!(matches!(
+            map_native_error(&native::Error::RetirementUncertain),
+            Error::Authenticator(AuthenticatorFailure::RetirementUncertain)
         ));
         assert!(matches!(
             map_native_error(&native::Error::Transport),

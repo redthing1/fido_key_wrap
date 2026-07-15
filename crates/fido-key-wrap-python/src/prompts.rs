@@ -24,6 +24,10 @@ pub enum Operation {
     AddRecipient = 4,
     #[pyo3(name = "REWRAP_PASSPHRASE")]
     RewrapPassphrase = 5,
+    #[pyo3(name = "VERIFY_MANAGED_RECIPIENT")]
+    VerifyManagedRecipient = 6,
+    #[pyo3(name = "RETIRE_MANAGED_RECIPIENT")]
+    RetireManagedRecipient = 7,
 }
 
 impl From<core::Operation> for Operation {
@@ -34,6 +38,8 @@ impl From<core::Operation> for Operation {
             core::Operation::Unlock => Self::Unlock,
             core::Operation::AddRecipient => Self::AddRecipient,
             core::Operation::RewrapPassphrase => Self::RewrapPassphrase,
+            core::Operation::VerifyManagedRecipient => Self::VerifyManagedRecipient,
+            core::Operation::RetireManagedRecipient => Self::RetireManagedRecipient,
         }
     }
 }

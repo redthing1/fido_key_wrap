@@ -18,6 +18,10 @@ library-generated 256-bit secret with hkdf-sha-256. a fido recipient obtains a
 signed and verified `hmac-secret` result from its dedicated non-discoverable
 credential, then derives a wrapping key with hkdf-sha-256.
 
+a managed fido recipient uses the same verified `hmac-secret` construction with
+a discoverable, user-verified credential. its distinct suite binds the managed
+storage semantics into the wrapping context.
+
 a combined recipient encrypts the root under the passphrase key and encrypts
 that result under the fido key. unlock verifies and removes the fido layer
 before requesting the passphrase.
@@ -56,11 +60,17 @@ packed attestation signature, the es256 key, the requested credential
 protection, and exact signed flags. the new credential is then exercised by a
 fresh assertion before the recipient is returned.
 
+`managed fido` requires user verification and a discoverable credential. the
+same nonbackup, attestation, assertion, and wrapping checks apply. enrollment
+also confirms the exact credential through authenticated credential management
+before returning it.
+
 ## credential storage
 
-the library requests a non-discoverable credential with `rk=false`. the
-credential id is stored in the envelope and supplied to the authenticator for
-each assertion. it does not consume a discoverable credential slot.
+ordinary fido and combined recipients request a non-discoverable credential
+with `rk=false`. the credential id is stored in the envelope and supplied to
+the authenticator for each assertion. these recipients do not consume a
+discoverable credential slot.
 
 credential-management tools enumerate and delete discoverable credentials;
 they do not manage this envelope-held credential id. removing a recipient
@@ -68,6 +78,18 @@ therefore removes the route from the current envelope without contacting the
 security key. old envelope copies still contain the route. resetting the fido
 function on the authenticator invalidates its non-discoverable credentials,
 along with the device's other fido credentials.
+
+a managed recipient requests a distinct discoverable credential with `rk=true`
+and consumes one discoverable slot. its user id is the random recipient id;
+authenticator-visible names contain no application object or recipient label.
+the library records the credential id and public key in the envelope and
+requires exact agreement among the signed assertion, envelope, and credential
+management record.
+
+managed verification proves that the exact credential is present on the
+selected authenticator. managed retirement obtains a fresh signed assertion,
+confirms the exact management record, deletes it on the same open authenticator,
+and completes a post-deletion absence check. it never resets the authenticator.
 
 ## several recipients
 
@@ -115,6 +137,22 @@ credential and the exact signed ceremony recorded by its policy.
 a valid unlock places the prf result, derived wrapping key, and root in host
 memory. malware present during that unlock can capture them.
 
+### managed fido recipient
+
+before retirement, a managed recipient has the same copied-envelope protection
+as a user-verified fido recipient. after successful retirement, retained copies
+cannot recover through that recipient because its credential is absent.
+
+this statement concerns one exact route. any surviving recipient still
+recovers the same root. passphrase and recovery-secret routes are unaffected,
+and ordinary fido credentials are not individually erasable through this
+library. a lost or unavailable authenticator prevents verified retirement.
+
+the guarantee trusts authenticator nonexportability, correct implementation of
+the nonbackup flags and credential-management protocol, and physical resistance
+of the authenticator. extraction from a compromised authenticator is outside
+the guarantee.
+
 ### combined recipient
 
 an envelope-only attacker cannot reach the inner passphrase ciphertext without
@@ -146,9 +184,8 @@ calling the authenticator.
 packed attestation authenticates the credential-creation response and its
 embedded credential public key. a fresh assertion proves control of the
 corresponding private key before the recipient is returned. attestation is not
-evaluated against
-a manufacturer trust chain and establishes no vendor, model, serial number,
-physical origin, or unclonability.
+evaluated against a manufacturer trust chain and establishes no vendor, model,
+serial number, physical origin, or unclonability.
 
 credential ids and discovery metadata are not physical-device identities. an
 application or user that wants separate primary and backup keys must arrange
@@ -157,6 +194,9 @@ and verify that separation operationally.
 changing an authenticator pin normally leaves its credentials usable under the
 new pin. resetting the authenticator destroys the credential secrets needed by
 existing recipients.
+
+managed credentials are bound by assertion and exact stored credential data,
+not by a vendor, model, serial number, transport path, or aaguid identity.
 
 ## envelope integrity and application binding
 
@@ -177,6 +217,12 @@ adopting values from the envelope.
 
 an old complete envelope contains a valid old mac and remains usable. removing
 a recipient or changing a passphrase affects only the updated copy.
+
+successful managed retirement is different: every copy referring to that exact
+credential loses that route. this does not establish that the root is destroyed;
+all other recipients must be accounted for separately. retirement leaves the
+envelope unchanged so the application can order credential deletion and its
+own atomic storage update safely.
 
 the envelope has no clock, trusted counter, or monotonic state. applications
 that need rollback detection must keep freshness state elsewhere.
@@ -219,7 +265,10 @@ the security model excludes:
 
 - application data encryption or storage
 - protection from malware during a valid unlock
-- availability, backup, deletion, and rollback protection
+- availability, backup, and rollback protection
+- deletion guarantees outside exact managed-credential retirement
+- cleanup of an unpublished managed credential after process termination;
+  ambiguous creation and cleanup are reported
 - a trusted user interface for passphrase, pin, or touch prompts
 - protection from weak passphrases or observed input
 - non-exportable host-side wrapping keys

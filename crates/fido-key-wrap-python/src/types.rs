@@ -33,6 +33,8 @@ pub enum Policy {
     FidoPresenceAndPassphrase = 5,
     #[pyo3(name = "FIDO_USER_VERIFICATION_AND_PASSPHRASE")]
     FidoUserVerificationAndPassphrase = 6,
+    #[pyo3(name = "MANAGED_FIDO")]
+    ManagedFido = 7,
 }
 
 /// the authenticator requirement within a fido policy.
@@ -70,6 +72,7 @@ impl Policy {
             core::RecipientPolicy::Fido(core::FidoPolicy::UserVerification) => {
                 Self::FidoUserVerification
             }
+            core::RecipientPolicy::ManagedFido => Self::ManagedFido,
             core::RecipientPolicy::FidoAndPassphrase(core::FidoPolicy::Presence) => {
                 Self::FidoPresenceAndPassphrase
             }
@@ -94,6 +97,7 @@ impl Policy {
             Self::RecoverySecret => "Policy.RECOVERY_SECRET",
             Self::FidoPresence => "Policy.FIDO_PRESENCE",
             Self::FidoUserVerification => "Policy.FIDO_USER_VERIFICATION",
+            Self::ManagedFido => "Policy.MANAGED_FIDO",
             Self::FidoPresenceAndPassphrase => "Policy.FIDO_PRESENCE_AND_PASSPHRASE",
             Self::FidoUserVerificationAndPassphrase => {
                 "Policy.FIDO_USER_VERIFICATION_AND_PASSPHRASE"
@@ -344,6 +348,7 @@ impl Enrollment {
             (Policy::FidoUserVerification, None) => {
                 core::Enrollment::fido(label, core::FidoPolicy::UserVerification)
             }
+            (Policy::ManagedFido, None) => core::Enrollment::managed_fido(label),
             (Policy::FidoPresenceAndPassphrase, Some(parameters)) => {
                 core::Enrollment::fido_and_passphrase_with_parameters(
                     label,

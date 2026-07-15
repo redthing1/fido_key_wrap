@@ -97,6 +97,14 @@ pub enum ErrorCode {
     Busy = 35,
     #[pyo3(name = "INTERNAL")]
     Internal = 36,
+    #[pyo3(name = "RECIPIENT_IS_NOT_MANAGED")]
+    RecipientIsNotManaged = 37,
+    #[pyo3(name = "FIDO_CREDENTIAL_STORE_FULL")]
+    FidoCredentialStoreFull = 38,
+    #[pyo3(name = "FIDO_RETIREMENT_UNCERTAIN")]
+    FidoRetirementUncertain = 39,
+    #[pyo3(name = "FIDO_CREDENTIAL_MAY_REMAIN")]
+    FidoCredentialMayRemain = 40,
 }
 
 pub fn map_error(py: Python<'_>, error: &CoreError) -> PyErr {
@@ -117,6 +125,7 @@ pub fn map_error(py: Python<'_>, error: &CoreError) -> PyErr {
         CoreError::RecipientDoesNotUsePassphrase => {
             (ErrorCode::RecipientDoesNotUsePassphrase, None)
         }
+        CoreError::RecipientIsNotManaged => (ErrorCode::RecipientIsNotManaged, None),
         CoreError::PassphraseConfirmationMismatch => {
             (ErrorCode::PassphraseConfirmationMismatch, None)
         }
@@ -135,6 +144,9 @@ pub fn map_error(py: Python<'_>, error: &CoreError) -> PyErr {
             AuthenticatorFailure::CredentialUnavailable => {
                 (ErrorCode::FidoCredentialUnavailable, None)
             }
+            AuthenticatorFailure::CredentialStoreFull => (ErrorCode::FidoCredentialStoreFull, None),
+            AuthenticatorFailure::CredentialMayRemain => (ErrorCode::FidoCredentialMayRemain, None),
+            AuthenticatorFailure::RetirementUncertain => (ErrorCode::FidoRetirementUncertain, None),
             AuthenticatorFailure::Transport => (ErrorCode::FidoTransport, None),
             // Includes OperationFailed and future bounded fallback categories.
             _ => (ErrorCode::FidoOperationFailed, None),
@@ -246,6 +258,21 @@ mod tests {
                 (
                     AuthenticatorFailure::Transport,
                     ErrorCode::FidoTransport,
+                    None,
+                ),
+                (
+                    AuthenticatorFailure::CredentialStoreFull,
+                    ErrorCode::FidoCredentialStoreFull,
+                    None,
+                ),
+                (
+                    AuthenticatorFailure::CredentialMayRemain,
+                    ErrorCode::FidoCredentialMayRemain,
+                    None,
+                ),
+                (
+                    AuthenticatorFailure::RetirementUncertain,
+                    ErrorCode::FidoRetirementUncertain,
                     None,
                 ),
                 (

@@ -18,6 +18,7 @@ pub(crate) enum Access {
     ApplicationPassphrase,
     FidoPresence,
     FidoUserVerification,
+    FidoManaged,
     FidoPresencePlusPassphrase,
     FidoUserVerificationPlusPassphrase,
 }
@@ -117,6 +118,36 @@ pub(crate) enum Command {
         using: Option<String>,
     },
 
+    /// verify that one managed security-key route is present.
+    VerifyKey {
+        /// encrypted .fkd file to inspect.
+        file: PathBuf,
+
+        /// managed recipient to verify.
+        recipient: String,
+
+        /// recipient used to authenticate the envelope.
+        #[arg(short = 'u', long)]
+        using: Option<String>,
+    },
+
+    /// permanently retire one managed security-key route.
+    RetireKey {
+        /// encrypted .fkd file whose route will be retired.
+        file: PathBuf,
+
+        /// managed recipient to retire.
+        recipient: String,
+
+        /// recipient used to authenticate the envelope.
+        #[arg(short = 'u', long)]
+        using: Option<String>,
+
+        /// skip the destructive-operation confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+
     /// change the application passphrase for one recipient.
     ChangePassphrase {
         /// encrypted .fkd file to update.
@@ -169,6 +200,7 @@ mod tests {
             "application-passphrase",
             "fido-presence",
             "fido-user-verification",
+            "fido-managed",
             "fido-presence-plus-passphrase",
             "fido-user-verification-plus-passphrase",
         ] {

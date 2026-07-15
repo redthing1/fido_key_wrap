@@ -26,6 +26,20 @@ pub(crate) trait KeyAccess {
         recipient: RecipientId,
     ) -> Result<()>;
 
+    fn verify_managed_recipient(
+        &mut self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        recipient: RecipientId,
+    ) -> Result<()>;
+
+    fn retire_managed_recipient(
+        &mut self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        recipient: RecipientId,
+    ) -> Result<()>;
+
     fn rewrap_passphrase(
         &mut self,
         envelope: &mut KeyEnvelope,
@@ -94,6 +108,28 @@ impl KeyAccess for ProductionKeyAccess {
     ) -> Result<()> {
         self.protector
             .remove_recipient(envelope, root, recipient)
+            .map_err(Into::into)
+    }
+
+    fn verify_managed_recipient(
+        &mut self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        recipient: RecipientId,
+    ) -> Result<()> {
+        self.protector
+            .verify_managed_recipient(envelope, root, recipient, self.interaction.as_mut())
+            .map_err(Into::into)
+    }
+
+    fn retire_managed_recipient(
+        &mut self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        recipient: RecipientId,
+    ) -> Result<()> {
+        self.protector
+            .retire_managed_recipient(envelope, root, recipient, self.interaction.as_mut())
             .map_err(Into::into)
     }
 

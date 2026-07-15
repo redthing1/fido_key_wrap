@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "fido-key-wrap"
 dynamic = ["version"]
-description = "protect application root keys with passphrases and security keys"
+description = "protect application root keys with passphrases, recovery secrets, and security keys"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []

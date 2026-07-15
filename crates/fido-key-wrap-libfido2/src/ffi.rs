@@ -22,6 +22,11 @@ pub struct fido_cred_t {
 }
 
 #[repr(C)]
+pub struct fido_credman_rk_t {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
 pub struct fido_dev_t {
     _private: [u8; 0],
 }
@@ -38,12 +43,15 @@ pub struct es256_pk_t {
 
 pub const FIDO_DISABLE_U2F_FALLBACK: c_int = 0x02;
 pub const FIDO_OK: c_int = 0x00;
+pub const FIDO_ERR_INVALID_COMMAND: c_int = 0x01;
 pub const FIDO_ERR_TIMEOUT: c_int = 0x05;
 pub const FIDO_ERR_CHANNEL_BUSY: c_int = 0x06;
 pub const FIDO_ERR_UNSUPPORTED_EXTENSION: c_int = 0x16;
 pub const FIDO_ERR_UNSUPPORTED_ALGORITHM: c_int = 0x26;
 pub const FIDO_ERR_OPERATION_DENIED: c_int = 0x27;
+pub const FIDO_ERR_KEY_STORE_FULL: c_int = 0x28;
 pub const FIDO_ERR_UNSUPPORTED_OPTION: c_int = 0x2b;
+pub const FIDO_ERR_INVALID_OPTION: c_int = 0x2c;
 pub const FIDO_ERR_KEEPALIVE_CANCEL: c_int = 0x2d;
 pub const FIDO_ERR_NO_CREDENTIALS: c_int = 0x2e;
 pub const FIDO_ERR_USER_ACTION_TIMEOUT: c_int = 0x2f;
@@ -58,6 +66,8 @@ pub const FIDO_ERR_UV_BLOCKED: c_int = 0x3c;
 pub const FIDO_ERR_UV_INVALID: c_int = 0x3f;
 pub const FIDO_ERR_TX: c_int = -1;
 pub const FIDO_ERR_RX: c_int = -2;
+pub const FIDO_ERR_RX_NOT_CBOR: c_int = -3;
+pub const FIDO_ERR_RX_INVALID_CBOR: c_int = -4;
 pub const FIDO_ERR_INVALID_SIG: c_int = -6;
 pub const FIDO_ERR_USER_PRESENCE_REQUIRED: c_int = -8;
 pub const FIDO_ERR_INTERNAL: c_int = -9;
@@ -112,6 +122,7 @@ unsafe extern "C" {
     pub fn fido_dev_has_uv(dev: *const fido_dev_t) -> bool;
     pub fn fido_dev_supports_uv(dev: *const fido_dev_t) -> bool;
     pub fn fido_dev_supports_cred_prot(dev: *const fido_dev_t) -> bool;
+    pub fn fido_dev_supports_credman(dev: *const fido_dev_t) -> bool;
     pub fn fido_dev_get_retry_count(dev: *mut fido_dev_t, retries: *mut c_int) -> c_int;
     pub fn fido_dev_get_touch_begin(dev: *mut fido_dev_t) -> c_int;
     pub fn fido_dev_get_touch_status(
@@ -174,8 +185,30 @@ unsafe extern "C" {
     pub fn fido_cred_id_len(credential: *const fido_cred_t) -> usize;
     pub fn fido_cred_pubkey_ptr(credential: *const fido_cred_t) -> *const c_uchar;
     pub fn fido_cred_pubkey_len(credential: *const fido_cred_t) -> usize;
+    pub fn fido_cred_user_id_ptr(credential: *const fido_cred_t) -> *const c_uchar;
+    pub fn fido_cred_user_id_len(credential: *const fido_cred_t) -> usize;
     pub fn fido_cred_x5c_ptr(credential: *const fido_cred_t) -> *const c_uchar;
     pub fn fido_cred_x5c_len(credential: *const fido_cred_t) -> usize;
+
+    pub fn fido_credman_rk_new() -> *mut fido_credman_rk_t;
+    pub fn fido_credman_rk_free(credentials: *mut *mut fido_credman_rk_t);
+    pub fn fido_credman_get_dev_rk(
+        dev: *mut fido_dev_t,
+        rp_id: *const c_char,
+        credentials: *mut fido_credman_rk_t,
+        pin: *const c_char,
+    ) -> c_int;
+    pub fn fido_credman_del_dev_rk(
+        dev: *mut fido_dev_t,
+        credential_id: *const c_uchar,
+        credential_id_len: usize,
+        pin: *const c_char,
+    ) -> c_int;
+    pub fn fido_credman_rk_count(credentials: *const fido_credman_rk_t) -> usize;
+    pub fn fido_credman_rk(
+        credentials: *const fido_credman_rk_t,
+        index: usize,
+    ) -> *const fido_cred_t;
 
     pub fn fido_assert_new() -> *mut fido_assert_t;
     pub fn fido_assert_free(assertion: *mut *mut fido_assert_t);

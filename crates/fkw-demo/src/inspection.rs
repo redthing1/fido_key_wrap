@@ -46,6 +46,12 @@ impl AuthenticatorInspection for ProductionInspection {
                         AuthenticatorIssue::CredentialProtectionUnavailable => {
                             "credential protection is unavailable"
                         }
+                        AuthenticatorIssue::DiscoverableCredentialsUnavailable => {
+                            "managed credential storage is unavailable"
+                        }
+                        AuthenticatorIssue::CredentialManagementUnavailable => {
+                            "managed credential operations are unavailable"
+                        }
                         AuthenticatorIssue::UserVerificationUnavailable => {
                             "user verification is unavailable"
                         }

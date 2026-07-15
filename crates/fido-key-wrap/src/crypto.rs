@@ -18,6 +18,7 @@ use crate::{
         FidoAndPassphraseRecipient, FidoRecipient, KdfDescriptor, PassphraseRecipient,
         RecipientRecord, RecoverySecretRecord,
     },
+    policy::FidoStorage,
     transcript,
 };
 
@@ -26,6 +27,7 @@ const PASSPHRASE_SUITE: [u8; 1] = [1];
 const FIDO_SUITE: [u8; 1] = [2];
 const COMBINED_SUITE: [u8; 1] = [3];
 const RECOVERY_SECRET_SUITE: [u8; 1] = [4];
+const MANAGED_FIDO_SUITE: [u8; 1] = [5];
 const ARGON2ID_KDF: [u8; 1] = [1];
 const ROOT_BYTES: usize = 32;
 const TAG_BYTES: usize = 16;
@@ -377,10 +379,14 @@ fn fido_context_transcript(
     envelope_id: &[u8; 32],
 ) -> Result<Vec<u8>> {
     let policy = [recipient.policy.code()];
+    let suite = match recipient.storage {
+        FidoStorage::NonDiscoverable => &FIDO_SUITE,
+        FidoStorage::Managed => &MANAGED_FIDO_SUITE,
+    };
     transcript::encode(&[
         RECIPIENT_CONTEXT_DOMAIN,
         &FORMAT,
-        &FIDO_SUITE,
+        suite,
         application.as_str().as_bytes(),
         envelope_id,
         recipient.id.as_bytes(),
@@ -617,6 +623,8 @@ mod tests {
         include_str!("../../../test-vectors/format-1-fido-presence.txt");
     const FIDO_UV_VECTOR: &str =
         include_str!("../../../test-vectors/format-1-fido-user-verification.txt");
+    const MANAGED_FIDO_VECTOR: &str =
+        include_str!("../../../test-vectors/format-1-managed-fido.txt");
     const COMBINED_PRESENCE_VECTOR: &str =
         include_str!("../../../test-vectors/format-1-fido-presence-plus-passphrase.txt");
     const COMBINED_UV_VECTOR: &str =
@@ -1009,6 +1017,7 @@ mod tests {
             credential_id: record.credential_id.clone(),
             public_key: record.public_key.clone(),
             policy: record.policy,
+            storage: FidoStorage::NonDiscoverable,
             prf_nonce: record.prf_nonce,
             fido_nonce: record.fido_nonce,
             wrapped_root: record.wrapped_root[..WRAPPED_ROOT_BYTES]
@@ -1032,6 +1041,7 @@ mod tests {
         for vector in [
             FIDO_PRESENCE_VECTOR,
             FIDO_UV_VECTOR,
+            MANAGED_FIDO_VECTOR,
             COMBINED_PRESENCE_VECTOR,
             COMBINED_UV_VECTOR,
         ] {
@@ -1087,7 +1097,7 @@ mod tests {
 
     #[test]
     fn fido_only_vectors_wrap_and_unwrap_exactly() {
-        for vector in [FIDO_PRESENCE_VECTOR, FIDO_UV_VECTOR] {
+        for vector in [FIDO_PRESENCE_VECTOR, FIDO_UV_VECTOR, MANAGED_FIDO_VECTOR] {
             let envelope = envelope(vector);
             let recipient = &envelope.recipients[0];
             let RecipientRecord::Fido(record) = recipient else {
@@ -1127,6 +1137,39 @@ mod tests {
             .unwrap();
             assert!(same_root(&expected_root, &recovered));
         }
+    }
+
+    #[test]
+    fn managed_storage_is_bound_to_fido_derivation_and_wrapping() {
+        let envelope = envelope(MANAGED_FIDO_VECTOR);
+        let recipient = &envelope.recipients[0];
+        let RecipientRecord::Fido(record) = recipient else {
+            panic!("fixture has the wrong suite");
+        };
+        let mut altered = record.clone();
+        altered.storage = FidoStorage::NonDiscoverable;
+        let altered = RecipientRecord::Fido(altered);
+        assert_ne!(
+            recipient_context(recipient, &envelope.application_id, &envelope.envelope_id).unwrap(),
+            recipient_context(&altered, &envelope.application_id, &envelope.envelope_id).unwrap()
+        );
+
+        let altered_key = derive_fido_key(
+            &altered,
+            &envelope.application_id,
+            &envelope.envelope_id,
+            &array(MANAGED_FIDO_VECTOR, "verified_prf_result"),
+        )
+        .unwrap();
+        assert!(
+            unwrap_fido_root(
+                record,
+                &envelope.application_id,
+                &envelope.envelope_id,
+                &altered_key,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1317,7 +1360,7 @@ mod tests {
     #[test]
     fn mixed_recipient_body_and_whole_envelope_mac_match_vector() {
         let envelope = envelope(MIXED_VECTOR);
-        assert_eq!(envelope.recipients.len(), 6);
+        assert_eq!(envelope.recipients.len(), 7);
         let root = root(MIXED_VECTOR);
         check_envelope_mac_intermediates(MIXED_VECTOR, &envelope, &root);
         verify_envelope_mac(&envelope, &root).unwrap();

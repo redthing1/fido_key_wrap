@@ -31,6 +31,7 @@ pub(crate) trait AppUi {
     fn choose_recipient(&mut self, choices: &[RecipientChoice]) -> Result<RecipientId>;
     fn confirm_offline_passphrase_route(&mut self) -> Result<()>;
     fn confirm_root_rotation(&mut self) -> Result<()>;
+    fn confirm_managed_retirement(&mut self, label: &str, final_route: bool) -> Result<()>;
 }
 
 pub(crate) struct TerminalUi;
@@ -74,6 +75,18 @@ impl AppUi for TerminalUi {
         confirm(
             "root rotation replaces every current recovery route and re-encrypts the note; old complete copies remain usable",
         )
+    }
+
+    fn confirm_managed_retirement(&mut self, label: &str, final_route: bool) -> Result<()> {
+        if final_route {
+            confirm(&format!(
+                "retiring {label} permanently disables the final recovery route in this file"
+            ))
+        } else {
+            confirm(&format!(
+                "retiring {label} permanently disables that route in every copy of this note"
+            ))
+        }
     }
 }
 
@@ -136,13 +149,19 @@ impl<'a> Application<'a> {
         storage::ensure_absent(path)?;
         validate_plaintext(plaintext)?;
         let enrollment = enrollment(access, label, kdf)?;
+        let managed = enrollment.policy() == RecipientPolicy::ManagedFido;
         let (root, envelope, recipient) = self.access.create_root(enrollment)?;
-        self.validate_envelope(&envelope)?;
-        let envelope_bytes = envelope.encode();
-        let encrypted =
-            EncryptedNote::encrypt(&root, &self.trusted_id, &envelope_bytes, plaintext)?;
-        let container = NoteFile::new(envelope_bytes, encrypted)?;
-        storage::create_atomic(path, &container.encode())?;
+        managed_publication(
+            (|| {
+                self.validate_envelope(&envelope)?;
+                let envelope_bytes = envelope.encode();
+                let encrypted =
+                    EncryptedNote::encrypt(&root, &self.trusted_id, &envelope_bytes, plaintext)?;
+                let container = NoteFile::new(envelope_bytes, encrypted)?;
+                storage::create_atomic(path, &container.encode())
+            })(),
+            managed,
+        )?;
         Ok(recipient)
     }
 
@@ -174,6 +193,7 @@ impl<'a> Application<'a> {
         kdf: KdfOptions,
     ) -> Result<RecipientId> {
         let enrollment = enrollment(access, label.to_owned(), kdf)?;
+        let managed = enrollment.policy() == RecipientPolicy::ManagedFido;
         let _lock = storage::NoteLock::acquire(path)?;
         let mut loaded = self.load(path)?;
         if loaded
@@ -203,14 +223,19 @@ impl<'a> Application<'a> {
         let recipient = self
             .access
             .add_recipient(&mut loaded.envelope, &root, enrollment)?;
-        let staged_envelope = self.canonical_stage(&loaded.envelope)?;
-        let staged = self.stage_container(
-            &staged_envelope,
-            &root,
-            &plaintext,
-            loaded.container.note().nonce(),
+        managed_publication(
+            (|| {
+                let staged_envelope = self.canonical_stage(&loaded.envelope)?;
+                let staged = self.stage_container(
+                    &staged_envelope,
+                    &root,
+                    &plaintext,
+                    loaded.container.note().nonce(),
+                )?;
+                storage::replace_atomic_if_unchanged(path, &loaded.original_bytes, &staged.encode())
+            })(),
+            managed,
         )?;
-        storage::replace_atomic_if_unchanged(path, &loaded.original_bytes, &staged.encode())?;
         Ok(recipient)
     }
 
@@ -222,14 +247,17 @@ impl<'a> Application<'a> {
     ) -> Result<RecipientChoice> {
         let _lock = storage::NoteLock::acquire(path)?;
         let mut loaded = self.load(path)?;
-        if loaded.envelope.recipients().len() == 1 {
-            bail!("cannot remove the final recipient");
-        }
         let recipient = resolve_recipient(&loaded.envelope, recipient_selector)?;
         let removed = choices(&loaded.envelope)
             .into_iter()
             .find(|choice| choice.id == recipient)
             .context("recipient not found")?;
+        if removed.policy == RecipientPolicy::ManagedFido {
+            bail!("retire managed security-key routes with `fkw retire-key`");
+        }
+        if loaded.envelope.recipients().len() == 1 {
+            bail!("cannot remove the final recipient");
+        }
         let authorizer = self.select_recipient(&loaded.envelope, using)?;
         let root = self.access.unlock(&loaded.envelope, authorizer)?;
         let plaintext = loaded.container.note().decrypt(
@@ -290,6 +318,86 @@ impl<'a> Application<'a> {
         Ok(recipient)
     }
 
+    pub(crate) fn verify_managed_recipient(
+        &mut self,
+        path: &Path,
+        recipient_selector: &str,
+        using: Option<&str>,
+    ) -> Result<RecipientChoice> {
+        let loaded = self.load(path)?;
+        let recipient = resolve_recipient(&loaded.envelope, recipient_selector)?;
+        let selected = choices(&loaded.envelope)
+            .into_iter()
+            .find(|choice| choice.id == recipient)
+            .context("recipient not found")?;
+        if selected.policy != RecipientPolicy::ManagedFido {
+            bail!("the selected recipient is not a managed security-key route");
+        }
+        let authorizer = self.select_recipient(&loaded.envelope, using)?;
+        let root = self.access.unlock(&loaded.envelope, authorizer)?;
+        self.access
+            .verify_managed_recipient(&loaded.envelope, &root, recipient)?;
+        Ok(selected)
+    }
+
+    pub(crate) fn retire_managed_recipient(
+        &mut self,
+        path: &Path,
+        recipient_selector: &str,
+        using: Option<&str>,
+        confirmed: bool,
+    ) -> Result<(RecipientChoice, bool)> {
+        let _lock = storage::NoteLock::acquire(path)?;
+        let loaded = self.load(path)?;
+        let recipient = resolve_recipient(&loaded.envelope, recipient_selector)?;
+        let selected = choices(&loaded.envelope)
+            .into_iter()
+            .find(|choice| choice.id == recipient)
+            .context("recipient not found")?;
+        if selected.policy != RecipientPolicy::ManagedFido {
+            bail!("the selected recipient is not a managed security-key route");
+        }
+        let final_route = loaded.envelope.recipients().len() == 1;
+        if !confirmed {
+            self.ui
+                .confirm_managed_retirement(&selected.label, final_route)?;
+        }
+        let authorizer = self.select_recipient(&loaded.envelope, using)?;
+        let root = self.access.unlock(&loaded.envelope, authorizer)?;
+        let staged = if final_route {
+            None
+        } else {
+            let plaintext = loaded.container.note().decrypt(
+                &root,
+                &self.trusted_id,
+                loaded.container.envelope_bytes(),
+            )?;
+            let mut envelope = loaded.envelope.clone();
+            self.access
+                .remove_recipient(&mut envelope, &root, recipient)?;
+            let envelope = self.canonical_stage(&envelope)?;
+            Some(self.stage_container(
+                &envelope,
+                &root,
+                &plaintext,
+                loaded.container.note().nonce(),
+            )?)
+        };
+
+        self.access
+            .retire_managed_recipient(&loaded.envelope, &root, recipient)?;
+        if let Some(staged) = staged {
+            if let Err(error) =
+                storage::replace_atomic_if_unchanged(path, &loaded.original_bytes, &staged.encode())
+            {
+                return Err(error).context(
+                    "the managed credential was retired, but the note update could not be confirmed",
+                );
+            }
+        }
+        Ok((selected, final_route))
+    }
+
     pub(crate) fn rotate_root(
         &mut self,
         path: &Path,
@@ -300,6 +408,7 @@ impl<'a> Application<'a> {
         confirmed: bool,
     ) -> Result<RecipientId> {
         let enrollment = enrollment(access, label, kdf)?;
+        let managed = enrollment.policy() == RecipientPolicy::ManagedFido;
         let _lock = storage::NoteLock::acquire(path)?;
         let loaded = self.load(path)?;
         if !confirmed {
@@ -313,14 +422,19 @@ impl<'a> Application<'a> {
             loaded.container.envelope_bytes(),
         )?;
         let (new_root, envelope, recipient) = self.access.create_root(enrollment)?;
-        let staged_envelope = self.canonical_stage(&envelope)?;
-        let staged = self.stage_container(
-            &staged_envelope,
-            &new_root,
-            &plaintext,
-            loaded.container.note().nonce(),
+        managed_publication(
+            (|| {
+                let staged_envelope = self.canonical_stage(&envelope)?;
+                let staged = self.stage_container(
+                    &staged_envelope,
+                    &new_root,
+                    &plaintext,
+                    loaded.container.note().nonce(),
+                )?;
+                storage::replace_atomic_if_unchanged(path, &loaded.original_bytes, &staged.encode())
+            })(),
+            managed,
         )?;
-        storage::replace_atomic_if_unchanged(path, &loaded.original_bytes, &staged.encode())?;
         Ok(recipient)
     }
 
@@ -396,6 +510,16 @@ impl<'a> Application<'a> {
     }
 }
 
+fn managed_publication<T>(result: Result<T>, managed: bool) -> Result<T> {
+    if managed {
+        result.context(
+            "the note was not confirmed saved; a managed credential may remain on the security key",
+        )
+    } else {
+        result
+    }
+}
+
 struct LoadedNote {
     original_bytes: Vec<u8>,
     container: NoteFile,
@@ -468,6 +592,7 @@ pub(crate) fn enrollment(access: Access, label: String, kdf: KdfOptions) -> Resu
         (Access::FidoUserVerification, None) => {
             Enrollment::fido(label, FidoPolicy::UserVerification)
         }
+        (Access::FidoManaged, None) => Enrollment::managed_fido(label),
         (Access::FidoPresencePlusPassphrase, None) => {
             Enrollment::fido_and_passphrase(label, FidoPolicy::Presence)
         }
@@ -484,7 +609,7 @@ pub(crate) fn enrollment(access: Access, label: String, kdf: KdfOptions) -> Resu
                 parameters,
             )
         }
-        (Access::FidoPresence | Access::FidoUserVerification, Some(_)) => {
+        (Access::FidoPresence | Access::FidoUserVerification | Access::FidoManaged, Some(_)) => {
             bail!("argon2 options apply only to passphrase-bearing access policies")
         }
     }?;
@@ -512,6 +637,7 @@ fn ensure_allowed_policy(policy: RecipientPolicy) -> Result<()> {
     match policy {
         RecipientPolicy::Passphrase
         | RecipientPolicy::Fido(FidoPolicy::Presence | FidoPolicy::UserVerification)
+        | RecipientPolicy::ManagedFido
         | RecipientPolicy::FidoAndPassphrase(FidoPolicy::Presence | FidoPolicy::UserVerification) => {
             Ok(())
         }
@@ -535,6 +661,7 @@ pub(crate) const fn policy_text(policy: RecipientPolicy) -> &'static str {
         RecipientPolicy::RecoverySecret => "recovery secret",
         RecipientPolicy::Fido(FidoPolicy::Presence) => "security key: presence",
         RecipientPolicy::Fido(FidoPolicy::UserVerification) => "security key: user verification",
+        RecipientPolicy::ManagedFido => "managed security key: user verification",
         RecipientPolicy::FidoAndPassphrase(FidoPolicy::Presence) => {
             "security key: presence + application passphrase"
         }
@@ -591,11 +718,12 @@ mod tests {
     }
 
     #[test]
-    fn policy_allow_list_accepts_the_five_demo_routes() {
+    fn policy_allow_list_accepts_every_demo_route() {
         for policy in [
             RecipientPolicy::Passphrase,
             RecipientPolicy::Fido(FidoPolicy::Presence),
             RecipientPolicy::Fido(FidoPolicy::UserVerification),
+            RecipientPolicy::ManagedFido,
             RecipientPolicy::FidoAndPassphrase(FidoPolicy::Presence),
             RecipientPolicy::FidoAndPassphrase(FidoPolicy::UserVerification),
         ] {
@@ -793,12 +921,13 @@ mod tests {
     }
 
     #[test]
-    fn all_four_fido_policies_are_orchestrated_through_only_the_high_level_seam() {
+    fn every_fido_policy_is_orchestrated_through_only_the_high_level_seam() {
         let directory = TestDirectory::new();
         let application_id = ApplicationId::new("vectors.fido-key-wrap.example").unwrap();
         for (index, access_policy) in [
             Access::FidoPresence,
             Access::FidoUserVerification,
+            Access::FidoManaged,
             Access::FidoPresencePlusPassphrase,
             Access::FidoUserVerificationPlusPassphrase,
         ]
@@ -826,6 +955,181 @@ mod tests {
             assert_eq!(access.created, vec![access_policy]);
             assert_eq!(access.unlocks, 1);
         }
+    }
+
+    #[test]
+    fn managed_publication_failure_reports_the_possible_orphan() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("managed-publication.fkd");
+        let concurrent = b"concurrent destination".to_vec();
+        let application_id = ApplicationId::new("vectors.fido-key-wrap.example").unwrap();
+        let mut access = VectorKeyAccess {
+            creation_conflict: Some((path.clone(), concurrent.clone())),
+            ..VectorKeyAccess::default()
+        };
+        let mut ui = TestUi::default();
+        let mut application = Application::new(application_id, &mut access, &mut ui);
+
+        let result = application.create(
+            &path,
+            Access::FidoManaged,
+            "managed".into(),
+            KdfOptions::default(),
+            b"not published",
+        );
+
+        assert!(matches!(
+            result,
+            Err(error) if error.to_string().contains("a managed credential may remain")
+        ));
+        assert_eq!(storage::read_private(&path).unwrap(), concurrent);
+        assert_eq!(access.created, [Access::FidoManaged]);
+    }
+
+    #[test]
+    fn managed_routes_require_the_retirement_workflow() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("managed-retirement.fkd");
+        let envelope = mixed_demo_envelope();
+        let application_id = envelope.application_id().clone();
+        store_vector_note(&path, &envelope, b"managed retirement");
+        let original = storage::read_private(&path).unwrap();
+
+        let mut access = VectorKeyAccess::default();
+        let mut ui = TestUi::default();
+        let mut application = Application::new(application_id, &mut access, &mut ui);
+
+        let sole_path = directory.path.join("sole-managed.fkd");
+        let managed = managed_envelope();
+        store_vector_note(&sole_path, &managed, b"sole managed route");
+        let sole_removal = application.remove_recipient(&sole_path, "managed fido", None);
+        assert!(matches!(
+            sole_removal,
+            Err(error) if error.to_string().contains("retire-key")
+        ));
+
+        let removal = application.remove_recipient(&path, "managed fido", Some("passphrase"));
+        assert!(matches!(
+            removal,
+            Err(error) if error.to_string().contains("retire-key")
+        ));
+        assert_eq!(storage::read_private(&path).unwrap(), original);
+        assert_eq!(access.unlocks, 0);
+        assert_eq!(access.removals, 0);
+        assert_eq!(ui.confirmations, 0);
+    }
+
+    #[test]
+    fn managed_verification_and_nonfinal_retirement_are_exact() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("managed-retirement.fkd");
+        let envelope = mixed_demo_envelope();
+        let application_id = envelope.application_id().clone();
+        store_vector_note(&path, &envelope, b"managed retirement");
+        let original = storage::read_private(&path).unwrap();
+
+        let mut access = VectorKeyAccess::default();
+        let mut ui = TestUi::default();
+        let mut application = Application::new(application_id, &mut access, &mut ui);
+
+        application
+            .verify_managed_recipient(&path, "managed fido", Some("passphrase"))
+            .unwrap();
+        let (_, final_route) = application
+            .retire_managed_recipient(&path, "managed fido", Some("passphrase"), false)
+            .unwrap();
+        assert!(!final_route);
+        assert_ne!(storage::read_private(&path).unwrap(), original);
+        assert_eq!(application.recipients(&path).unwrap().len(), 1);
+
+        drop(application);
+        assert_eq!(access.unlocks, 2);
+        assert_eq!(access.verifications, 1);
+        assert_eq!(access.retirements, 1);
+        assert_eq!(access.removals, 1);
+        assert_eq!(ui.confirmations, 1);
+        assert_eq!(ui.managed_final_routes, [false]);
+    }
+
+    #[test]
+    fn rejected_managed_retirement_stops_before_key_access() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("cancelled-retirement.fkd");
+        let envelope = mixed_demo_envelope();
+        let application_id = envelope.application_id().clone();
+        store_vector_note(&path, &envelope, b"cancelled retirement");
+        let original = storage::read_private(&path).unwrap();
+
+        let mut access = VectorKeyAccess::default();
+        let mut ui = TestUi {
+            reject_managed_retirement: true,
+            ..TestUi::default()
+        };
+        let mut application = Application::new(application_id, &mut access, &mut ui);
+        let result =
+            application.retire_managed_recipient(&path, "managed fido", Some("passphrase"), false);
+
+        assert!(matches!(result, Err(error) if error.to_string() == "retirement cancelled"));
+        assert_eq!(storage::read_private(&path).unwrap(), original);
+        assert_eq!(access.unlocks, 0);
+        assert_eq!(access.removals, 0);
+        assert_eq!(access.retirements, 0);
+        assert_eq!(ui.confirmations, 1);
+    }
+
+    #[test]
+    fn retired_credential_is_reported_when_note_publication_conflicts() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("conflicted-retirement.fkd");
+        let envelope = mixed_demo_envelope();
+        let application_id = envelope.application_id().clone();
+        store_vector_note(&path, &envelope, b"conflicted retirement");
+        let original = storage::read_private(&path).unwrap();
+        let concurrent = b"concurrent note update".to_vec();
+
+        let mut access = VectorKeyAccess {
+            retirement_conflict: Some((path.clone(), original, concurrent.clone())),
+            ..VectorKeyAccess::default()
+        };
+        let mut ui = TestUi::default();
+        let mut application = Application::new(application_id, &mut access, &mut ui);
+        let result =
+            application.retire_managed_recipient(&path, "managed fido", Some("passphrase"), true);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.to_string().contains("the managed credential was retired")
+        ));
+        assert_eq!(storage::read_private(&path).unwrap(), concurrent);
+        assert_eq!(access.unlocks, 1);
+        assert_eq!(access.removals, 1);
+        assert_eq!(access.retirements, 1);
+        assert_eq!(ui.confirmations, 0);
+    }
+
+    #[test]
+    fn final_managed_retirement_leaves_the_dead_route_recorded() {
+        let directory = TestDirectory::new();
+        let path = directory.path.join("final-managed.fkd");
+        let envelope = managed_envelope();
+        let application_id = envelope.application_id().clone();
+        store_vector_note(&path, &envelope, b"final managed route");
+        let original = storage::read_private(&path).unwrap();
+
+        let mut access = VectorKeyAccess::default();
+        let mut ui = TestUi::default();
+        let mut application = Application::new(application_id, &mut access, &mut ui);
+        let (_, final_route) = application
+            .retire_managed_recipient(&path, "managed fido", None, false)
+            .unwrap();
+
+        assert!(final_route);
+        assert_eq!(storage::read_private(&path).unwrap(), original);
+        assert_eq!(access.unlocks, 1);
+        assert_eq!(access.retirements, 1);
+        assert_eq!(access.removals, 0);
+        assert_eq!(ui.confirmations, 1);
+        assert_eq!(ui.managed_final_routes, [true]);
     }
 
     #[test]
@@ -950,6 +1254,8 @@ mod tests {
     #[derive(Default)]
     struct TestUi {
         confirmations: usize,
+        managed_final_routes: Vec<bool>,
+        reject_managed_retirement: bool,
     }
 
     impl AppUi for TestUi {
@@ -964,6 +1270,15 @@ mod tests {
 
         fn confirm_root_rotation(&mut self) -> Result<()> {
             self.confirmations += 1;
+            Ok(())
+        }
+
+        fn confirm_managed_retirement(&mut self, _label: &str, final_route: bool) -> Result<()> {
+            self.confirmations += 1;
+            self.managed_final_routes.push(final_route);
+            if self.reject_managed_retirement {
+                bail!("retirement cancelled");
+            }
             Ok(())
         }
     }
@@ -981,6 +1296,10 @@ mod tests {
         }
 
         fn confirm_root_rotation(&mut self) -> Result<()> {
+            unreachable!("the selector test does not confirm mutations")
+        }
+
+        fn confirm_managed_retirement(&mut self, _label: &str, _final_route: bool) -> Result<()> {
             unreachable!("the selector test does not confirm mutations")
         }
     }
@@ -1044,7 +1363,11 @@ mod tests {
         unlocks: usize,
         additions: usize,
         removals: usize,
+        verifications: usize,
+        retirements: usize,
         rewraps: usize,
+        creation_conflict: Option<(std::path::PathBuf, Vec<u8>)>,
+        retirement_conflict: Option<(std::path::PathBuf, Vec<u8>, Vec<u8>)>,
     }
 
     impl KeyAccess for VectorKeyAccess {
@@ -1056,6 +1379,9 @@ mod tests {
             self.created.push(access);
             let envelope = KeyEnvelope::decode(&vector_bytes(vector, "envelope"))?;
             let recipient = envelope.recipients()[0].id();
+            if let Some((path, contents)) = self.creation_conflict.take() {
+                storage::create_atomic(&path, &contents)?;
+            }
             Ok((vector_root(), envelope, recipient))
         }
 
@@ -1091,6 +1417,29 @@ mod tests {
                 "../../../test-vectors/format-1-fido-user-verification-plus-passphrase.txt"
             );
             *envelope = KeyEnvelope::decode(&vector_bytes(vector, "envelope"))?;
+            Ok(())
+        }
+
+        fn verify_managed_recipient(
+            &mut self,
+            _envelope: &KeyEnvelope,
+            _root: &RootKey,
+            _recipient: RecipientId,
+        ) -> Result<()> {
+            self.verifications += 1;
+            Ok(())
+        }
+
+        fn retire_managed_recipient(
+            &mut self,
+            _envelope: &KeyEnvelope,
+            _root: &RootKey,
+            _recipient: RecipientId,
+        ) -> Result<()> {
+            self.retirements += 1;
+            if let Some((path, expected, replacement)) = self.retirement_conflict.take() {
+                storage::replace_atomic_if_unchanged(&path, &expected, &replacement)?;
+            }
             Ok(())
         }
 
@@ -1130,6 +1479,10 @@ mod tests {
                     "../../../test-vectors/format-1-fido-user-verification-plus-passphrase.txt"
                 ),
             )),
+            RecipientPolicy::ManagedFido => Ok((
+                Access::FidoManaged,
+                include_str!("../../../test-vectors/format-1-managed-fido.txt"),
+            )),
             RecipientPolicy::Passphrase | RecipientPolicy::RecoverySecret => {
                 bail!("expected a fido policy")
             }
@@ -1151,6 +1504,23 @@ mod tests {
     fn mixed_envelope() -> KeyEnvelope {
         let vector = include_str!("../../../test-vectors/format-1-mixed.txt");
         KeyEnvelope::decode(&vector_bytes(vector, "envelope")).unwrap()
+    }
+
+    fn managed_envelope() -> KeyEnvelope {
+        let vector = include_str!("../../../test-vectors/format-1-managed-fido.txt");
+        KeyEnvelope::decode(&vector_bytes(vector, "envelope")).unwrap()
+    }
+
+    fn store_vector_note(path: &Path, envelope: &KeyEnvelope, plaintext: &[u8]) {
+        let encoded = envelope.encode();
+        let note = EncryptedNote::encrypt(
+            &vector_root(),
+            envelope.application_id(),
+            &encoded,
+            plaintext,
+        )
+        .unwrap();
+        storage::create_atomic(path, &NoteFile::new(encoded, note).unwrap().encode()).unwrap();
     }
 
     fn mixed_demo_envelope() -> KeyEnvelope {

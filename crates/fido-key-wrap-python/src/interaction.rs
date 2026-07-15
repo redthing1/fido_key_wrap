@@ -21,8 +21,13 @@ impl PythonInteraction {
         }
     }
 
-    pub fn take_pending(&mut self) -> Option<PyErr> {
-        self.pending.take()
+    pub fn take_pending_if_causal<T>(&mut self, result: &core::Result<T>) -> Option<PyErr> {
+        let pending = self.pending.take();
+        if matches!(result, Err(core::Error::Interaction(_))) {
+            pending
+        } else {
+            None
+        }
     }
 
     fn finish<T>(
@@ -34,7 +39,9 @@ impl PythonInteraction {
             Err(CallbackFailure::Unsupported) => Err(core::InteractionError::Unsupported),
             Err(CallbackFailure::Python(error)) => {
                 let cancelled = Python::attach(|py| error.is_instance_of::<Cancelled>(py));
-                self.pending = Some(error);
+                if self.pending.is_none() {
+                    self.pending = Some(error);
+                }
                 if cancelled {
                     Err(core::InteractionError::Cancelled)
                 } else {
@@ -196,6 +203,26 @@ mod tests {
             let value = 1_u8.into_pyobject(py).unwrap();
             let error = require_none(value.as_any()).unwrap_err();
             assert!(error.is_instance_of::<PyTypeError>(py));
+        });
+    }
+
+    #[test]
+    fn callback_errors_do_not_hide_a_later_security_state_error() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut interaction = PythonInteraction::new(py.None());
+            interaction.pending = Some(PyTypeError::new_err("callback failed"));
+            let state_error: core::Result<()> =
+                Err(core::AuthenticatorFailure::CredentialMayRemain.into());
+            assert!(interaction.take_pending_if_causal(&state_error).is_none());
+
+            interaction.pending = Some(PyTypeError::new_err("callback failed"));
+            let callback_error: core::Result<()> = Err(core::InteractionError::Failed.into());
+            assert!(
+                interaction
+                    .take_pending_if_causal(&callback_error)
+                    .is_some()
+            );
         });
     }
 }

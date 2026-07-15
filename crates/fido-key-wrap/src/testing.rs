@@ -16,8 +16,14 @@ pub enum FakeStep {
     Selection,
     /// credential creation.
     Enrollment,
+    /// managed discoverable-credential creation.
+    ManagedEnrollment,
     /// evaluation of an existing credential.
     Assertion,
+    /// managed credential deletion.
+    Retirement,
+    /// post-deletion absence verification.
+    AbsenceCheck,
 }
 
 /// one bounded failure scheduled for a deterministic fake operation.
@@ -40,6 +46,10 @@ pub enum FakeFailure {
     Busy,
     /// the selected credential is unavailable.
     CredentialUnavailable,
+    /// a managed enrollment or cleanup may have left a credential behind.
+    CredentialMayRemain,
+    /// managed-credential deletion could not be confirmed.
+    RetirementUncertain,
     /// authenticator transport fails.
     Transport,
     /// the operation fails without a narrower category.
@@ -48,12 +58,25 @@ pub enum FakeFailure {
     InvalidResponse,
 }
 
+/// invalid deterministic-failure scheduling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FakeScheduleError {
+    /// the selected failure cannot occur at that operation stage.
+    #[error("the fake failure is not valid at that operation stage")]
+    InvalidCombination,
+    /// one unconsumed failure is already scheduled.
+    #[error("a fake failure is already scheduled")]
+    AlreadyScheduled,
+}
+
 /// deterministic operation counts observed by a fake authenticator.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FakeCounters {
     selections: usize,
     enrollments: usize,
     assertions: usize,
+    retirements: usize,
 }
 
 impl FakeCounters {
@@ -74,6 +97,12 @@ impl FakeCounters {
     pub const fn assertions(self) -> usize {
         self.assertions
     }
+
+    /// returns the number of managed credential deletions attempted.
+    #[must_use]
+    pub const fn retirements(self) -> usize {
+        self.retirements
+    }
 }
 
 impl From<Counters> for FakeCounters {
@@ -82,11 +111,12 @@ impl From<Counters> for FakeCounters {
             selections: value.selections,
             enrollments: value.enrollments,
             assertions: value.assertions,
+            retirements: value.retirements,
         }
     }
 }
 
-/// deterministic authenticator and its ordinary key protector.
+/// deterministic authenticator and its key protector.
 ///
 /// this concrete type exposes scenarios, not a replaceable backend or raw
 /// cryptographic values.
@@ -121,11 +151,48 @@ impl FakeAuthenticator {
         Ok(())
     }
 
-    /// schedules one failure at one exact future operation stage.
-    pub fn fail_next(&mut self, step: FakeStep, failure: FakeFailure) {
+    /// chooses which visible fake authenticator responds to later operations.
+    pub fn select_authenticator(&mut self, index: usize) -> Result<()> {
         self.protector
             .fake_backend_mut()
-            .fail_next_with(failure_point(step), failure_kind(failure));
+            .select_authenticator(index)
+    }
+
+    /// sets managed-credential capacity on the selected fake authenticator.
+    pub fn set_managed_capacity(&mut self, capacity: usize) -> Result<()> {
+        if capacity > 256 {
+            return Err(Error::InvalidFidoConfig);
+        }
+        self.protector
+            .fake_backend_mut()
+            .set_managed_capacity(capacity);
+        Ok(())
+    }
+
+    /// schedules one failure at one exact future operation stage.
+    ///
+    /// # errors
+    ///
+    /// returns [`FakeScheduleError::InvalidCombination`] when the requested
+    /// failure cannot occur at that stage, or
+    /// [`FakeScheduleError::AlreadyScheduled`] while another failure remains
+    /// queued.
+    pub fn fail_next(
+        &mut self,
+        step: FakeStep,
+        failure: FakeFailure,
+    ) -> std::result::Result<(), FakeScheduleError> {
+        if !valid_failure(step, failure) {
+            return Err(FakeScheduleError::InvalidCombination);
+        }
+        if !self
+            .protector
+            .fake_backend_mut()
+            .fail_next_with(failure_point(step), failure_kind(failure))
+        {
+            return Err(FakeScheduleError::AlreadyScheduled);
+        }
+        Ok(())
     }
 
     /// removes the credential referenced by one FIDO recipient.
@@ -163,7 +230,62 @@ const fn failure_point(step: FakeStep) -> FailurePoint {
     match step {
         FakeStep::Selection => FailurePoint::Selection,
         FakeStep::Enrollment => FailurePoint::Enrollment,
+        FakeStep::ManagedEnrollment => FailurePoint::ManagedEnrollment,
         FakeStep::Assertion => FailurePoint::Assertion,
+        FakeStep::Retirement => FailurePoint::Retirement,
+        FakeStep::AbsenceCheck => FailurePoint::AbsenceCheck,
+    }
+}
+
+const fn valid_failure(step: FakeStep, failure: FakeFailure) -> bool {
+    match step {
+        FakeStep::Selection => matches!(
+            failure,
+            FakeFailure::NoCompatibleAuthenticator
+                | FakeFailure::TimedOut
+                | FakeFailure::Busy
+                | FakeFailure::Transport
+                | FakeFailure::OperationFailed
+                | FakeFailure::InvalidResponse
+        ),
+        FakeStep::Enrollment => matches!(
+            failure,
+            FakeFailure::PinInvalid { .. }
+                | FakeFailure::PinBlocked
+                | FakeFailure::PinTemporarilyBlocked
+                | FakeFailure::TimedOut
+                | FakeFailure::Busy
+                | FakeFailure::Transport
+                | FakeFailure::OperationFailed
+                | FakeFailure::InvalidResponse
+        ),
+        FakeStep::ManagedEnrollment => matches!(
+            failure,
+            FakeFailure::PinInvalid { .. }
+                | FakeFailure::PinBlocked
+                | FakeFailure::PinTemporarilyBlocked
+                | FakeFailure::TimedOut
+                | FakeFailure::Busy
+                | FakeFailure::CredentialMayRemain
+                | FakeFailure::Transport
+                | FakeFailure::OperationFailed
+        ),
+        FakeStep::Assertion | FakeStep::Retirement => matches!(
+            failure,
+            FakeFailure::PinInvalid { .. }
+                | FakeFailure::PinBlocked
+                | FakeFailure::PinTemporarilyBlocked
+                | FakeFailure::TimedOut
+                | FakeFailure::Busy
+                | FakeFailure::CredentialUnavailable
+                | FakeFailure::Transport
+                | FakeFailure::OperationFailed
+                | FakeFailure::InvalidResponse
+        ),
+        FakeStep::AbsenceCheck => matches!(
+            failure,
+            FakeFailure::RetirementUncertain | FakeFailure::InvalidResponse
+        ),
     }
 }
 
@@ -181,6 +303,12 @@ const fn failure_kind(failure: FakeFailure) -> FailureKind {
         FakeFailure::Busy => FailureKind::Authenticator(AuthenticatorFailure::Busy),
         FakeFailure::CredentialUnavailable => {
             FailureKind::Authenticator(AuthenticatorFailure::CredentialUnavailable)
+        }
+        FakeFailure::CredentialMayRemain => {
+            FailureKind::Authenticator(AuthenticatorFailure::CredentialMayRemain)
+        }
+        FakeFailure::RetirementUncertain => {
+            FailureKind::Authenticator(AuthenticatorFailure::RetirementUncertain)
         }
         FakeFailure::Transport => FailureKind::Authenticator(AuthenticatorFailure::Transport),
         FakeFailure::OperationFailed => {
@@ -293,6 +421,130 @@ mod tests {
     }
 
     #[test]
+    fn managed_credentials_are_scoped_to_one_fake_authenticator() {
+        let mut authenticator = FakeAuthenticator::new(application());
+        authenticator.set_compatible_authenticators(2).unwrap();
+        authenticator.select_authenticator(0).unwrap();
+        let mut interaction = RecordingInteraction::default();
+        let (root, envelope, recipient) = authenticator
+            .protector()
+            .create_root(
+                Enrollment::managed_fido("managed").unwrap(),
+                &mut interaction,
+            )
+            .unwrap();
+
+        authenticator.select_authenticator(1).unwrap();
+        assert!(matches!(
+            authenticator.protector().verify_managed_recipient(
+                &envelope,
+                &root,
+                recipient,
+                &mut interaction,
+            ),
+            Err(Error::Authenticator(
+                AuthenticatorFailure::CredentialUnavailable
+            ))
+        ));
+
+        authenticator.select_authenticator(0).unwrap();
+        authenticator
+            .protector()
+            .verify_managed_recipient(&envelope, &root, recipient, &mut interaction)
+            .unwrap();
+    }
+
+    #[test]
+    fn managed_capacity_failure_is_actionable() {
+        let mut authenticator = FakeAuthenticator::new(application());
+        authenticator.set_managed_capacity(0).unwrap();
+        let mut interaction = RecordingInteraction::default();
+        assert!(matches!(
+            authenticator.protector().create_root(
+                Enrollment::managed_fido("managed").unwrap(),
+                &mut interaction,
+            ),
+            Err(Error::Authenticator(
+                AuthenticatorFailure::CredentialStoreFull
+            ))
+        ));
+    }
+
+    #[test]
+    fn uncertain_managed_enrollment_leaves_capacity_consumed() {
+        let mut authenticator = FakeAuthenticator::new(application());
+        authenticator.set_managed_capacity(1).unwrap();
+        authenticator
+            .fail_next(
+                FakeStep::ManagedEnrollment,
+                FakeFailure::CredentialMayRemain,
+            )
+            .unwrap();
+        let mut interaction = RecordingInteraction::default();
+        assert!(matches!(
+            authenticator.protector().create_root(
+                Enrollment::managed_fido("uncertain").unwrap(),
+                &mut interaction,
+            ),
+            Err(Error::Authenticator(
+                AuthenticatorFailure::CredentialMayRemain
+            ))
+        ));
+        assert!(matches!(
+            authenticator
+                .protector()
+                .create_root(Enrollment::managed_fido("next").unwrap(), &mut interaction,),
+            Err(Error::Authenticator(
+                AuthenticatorFailure::CredentialStoreFull
+            ))
+        ));
+    }
+
+    #[test]
+    fn managed_retirement_failures_report_the_resulting_state() {
+        for (step, failure, expected, remains) in [
+            (
+                FakeStep::Retirement,
+                FakeFailure::OperationFailed,
+                AuthenticatorFailure::OperationFailed,
+                true,
+            ),
+            (
+                FakeStep::AbsenceCheck,
+                FakeFailure::RetirementUncertain,
+                AuthenticatorFailure::RetirementUncertain,
+                false,
+            ),
+        ] {
+            let mut authenticator = FakeAuthenticator::new(application());
+            let mut interaction = RecordingInteraction::default();
+            let (root, envelope, recipient) = authenticator
+                .protector()
+                .create_root(
+                    Enrollment::managed_fido("managed").unwrap(),
+                    &mut interaction,
+                )
+                .unwrap();
+            authenticator.fail_next(step, failure).unwrap();
+            let result = authenticator.protector().retire_managed_recipient(
+                &envelope,
+                &root,
+                recipient,
+                &mut interaction,
+            );
+            match result {
+                Err(Error::Authenticator(actual)) => assert_eq!(actual, expected),
+                _ => panic!("retirement returned the wrong result"),
+            }
+            let present = authenticator
+                .protector()
+                .verify_managed_recipient(&envelope, &root, recipient, &mut interaction)
+                .is_ok();
+            assert_eq!(present, remains);
+        }
+    }
+
+    #[test]
     fn combined_presence_preserves_factor_order() {
         let mut authenticator = FakeAuthenticator::new(application());
         let parameters = PassphraseParameters::new(65_536, 3, 1).unwrap();
@@ -327,34 +579,33 @@ mod tests {
     }
 
     #[test]
-    fn injects_every_curated_failure_without_raw_material() {
-        let failures = [
-            FakeFailure::NoCompatibleAuthenticator,
-            FakeFailure::PinInvalid { retries: Some(2) },
-            FakeFailure::PinBlocked,
-            FakeFailure::PinTemporarilyBlocked,
-            FakeFailure::TimedOut,
-            FakeFailure::Busy,
-            FakeFailure::CredentialUnavailable,
-            FakeFailure::Transport,
-            FakeFailure::OperationFailed,
-            FakeFailure::InvalidResponse,
-        ];
+    fn failure_schedules_reject_impossible_and_overlapping_scenarios() {
+        let mut authenticator = FakeAuthenticator::new(application());
+        assert_eq!(
+            authenticator.fail_next(
+                FakeStep::Selection,
+                FakeFailure::PinInvalid { retries: Some(2) }
+            ),
+            Err(FakeScheduleError::InvalidCombination)
+        );
+        authenticator
+            .fail_next(FakeStep::Selection, FakeFailure::Busy)
+            .unwrap();
+        assert_eq!(
+            authenticator.fail_next(FakeStep::Assertion, FakeFailure::Transport),
+            Err(FakeScheduleError::AlreadyScheduled)
+        );
 
-        for failure in failures {
-            let mut authenticator = FakeAuthenticator::new(application());
-            authenticator.fail_next(FakeStep::Selection, failure);
-            let mut interaction = RecordingInteraction::default();
-            let Err(error) = authenticator.protector().create_root(
+        let mut interaction = RecordingInteraction::default();
+        assert!(matches!(
+            authenticator.protector().create_root(
                 Enrollment::fido("primary", FidoPolicy::Presence).unwrap(),
                 &mut interaction,
-            ) else {
-                panic!("scheduled failure was not returned: {failure:?}");
-            };
-            assert_fake_failure(failure, error);
-            assert_eq!(authenticator.counters().selections(), 1);
-            assert_eq!(authenticator.counters().enrollments(), 0);
-        }
+            ),
+            Err(Error::Authenticator(AuthenticatorFailure::Busy))
+        ));
+        assert_eq!(authenticator.counters().selections(), 1);
+        assert_eq!(authenticator.counters().enrollments(), 0);
     }
 
     #[test]
@@ -374,7 +625,9 @@ mod tests {
             Err(Error::InvalidFidoConfig)
         ));
         authenticator.set_compatible_authenticators(0).unwrap();
-        authenticator.fail_next(FakeStep::Selection, FakeFailure::Busy);
+        authenticator
+            .fail_next(FakeStep::Selection, FakeFailure::Busy)
+            .unwrap();
         authenticator.clear();
         assert_eq!(authenticator.counters(), FakeCounters::default());
         assert!(matches!(
@@ -395,34 +648,5 @@ mod tests {
                 )
                 .is_ok()
         );
-    }
-
-    fn assert_fake_failure(expected: FakeFailure, actual: Error) {
-        let matches = match (expected, actual) {
-            (FakeFailure::NoCompatibleAuthenticator, Error::NoCompatibleAuthenticator)
-            | (FakeFailure::PinBlocked, Error::Authenticator(AuthenticatorFailure::PinBlocked))
-            | (
-                FakeFailure::PinTemporarilyBlocked,
-                Error::Authenticator(AuthenticatorFailure::PinTemporarilyBlocked),
-            )
-            | (FakeFailure::TimedOut, Error::Authenticator(AuthenticatorFailure::TimedOut))
-            | (FakeFailure::Busy, Error::Authenticator(AuthenticatorFailure::Busy))
-            | (
-                FakeFailure::CredentialUnavailable,
-                Error::Authenticator(AuthenticatorFailure::CredentialUnavailable),
-            )
-            | (FakeFailure::Transport, Error::Authenticator(AuthenticatorFailure::Transport))
-            | (
-                FakeFailure::OperationFailed,
-                Error::Authenticator(AuthenticatorFailure::OperationFailed),
-            )
-            | (FakeFailure::InvalidResponse, Error::AuthenticatorResponseInvalid) => true,
-            (
-                FakeFailure::PinInvalid { retries: expected },
-                Error::Authenticator(AuthenticatorFailure::PinInvalid { retries: actual }),
-            ) => expected == actual,
-            _ => false,
-        };
-        assert!(matches, "unexpected failure category");
     }
 }

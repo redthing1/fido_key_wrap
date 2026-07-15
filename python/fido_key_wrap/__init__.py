@@ -1,4 +1,4 @@
-"""protect application root keys with passphrases and security keys."""
+"""protect application root keys with passphrases, recovery secrets, and security keys."""
 
 from ._native import (
     FIDO_SUPPORT,

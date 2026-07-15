@@ -32,6 +32,10 @@ pub enum AuthenticatorIssue {
     UserVerificationNotConfigured = 7,
     #[pyo3(name = "PRESENCE_RECOVERY_UNAVAILABLE")]
     PresenceRecoveryUnavailable = 8,
+    #[pyo3(name = "DISCOVERABLE_CREDENTIALS_UNAVAILABLE")]
+    DiscoverableCredentialsUnavailable = 9,
+    #[pyo3(name = "CREDENTIAL_MANAGEMENT_UNAVAILABLE")]
+    CredentialManagementUnavailable = 10,
 }
 
 #[cfg(feature = "fido")]
@@ -52,6 +56,12 @@ impl From<fido_key_wrap::AuthenticatorIssue> for AuthenticatorIssue {
             }
             fido_key_wrap::AuthenticatorIssue::PresenceRecoveryUnavailable => {
                 Self::PresenceRecoveryUnavailable
+            }
+            fido_key_wrap::AuthenticatorIssue::DiscoverableCredentialsUnavailable => {
+                Self::DiscoverableCredentialsUnavailable
+            }
+            fido_key_wrap::AuthenticatorIssue::CredentialManagementUnavailable => {
+                Self::CredentialManagementUnavailable
             }
             _ => Self::Unavailable,
         }

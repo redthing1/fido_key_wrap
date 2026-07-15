@@ -317,14 +317,18 @@ class BindingTests(unittest.TestCase):
             def __getattr__(self, _name):
                 raise AssertionError("interaction was requested")
 
-        enrollment = fkw.Enrollment(
-            "security key", fkw.Policy.FIDO_USER_VERIFICATION
-        )
-        with self.assertRaises(fkw.Error) as caught:
-            fkw.KeyProtector("fido-disabled.example").create_root(
-                enrollment, Unexpected()
+        for policy in (
+            fkw.Policy.FIDO_USER_VERIFICATION,
+            fkw.Policy.MANAGED_FIDO,
+        ):
+            enrollment = fkw.Enrollment("security key", policy)
+            with self.assertRaises(fkw.Error) as caught:
+                fkw.KeyProtector("fido-disabled.example").create_root(
+                    enrollment, Unexpected()
+                )
+            self.assertEqual(
+                caught.exception.code, fkw.ErrorCode.FIDO_SUPPORT_UNAVAILABLE
             )
-        self.assertEqual(caught.exception.code, fkw.ErrorCode.FIDO_SUPPORT_UNAVAILABLE)
         with self.assertRaises(fkw.Error) as caught:
             fkw.inspect_authenticators()
         self.assertEqual(caught.exception.code, fkw.ErrorCode.FIDO_SUPPORT_UNAVAILABLE)
@@ -411,6 +415,7 @@ class BindingTests(unittest.TestCase):
             fkw.Policy.FIDO_USER_VERIFICATION,
             fkw.Policy.FIDO_PRESENCE_AND_PASSPHRASE,
             fkw.Policy.FIDO_USER_VERIFICATION_AND_PASSPHRASE,
+            fkw.Policy.MANAGED_FIDO,
         )
         for index, policy in enumerate(
             policy for policy in policies if policy != fkw.Policy.RECOVERY_SECRET

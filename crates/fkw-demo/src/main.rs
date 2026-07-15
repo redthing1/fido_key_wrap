@@ -91,6 +91,19 @@ trait CommandApplication {
         using: Option<&str>,
         kdf: KdfOptions,
     ) -> Result<RecipientId>;
+    fn verify_managed_recipient(
+        &mut self,
+        file: &Path,
+        recipient: &str,
+        using: Option<&str>,
+    ) -> Result<RecipientChoice>;
+    fn retire_managed_recipient(
+        &mut self,
+        file: &Path,
+        recipient: &str,
+        using: Option<&str>,
+        confirmed: bool,
+    ) -> Result<(RecipientChoice, bool)>;
     fn rotate_root(
         &mut self,
         file: &Path,
@@ -150,6 +163,25 @@ impl CommandApplication for Application<'_> {
         kdf: KdfOptions,
     ) -> Result<RecipientId> {
         Application::rewrap_passphrase(self, file, recipient, using, kdf)
+    }
+
+    fn verify_managed_recipient(
+        &mut self,
+        file: &Path,
+        recipient: &str,
+        using: Option<&str>,
+    ) -> Result<RecipientChoice> {
+        Application::verify_managed_recipient(self, file, recipient, using)
+    }
+
+    fn retire_managed_recipient(
+        &mut self,
+        file: &Path,
+        recipient: &str,
+        using: Option<&str>,
+        confirmed: bool,
+    ) -> Result<(RecipientChoice, bool)> {
+        Application::retire_managed_recipient(self, file, recipient, using, confirmed)
     }
 
     fn rotate_root(
@@ -238,6 +270,38 @@ fn dispatch(
                 "old complete file copies still contain the removed route"
             )?;
         }
+        Command::VerifyKey {
+            file,
+            recipient,
+            using,
+        } => {
+            let verified =
+                application.verify_managed_recipient(&file, &recipient, using.as_deref())?;
+            writeln!(
+                output,
+                "verified {} on the selected security key",
+                verified.label
+            )?;
+        }
+        Command::RetireKey {
+            file,
+            recipient,
+            using,
+            yes,
+        } => {
+            let (retired, final_route) =
+                application.retire_managed_recipient(&file, &recipient, using.as_deref(), yes)?;
+            writeln!(
+                output,
+                "retired {} from the selected security key",
+                retired.label
+            )?;
+            if final_route {
+                writeln!(output, "this file has no working recovery route")?;
+            } else {
+                writeln!(output, "removed the retired route from the current file")?;
+            }
+        }
         Command::ChangePassphrase {
             file,
             recipient,
@@ -291,7 +355,7 @@ fn check(details: bool, inspection: &mut dyn AuthenticatorInspection) -> Result<
                     if report.compatible {
                         "compatible"
                     } else {
-                        "not compatible with every access policy"
+                        "not compatible with every security-key access policy"
                     }
                 );
                 if details {
@@ -398,6 +462,25 @@ mod tests {
             .as_slice(),
             [
                 "fkw",
+                "verify-key",
+                "note.fkd",
+                "managed",
+                "--using",
+                "primary",
+            ]
+            .as_slice(),
+            [
+                "fkw",
+                "retire-key",
+                "note.fkd",
+                "managed",
+                "--using",
+                "primary",
+                "--yes",
+            ]
+            .as_slice(),
+            [
+                "fkw",
                 "rotate-root",
                 "note.fkd",
                 "--access",
@@ -431,14 +514,28 @@ mod tests {
 
         assert_eq!(
             application.calls,
-            ["recipients", "add", "change-passphrase", "remove", "rotate"]
+            [
+                "recipients",
+                "add",
+                "change-passphrase",
+                "remove",
+                "verify-key",
+                "retire-key",
+                "rotate"
+            ]
         );
         assert_eq!(plaintext_reads, 0);
         let output = String::from_utf8(output).unwrap();
+        assert_management_output(&output);
+    }
+
+    fn assert_management_output(output: &str) {
         assert!(output.contains("recipient metadata is unauthenticated"));
         assert!(output.contains("added backup as an alternative recovery route"));
         assert!(output.contains("changed the application passphrase for primary"));
         assert!(output.contains("removed backup"));
+        assert!(output.contains("verified managed"));
+        assert!(output.contains("retired managed"));
         assert!(output.contains("installed replacement as the only recovery route"));
     }
 
@@ -519,6 +616,27 @@ mod tests {
         ) -> Result<RecipientId> {
             self.calls.push("change-passphrase");
             Ok(Self::recipient())
+        }
+
+        fn verify_managed_recipient(
+            &mut self,
+            _file: &Path,
+            recipient: &str,
+            _using: Option<&str>,
+        ) -> Result<RecipientChoice> {
+            self.calls.push("verify-key");
+            Ok(Self::choice(recipient))
+        }
+
+        fn retire_managed_recipient(
+            &mut self,
+            _file: &Path,
+            recipient: &str,
+            _using: Option<&str>,
+            _confirmed: bool,
+        ) -> Result<(RecipientChoice, bool)> {
+            self.calls.push("retire-key");
+            Ok((Self::choice(recipient), false))
         }
 
         fn rotate_root(

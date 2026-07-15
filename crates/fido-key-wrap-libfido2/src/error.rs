@@ -53,8 +53,23 @@ pub enum Error {
     #[error("the authenticator does not support the requested operation")]
     Unsupported,
 
+    #[error("the authenticator does not support managed discoverable credentials")]
+    CredentialManagementUnsupported,
+
+    #[error("the authenticator credential store is full")]
+    CredentialStoreFull,
+
+    #[error("a managed credential may remain on the authenticator")]
+    CredentialMayRemain,
+
     #[error("the authenticator does not contain the requested credential")]
     CredentialNotFound,
+
+    #[error("the managed credential does not match its stored identity")]
+    CredentialMismatch,
+
+    #[error("managed credential retirement could not be confirmed")]
+    RetirementUncertain,
 
     #[error("authenticator response verification failed")]
     VerificationFailed,
@@ -67,7 +82,28 @@ pub enum Error {
 }
 
 fn retry_suffix(retries: Option<u8>) -> String {
-    retries.map_or_else(String::new, |n| format!(" ({n} retries remain)"))
+    match retries {
+        Some(1) => " (1 retry remains)".into(),
+        Some(count) => format!(" ({count} retries remain)"),
+        None => String::new(),
+    }
 }
 
 pub type Result<T> = core::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pin_retry_text_is_grammatical() {
+        assert_eq!(
+            Error::PinInvalid { retries: Some(1) }.to_string(),
+            "the PIN was incorrect (1 retry remains)"
+        );
+        assert_eq!(
+            Error::PinInvalid { retries: Some(2) }.to_string(),
+            "the PIN was incorrect (2 retries remain)"
+        );
+    }
+}

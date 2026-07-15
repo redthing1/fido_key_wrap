@@ -108,6 +108,10 @@ pub enum Operation {
     AddRecipient,
     /// replace a passphrase layer.
     RewrapPassphrase,
+    /// verify that a managed credential is present.
+    VerifyManagedRecipient,
+    /// retire a managed credential from the selected authenticator.
+    RetireManagedRecipient,
 }
 
 /// security-key ceremony being performed.

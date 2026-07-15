@@ -59,7 +59,7 @@
 //! fido = ["fido-key-wrap/fido"]
 //!
 //! [dependencies]
-//! fido-key-wrap = { path = "path/to/fido-key-wrap", default-features = false }
+//! fido-key-wrap = { git = "https://github.com/redthing1/fido_key_wrap.git", default-features = false }
 //! ```
 //!
 //! the application chooses the constructor at compile time. both branches use

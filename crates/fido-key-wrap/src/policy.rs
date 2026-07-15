@@ -47,6 +47,9 @@ pub enum RecipientPolicy {
     RecoverySecret,
     /// one exact security-key ceremony.
     Fido(FidoPolicy),
+    /// one user-verified security-key ceremony backed by managed credential
+    /// storage.
+    ManagedFido,
     /// one exact security-key ceremony followed by an application passphrase.
     FidoAndPassphrase(FidoPolicy),
 }
@@ -55,6 +58,12 @@ impl RecipientPolicy {
     pub(crate) const fn uses_passphrase(self) -> bool {
         matches!(self, Self::Passphrase | Self::FidoAndPassphrase(_))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FidoStorage {
+    NonDiscoverable,
+    Managed,
 }
 
 /// argon2id work recorded for one passphrase-bearing recipient.
@@ -201,6 +210,12 @@ impl Enrollment {
         Self::build(label, RecipientPolicy::Fido(policy), None)
     }
 
+    /// requests a user-verified route whose discoverable credential can later
+    /// be retired.
+    pub fn managed_fido(label: impl Into<String>) -> Result<Self> {
+        Self::build(label, RecipientPolicy::ManagedFido, None)
+    }
+
     /// requests a security-key plus passphrase route using the desktop profile.
     pub fn fido_and_passphrase(label: impl Into<String>, policy: FidoPolicy) -> Result<Self> {
         Self::fido_and_passphrase_with_parameters(label, policy, PassphraseParameters::DESKTOP)
@@ -284,7 +299,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exposes_five_interactive_enrollments_and_separate_recovery_policy() {
+    fn exposes_interactive_enrollments_and_separate_recovery_policy() {
         let policies = [
             Enrollment::passphrase("passphrase").unwrap().policy(),
             Enrollment::fido("presence", FidoPolicy::Presence)
@@ -293,6 +308,7 @@ mod tests {
             Enrollment::fido("verified", FidoPolicy::UserVerification)
                 .unwrap()
                 .policy(),
+            Enrollment::managed_fido("managed").unwrap().policy(),
             Enrollment::fido_and_passphrase("both", FidoPolicy::Presence)
                 .unwrap()
                 .policy(),
@@ -300,11 +316,12 @@ mod tests {
                 .unwrap()
                 .policy(),
         ];
-        assert_eq!(policies.len(), 5);
+        assert_eq!(policies.len(), 6);
         assert!(!policies.contains(&RecipientPolicy::RecoverySecret));
         assert!(!RecipientPolicy::RecoverySecret.uses_passphrase());
         assert!(policies[0].uses_passphrase());
         assert_eq!(policies[1], RecipientPolicy::Fido(FidoPolicy::Presence));
+        assert_eq!(policies[3], RecipientPolicy::ManagedFido);
     }
 
     #[test]

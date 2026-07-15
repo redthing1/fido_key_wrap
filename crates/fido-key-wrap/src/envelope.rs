@@ -3,7 +3,7 @@ use p256::PublicKey;
 
 use crate::{
     ApplicationId, Error, RecipientId, Result,
-    policy::{FidoPolicy, PassphraseParameters, RecipientPolicy, validate_label},
+    policy::{FidoPolicy, FidoStorage, PassphraseParameters, RecipientPolicy, validate_label},
 };
 
 pub(crate) const MAGIC: &[u8; 4] = b"FKW\0";
@@ -16,6 +16,7 @@ const PASSPHRASE_SUITE: u8 = 1;
 const FIDO_SUITE: u8 = 2;
 const FIDO_AND_PASSPHRASE_SUITE: u8 = 3;
 const RECOVERY_SECRET_SUITE: u8 = 4;
+const MANAGED_FIDO_SUITE: u8 = 5;
 const ARGON2ID_KDF: u8 = 1;
 
 const ROOT_BYTES: usize = 32;
@@ -76,6 +77,7 @@ pub(crate) struct FidoRecipient {
     pub(crate) credential_id: Vec<u8>,
     pub(crate) public_key: PublicKey64,
     pub(crate) policy: FidoPolicy,
+    pub(crate) storage: FidoStorage,
     pub(crate) prf_nonce: [u8; PRF_NONCE_BYTES],
     pub(crate) fido_nonce: [u8; GCM_NONCE_BYTES],
     pub(crate) wrapped_root: [u8; WRAPPED_ROOT_BYTES],
@@ -127,7 +129,10 @@ impl RecipientRecord {
         match self {
             Self::Passphrase(_) => RecipientPolicy::Passphrase,
             Self::RecoverySecret(_) => RecipientPolicy::RecoverySecret,
-            Self::Fido(record) => RecipientPolicy::Fido(record.policy),
+            Self::Fido(record) => match record.storage {
+                FidoStorage::NonDiscoverable => RecipientPolicy::Fido(record.policy),
+                FidoStorage::Managed => RecipientPolicy::ManagedFido,
+            },
             Self::FidoAndPassphrase(record) => RecipientPolicy::FidoAndPassphrase(record.policy),
         }
     }
@@ -367,7 +372,11 @@ fn encode_recipient<W: minicbor::encode::Write>(
             encoder.bytes(&record.wrapped_root)?;
         }
         RecipientRecord::Fido(record) => {
-            encoder.array(9)?.u8(FIDO_SUITE)?;
+            let suite = match record.storage {
+                FidoStorage::NonDiscoverable => FIDO_SUITE,
+                FidoStorage::Managed => MANAGED_FIDO_SUITE,
+            };
+            encoder.array(9)?.u8(suite)?;
             encoder.bytes(record.id.as_bytes())?;
             encoder.str(&record.label)?;
             encoder.bytes(&record.credential_id)?;
@@ -414,7 +423,8 @@ fn decode_recipient(decoder: &mut Decoder<'_>) -> Result<RecipientRecord> {
     match suite {
         PASSPHRASE_SUITE if length == 6 => decode_passphrase_recipient(decoder),
         RECOVERY_SECRET_SUITE if length == 5 => decode_recovery_secret_recipient(decoder),
-        FIDO_SUITE if length == 9 => decode_fido_recipient(decoder),
+        FIDO_SUITE if length == 9 => decode_fido_recipient(decoder, FidoStorage::NonDiscoverable),
+        MANAGED_FIDO_SUITE if length == 9 => decode_fido_recipient(decoder, FidoStorage::Managed),
         FIDO_AND_PASSPHRASE_SUITE if length == 11 => decode_fido_and_passphrase_recipient(decoder),
         _ => Err(Error::InvalidEnvelope),
     }
@@ -448,12 +458,18 @@ fn decode_passphrase_recipient(decoder: &mut Decoder<'_>) -> Result<RecipientRec
     }))
 }
 
-fn decode_fido_recipient(decoder: &mut Decoder<'_>) -> Result<RecipientRecord> {
+fn decode_fido_recipient(
+    decoder: &mut Decoder<'_>,
+    storage: FidoStorage,
+) -> Result<RecipientRecord> {
     let id = RecipientId::from_bytes(exact_bytes::<RECIPIENT_ID_BYTES>(decoder)?);
     let label = decode_label(decoder)?;
     let credential_id = decode_credential_id(decoder)?;
     let public_key = PublicKey64::new(exact_bytes::<PUBLIC_KEY_BYTES>(decoder)?)?;
     let policy = FidoPolicy::from_code(decoder.u8().map_err(invalid)?)?;
+    if storage == FidoStorage::Managed && policy != FidoPolicy::UserVerification {
+        return Err(Error::InvalidEnvelope);
+    }
     let prf_nonce = exact_bytes::<PRF_NONCE_BYTES>(decoder)?;
     let fido_nonce = exact_bytes::<GCM_NONCE_BYTES>(decoder)?;
     let wrapped_root = exact_bytes::<WRAPPED_ROOT_BYTES>(decoder)?;
@@ -463,6 +479,7 @@ fn decode_fido_recipient(decoder: &mut Decoder<'_>) -> Result<RecipientRecord> {
         credential_id,
         public_key,
         policy,
+        storage,
         prf_nonce,
         fido_nonce,
         wrapped_root,
@@ -623,6 +640,7 @@ mod tests {
                     credential_id: vec![0x21; 64],
                     public_key: public_key.clone(),
                     policy: FidoPolicy::Presence,
+                    storage: FidoStorage::NonDiscoverable,
                     prf_nonce: [0x22; PRF_NONCE_BYTES],
                     fido_nonce: [0x23; GCM_NONCE_BYTES],
                     wrapped_root: [0x24; WRAPPED_ROOT_BYTES],
@@ -816,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn all_four_structural_suites_round_trip_canonically() {
+    fn structural_suites_round_trip_canonically() {
         let envelope = sample_envelope();
         let encoded = envelope.encode();
         assert!(encoded.starts_with(MAGIC));
@@ -851,6 +869,7 @@ mod tests {
             include_str!("../../../test-vectors/format-1-recovery-secret.txt"),
             include_str!("../../../test-vectors/format-1-fido-presence.txt"),
             include_str!("../../../test-vectors/format-1-fido-user-verification.txt"),
+            include_str!("../../../test-vectors/format-1-managed-fido.txt"),
             include_str!("../../../test-vectors/format-1-fido-presence-plus-passphrase.txt"),
             include_str!(
                 "../../../test-vectors/format-1-fido-user-verification-plus-passphrase.txt"
@@ -862,6 +881,22 @@ mod tests {
             let envelope = KeyEnvelope::decode(&encoded).unwrap();
             assert_eq!(envelope.encode(), encoded);
         }
+    }
+
+    #[test]
+    fn managed_fido_requires_user_verification() {
+        let encoded = vector_envelope(include_str!(
+            "../../../test-vectors/format-1-managed-fido.txt"
+        ));
+        let mut envelope = KeyEnvelope::decode(&encoded).unwrap();
+        let RecipientRecord::Fido(record) = &mut envelope.recipients[0] else {
+            panic!("fixture has the wrong suite");
+        };
+        record.policy = FidoPolicy::Presence;
+        assert!(matches!(
+            KeyEnvelope::decode(&envelope.encode()),
+            Err(Error::InvalidEnvelope)
+        ));
     }
 
     #[test]

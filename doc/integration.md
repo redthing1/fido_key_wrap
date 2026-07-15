@@ -17,6 +17,7 @@ the library is responsible for:
 - encrypting the root for each recipient
 - strict envelope encoding, decoding, and authentication
 - transactional recipient addition, removal, and passphrase rewrap
+- exact verification and retirement of managed security-key credentials
 - clearing secret buffers that it owns
 
 the application is responsible for:
@@ -29,6 +30,7 @@ the application is responsible for:
 - authenticating the exact encoded envelope with its ciphertext
 - atomic storage, concurrency limits, unlocked-session lifetime, and backups
 - storing each recovery secret separately from its envelope
+- publishing managed-recipient changes in a failure-safe order
 - re-encrypting application data when the root is rotated
 
 assertion output, prf results, and derived wrapping keys never cross into the
@@ -36,7 +38,7 @@ application.
 
 ## choosing a recovery model
 
-the six policies are building blocks. an application may expose one, several,
+the seven policies are building blocks. an application may expose one, several,
 or all of them.
 
 | policy | recovery requirement | main consequence |
@@ -45,6 +47,7 @@ or all of them.
 | recovery secret | generated 256-bit secret | the separate secret is sufficient to recover this route |
 | fido presence | credential and touch | possession and touch are sufficient |
 | fido user verification | credential, authenticator verification, and touch | adds the authenticator's verification check |
+| managed fido | managed credential, authenticator verification, and touch | uses one discoverable slot and supports exact retirement |
 | fido presence plus passphrase | credential, touch, and passphrase | the copied envelope alone exposes no passphrase verifier |
 | fido user verification plus passphrase | verified security-key ceremony and passphrase | requires both factors and authenticator verification |
 
@@ -109,8 +112,69 @@ of discovered devices from trusted local configuration. pass it to
 
 native failures are returned as bounded `AuthenticatorFailure` values. wrong
 pin retries, blocked pin states, timeout, busy, unavailable credential, and
-transport failure remain distinct. applications should not retry a pin
-automatically.
+transport failure remain distinct. managed capacity exhaustion and an
+unconfirmed retirement also have distinct results. an ambiguous managed
+creation or failed cleanup reports that a discoverable credential may remain.
+applications should not retry a pin automatically.
+
+## managed security-key routes
+
+`Enrollment::managed_fido` creates a user-verified discoverable credential:
+
+```rust,ignore
+let enrollment = Enrollment::managed_fido("local key")?;
+let (root, envelope, recipient) =
+    protector.create_root(enrollment, &mut interaction)?;
+```
+
+each managed recipient occupies one discoverable credential slot. enrollment
+requires es256, `hmac-secret`, user verification, credential protection,
+discoverable storage, and credential management. backup-eligible or backed-up
+credentials are rejected. labels are not written to authenticator metadata.
+
+verification authenticates the envelope with the supplied root before asking
+for a pin or touch, then proves and enumerates the exact credential recorded by
+the recipient:
+
+```rust,ignore
+protector.verify_managed_recipient(
+    &envelope,
+    &root,
+    recipient,
+    &mut interaction,
+)?;
+```
+
+retirement applies the same checks, deletes that credential on the same open
+authenticator, and confirms its absence by complete enumeration. it does not
+change the envelope:
+
+```rust,ignore
+protector.retire_managed_recipient(
+    &envelope,
+    &root,
+    recipient,
+    &mut interaction,
+)?;
+```
+
+for an envelope with other recipients, prepare the new envelope and
+application ciphertext without the managed recipient before retirement. retire
+the credential against the authenticated original, then publish the prepared
+state. a failure before retirement preserves the original route; a failure
+after retirement leaves the other original routes available. retiring the
+final recipient leaves an envelope with no working route.
+
+successful retirement disables this managed route in every retained copy of
+the envelope. it does not disable another recipient, destroy a passphrase or
+recovery secret, or establish that every route to the root is gone. a missing
+or unavailable authenticator never counts as successful retirement.
+
+failure or process termination before a managed envelope is durably published
+can leave an unpublished discoverable credential on the authenticator. the
+library reports known ambiguous creation and cleanup outcomes. applications
+should reconcile their durable state and use a trusted authenticator management
+tool to remove abandoned entries. no library operation resets an authenticator.
 
 ## recovery secrets
 
@@ -146,9 +210,9 @@ library without fido support or a connected authenticator.
 
 rust tests can enable the non-default `testing` feature and use
 `testing::FakeAuthenticator`. it owns an ordinary `KeyProtector` and provides
-bounded device counts, failure scheduling, credential removal, and operation
-counters. it exposes no backend trait or cryptographic material. keep this
-feature in development dependencies.
+bounded device counts, managed capacity, exact managed retirement, failure
+scheduling, credential removal, and operation counters. it exposes no backend
+trait or cryptographic material. keep this feature in development dependencies.
 
 ## trusted application identity
 
@@ -197,6 +261,10 @@ staged container, and replace the envelope and ciphertext atomically.
 `rewrap_passphrase` require the current root and authenticate the current
 envelope before returning. they stage a complete replacement and leave the
 caller's envelope unchanged on failure.
+
+`remove_recipient` changes only the supplied envelope. it does not delete a
+managed credential. applications should use the managed retirement sequence
+above when removing that kind of route.
 
 these operations keep the same root. an old complete copy remains valid under
 its old recipients and passphrases. strong revocation requires the application

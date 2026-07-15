@@ -4,16 +4,16 @@ use subtle::ConstantTimeEq;
 use std::cell::Cell;
 
 use crate::{
-    ApplicationId, Enrollment, Error, Interaction, KeyEnvelope, Operation, Passphrase,
-    PassphraseLimits, PassphraseParameters, PassphrasePrompt, PassphrasePurpose, RecipientId,
-    RecoverySecret, RecoverySecretRecipient, Result, RootKey,
-    backend::{AuthenticatorBackend, PrfRequest},
+    ApplicationId, AuthenticatorFailure, Enrollment, Error, Interaction, KeyEnvelope, Operation,
+    Passphrase, PassphraseLimits, PassphraseParameters, PassphrasePrompt, PassphrasePurpose,
+    RecipientId, RecoverySecret, RecoverySecretRecipient, Result, RootKey,
+    backend::{AuthenticatorBackend, ManagedEnrollment, ManagedRequest, PrfRequest},
     crypto::{self, DerivedKey},
     envelope::{
         FidoAndPassphraseRecipient, FidoRecipient, KdfDescriptor, MAX_CREDENTIAL_ID,
         MAX_RECIPIENTS, PassphraseRecipient, RecipientRecord, RecoverySecretRecord,
     },
-    policy::{RecipientPolicy, validate_label},
+    policy::{FidoStorage, RecipientPolicy, validate_label},
 };
 
 #[cfg(feature = "fido")]
@@ -319,7 +319,7 @@ impl KeyProtector {
         }
         self.admit_enrollment(&enrollment)?;
 
-        let (record, keys) = self.enroll_recipient(
+        let (record, keys, managed) = self.enroll_recipient(
             envelope,
             root,
             enrollment,
@@ -327,7 +327,8 @@ impl KeyProtector {
             interaction,
         )?;
         let id = record.id();
-        let staged = Self::stage_record(envelope.clone(), record, root, &keys)?;
+        let staged =
+            self.stage_enrollment(envelope.clone(), &record, root, &keys, managed, interaction)?;
         *envelope = staged;
         Ok(id)
     }
@@ -383,6 +384,72 @@ impl KeyProtector {
         Ok(())
     }
 
+    /// verifies that the selected managed credential is present.
+    ///
+    /// the complete envelope is authenticated before interaction. success
+    /// proves the signed credential and its exact management record on one
+    /// selected authenticator. the envelope is not changed.
+    pub fn verify_managed_recipient(
+        &mut self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        recipient: RecipientId,
+        interaction: &mut dyn Interaction,
+    ) -> Result<()> {
+        self.require_authenticated(envelope, root)?;
+        let record = envelope.find(recipient)?;
+        let RecipientRecord::Fido(inner) = record else {
+            return Err(Error::RecipientIsNotManaged);
+        };
+        if inner.storage != FidoStorage::Managed {
+            return Err(Error::RecipientIsNotManaged);
+        }
+        self.backend.verify_managed(
+            &ManagedRequest {
+                application_id: &self.application_id,
+                recipient_id: record.id(),
+                credential_id: &inner.credential_id,
+                public_key: &inner.public_key,
+                label: record.label(),
+                operation: Operation::VerifyManagedRecipient,
+            },
+            interaction,
+        )
+    }
+
+    /// retires the exact managed credential from one selected authenticator.
+    ///
+    /// the complete envelope is authenticated before interaction. success
+    /// requires a verified deletion attempt and a complete absence check. the
+    /// envelope is not changed.
+    pub fn retire_managed_recipient(
+        &mut self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        recipient: RecipientId,
+        interaction: &mut dyn Interaction,
+    ) -> Result<()> {
+        self.require_authenticated(envelope, root)?;
+        let record = envelope.find(recipient)?;
+        let RecipientRecord::Fido(inner) = record else {
+            return Err(Error::RecipientIsNotManaged);
+        };
+        if inner.storage != FidoStorage::Managed {
+            return Err(Error::RecipientIsNotManaged);
+        }
+        self.backend.retire_managed(
+            &ManagedRequest {
+                application_id: &self.application_id,
+                recipient_id: record.id(),
+                credential_id: &inner.credential_id,
+                public_key: &inner.public_key,
+                label: record.label(),
+                operation: Operation::RetireManagedRecipient,
+            },
+            interaction,
+        )
+    }
+
     /// replaces a recipient's passphrase while preserving its argon2 work.
     pub fn rewrap_passphrase(
         &mut self,
@@ -426,10 +493,11 @@ impl KeyProtector {
             recipients: Vec::new(),
             mac: [0; ROOT_BYTES],
         };
-        let (record, keys) =
+        let (record, keys, managed) =
             self.enroll_recipient(&envelope, root, enrollment, operation, interaction)?;
         let id = record.id();
-        let envelope = Self::stage_record(envelope, record, root, &keys)?;
+        let envelope =
+            self.stage_enrollment(envelope, &record, root, &keys, managed, interaction)?;
         Ok((envelope, id))
     }
 
@@ -440,8 +508,8 @@ impl KeyProtector {
         enrollment: Enrollment,
         operation: Operation,
         interaction: &mut dyn Interaction,
-    ) -> Result<(RecipientRecord, RecoveryKeys)> {
-        match enrollment.policy {
+    ) -> Result<(RecipientRecord, RecoveryKeys, Option<ManagedEnrollment>)> {
+        let result = match enrollment.policy {
             RecipientPolicy::Passphrase => self.enroll_passphrase_recipient(
                 envelope,
                 root,
@@ -461,6 +529,15 @@ impl KeyProtector {
                 operation,
                 interaction,
             ),
+            RecipientPolicy::ManagedFido => {
+                return self.enroll_managed_fido_recipient(
+                    envelope,
+                    root,
+                    &enrollment.label,
+                    operation,
+                    interaction,
+                );
+            }
             RecipientPolicy::FidoAndPassphrase(policy) => self.enroll_combined_recipient(
                 envelope,
                 root,
@@ -472,7 +549,8 @@ impl KeyProtector {
                 operation,
                 interaction,
             ),
-        }
+        }?;
+        Ok((result.0, result.1, None))
     }
 
     fn enroll_passphrase_recipient(
@@ -566,11 +644,137 @@ impl KeyProtector {
             credential_id: credential.credential_id,
             public_key: credential.public_key,
             policy,
+            storage: FidoStorage::NonDiscoverable,
             prf_nonce: random_array()?,
             fido_nonce: random_array()?,
             wrapped_root: [0; WRAPPED_ROOT_BYTES],
         });
         let prf = self.evaluate(&record, envelope, operation, interaction)?;
+        let key =
+            crypto::derive_fido_key(&record, &self.application_id, &envelope.envelope_id, &prf)?;
+        drop(prf);
+        if let RecipientRecord::Fido(inner) = &mut record {
+            inner.wrapped_root = crypto::wrap_fido_root(
+                inner,
+                &self.application_id,
+                &envelope.envelope_id,
+                root,
+                &key,
+            )?;
+        }
+        Ok((record, RecoveryKeys::Fido(key)))
+    }
+
+    fn enroll_managed_fido_recipient(
+        &mut self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        label: &str,
+        operation: Operation,
+        interaction: &mut dyn Interaction,
+    ) -> Result<(RecipientRecord, RecoveryKeys, Option<ManagedEnrollment>)> {
+        let id = Self::unique_recipient_id(envelope)?;
+        let mut enrollment =
+            self.backend
+                .enroll_managed(&self.application_id, id, label, operation, interaction)?;
+        let result = self.finish_managed_fido_recipient(
+            envelope,
+            root,
+            id,
+            label,
+            operation,
+            &mut enrollment,
+            interaction,
+        );
+        match result {
+            Ok(result) => Ok((result.0, result.1, Some(enrollment))),
+            Err(error) => Err(self.cleanup_failed_managed_enrollment(
+                &mut enrollment,
+                id,
+                label,
+                error,
+                interaction,
+            )),
+        }
+    }
+
+    fn cleanup_failed_managed_enrollment(
+        &mut self,
+        enrollment: &mut ManagedEnrollment,
+        recipient_id: RecipientId,
+        label: &str,
+        original_error: Error,
+        interaction: &mut dyn Interaction,
+    ) -> Error {
+        let credential_id = enrollment.credential.credential_id.clone();
+        let public_key = enrollment.credential.public_key.clone();
+        match self.backend.cleanup_managed_enrollment(
+            enrollment,
+            &ManagedRequest {
+                application_id: &self.application_id,
+                recipient_id,
+                credential_id: &credential_id,
+                public_key: &public_key,
+                label,
+                operation: Operation::RetireManagedRecipient,
+            },
+            interaction,
+        ) {
+            Ok(()) => original_error,
+            Err(_) => AuthenticatorFailure::CredentialMayRemain.into(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_managed_fido_recipient(
+        &mut self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        id: RecipientId,
+        label: &str,
+        operation: Operation,
+        enrollment: &mut ManagedEnrollment,
+        interaction: &mut dyn Interaction,
+    ) -> Result<(RecipientRecord, RecoveryKeys)> {
+        Self::validate_credential(envelope, &enrollment.credential.credential_id)?;
+        let mut record = RecipientRecord::Fido(FidoRecipient {
+            id,
+            label: label.to_owned(),
+            credential_id: enrollment.credential.credential_id.clone(),
+            public_key: enrollment.credential.public_key.clone(),
+            policy: crate::FidoPolicy::UserVerification,
+            storage: FidoStorage::Managed,
+            prf_nonce: random_array()?,
+            fido_nonce: random_array()?,
+            wrapped_root: [0; WRAPPED_ROOT_BYTES],
+        });
+        let input = crypto::prf_input(&record, &self.application_id, &envelope.envelope_id)?;
+        let RecipientRecord::Fido(inner) = &record else {
+            unreachable!("constructed managed FIDO record")
+        };
+        let prf_request = PrfRequest {
+            application_id: &self.application_id,
+            credential_id: &inner.credential_id,
+            public_key: &inner.public_key,
+            policy: inner.policy,
+            input: &input,
+            label,
+            operation,
+        };
+        let managed_request = ManagedRequest {
+            application_id: &self.application_id,
+            recipient_id: id,
+            credential_id: &inner.credential_id,
+            public_key: &inner.public_key,
+            label,
+            operation,
+        };
+        let prf = self.backend.evaluate_managed_enrollment(
+            enrollment,
+            &prf_request,
+            &managed_request,
+            interaction,
+        )?;
         let key =
             crypto::derive_fido_key(&record, &self.application_id, &envelope.envelope_id, &prf)?;
         drop(prf);
@@ -796,6 +1000,41 @@ impl KeyProtector {
         ))
     }
 
+    fn stage_enrollment(
+        &mut self,
+        envelope: KeyEnvelope,
+        record: &RecipientRecord,
+        root: &RootKey,
+        keys: &RecoveryKeys,
+        mut managed: Option<ManagedEnrollment>,
+        interaction: &mut dyn Interaction,
+    ) -> Result<KeyEnvelope> {
+        match Self::stage_record(envelope, record.clone(), root, keys) {
+            Ok(envelope) => Ok(envelope),
+            Err(error) => {
+                let Some(enrollment) = &mut managed else {
+                    return Err(error);
+                };
+                if !matches!(
+                    record,
+                    RecipientRecord::Fido(FidoRecipient {
+                        storage: FidoStorage::Managed,
+                        ..
+                    })
+                ) {
+                    return Err(Error::AuthenticatorResponseInvalid);
+                }
+                Err(self.cleanup_failed_managed_enrollment(
+                    enrollment,
+                    record.id(),
+                    record.label(),
+                    error,
+                    interaction,
+                ))
+            }
+        }
+    }
+
     fn stage_record(
         mut staged: KeyEnvelope,
         record: RecipientRecord,
@@ -861,18 +1100,37 @@ impl KeyProtector {
             }
         };
         let input = crypto::prf_input(record, &self.application_id, &envelope.envelope_id)?;
-        self.backend.evaluate(
-            &PrfRequest {
-                application_id: &self.application_id,
-                credential_id,
-                public_key,
-                policy,
-                input: &input,
-                label: record.label(),
-                operation,
-            },
-            interaction,
-        )
+        let request = PrfRequest {
+            application_id: &self.application_id,
+            credential_id,
+            public_key,
+            policy,
+            input: &input,
+            label: record.label(),
+            operation,
+        };
+        if matches!(
+            record,
+            RecipientRecord::Fido(FidoRecipient {
+                storage: FidoStorage::Managed,
+                ..
+            })
+        ) {
+            self.backend.evaluate_managed(
+                &request,
+                &ManagedRequest {
+                    application_id: &self.application_id,
+                    recipient_id: record.id(),
+                    credential_id,
+                    public_key,
+                    label: record.label(),
+                    operation,
+                },
+                interaction,
+            )
+        } else {
+            self.backend.evaluate(&request, interaction)
+        }
     }
 
     fn require_application(&self, envelope: &KeyEnvelope) -> Result<()> {
@@ -1832,6 +2090,161 @@ mod tests {
             assert_eq!(crypto::passphrase_derivations(), 0);
             assert!(!open.events.iter().any(|event| event.contains("passphrase")));
         }
+    }
+
+    #[test]
+    fn managed_recipient_lifecycle_is_exact_and_does_not_mutate_the_envelope() {
+        let mut protector = KeyProtector::fake(application());
+        let mut create = ScriptedInteraction::new(&[]);
+        let (root, mut envelope, recipient) = protector
+            .create_root(
+                Enrollment::managed_fido("managed key").unwrap(),
+                &mut create,
+            )
+            .unwrap();
+        assert_eq!(
+            create.events,
+            ["pin", "enrollment touch", "assertion touch"]
+        );
+        assert_eq!(
+            envelope.recipients()[0].policy(),
+            RecipientPolicy::ManagedFido
+        );
+        let mut add = ScriptedInteraction::new(&[]);
+        let other = protector
+            .add_recipient(
+                &mut envelope,
+                &root,
+                Enrollment::managed_fido("other managed key").unwrap(),
+                &mut add,
+            )
+            .unwrap();
+        assert_eq!(add.events, ["pin", "enrollment touch", "assertion touch"]);
+
+        let mut verify = ScriptedInteraction::new(&[]);
+        protector
+            .verify_managed_recipient(&envelope, &root, recipient, &mut verify)
+            .unwrap();
+        assert_eq!(verify.events, ["pin", "assertion touch"]);
+
+        let encoded = envelope.encode();
+        let mut retire = ScriptedInteraction::new(&[]);
+        protector
+            .retire_managed_recipient(&envelope, &root, recipient, &mut retire)
+            .unwrap();
+        assert_eq!(retire.events, ["pin", "assertion touch"]);
+        assert_eq!(envelope.encode(), encoded);
+
+        let mut open = ScriptedInteraction::new(&[]);
+        assert!(matches!(
+            protector.unlock(&envelope, recipient, &mut open),
+            Err(Error::Authenticator(
+                AuthenticatorFailure::CredentialUnavailable
+            ))
+        ));
+        assert_eq!(open.events, ["pin", "assertion touch"]);
+
+        let mut open_other = ScriptedInteraction::new(&[]);
+        protector.unlock(&envelope, other, &mut open_other).unwrap();
+        assert_eq!(open_other.events, ["pin", "assertion touch"]);
+    }
+
+    #[test]
+    fn managed_lifecycle_authenticates_before_interaction() {
+        let mut protector = KeyProtector::fake(application());
+        let mut create = ScriptedInteraction::new(&[]);
+        let (root, envelope, recipient) = protector
+            .create_root(
+                Enrollment::managed_fido("managed key").unwrap(),
+                &mut create,
+            )
+            .unwrap();
+        let mut wrong_bytes = [0x91; 32];
+        let wrong_root = RootKey::import(&mut wrong_bytes);
+
+        for verify in [true, false] {
+            let mut interaction = ScriptedInteraction::new(&[]);
+            let result = if verify {
+                protector.verify_managed_recipient(
+                    &envelope,
+                    &wrong_root,
+                    recipient,
+                    &mut interaction,
+                )
+            } else {
+                protector.retire_managed_recipient(
+                    &envelope,
+                    &wrong_root,
+                    recipient,
+                    &mut interaction,
+                )
+            };
+            assert!(matches!(result, Err(Error::EnvelopeAuthenticationFailed)));
+            assert!(interaction.events.is_empty());
+        }
+
+        let mut interaction = ScriptedInteraction::new(&[]);
+        protector
+            .verify_managed_recipient(&envelope, &root, recipient, &mut interaction)
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_managed_staging_retires_the_created_credential() {
+        let mut protector = KeyProtector::fake(application());
+        protector.fake_backend_mut().set_managed_capacity(1);
+        fail_next_staged_validation(StagedFault::EnvelopeMac);
+
+        let mut first = ScriptedInteraction::new(&[]);
+        assert!(matches!(
+            protector.create_root(Enrollment::managed_fido("first").unwrap(), &mut first,),
+            Err(Error::UnlockFailed)
+        ));
+        assert_eq!(
+            first.events,
+            [
+                "pin",
+                "enrollment touch",
+                "assertion touch",
+                "assertion touch"
+            ]
+        );
+        assert_eq!(protector.fake_backend_mut().counters().retirements, 1);
+
+        let mut second = ScriptedInteraction::new(&[]);
+        assert!(
+            protector
+                .create_root(Enrollment::managed_fido("second").unwrap(), &mut second,)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn failed_managed_cleanup_reports_that_the_credential_may_remain() {
+        use crate::backend::fake::FailurePoint;
+
+        let mut protector = KeyProtector::fake(application());
+        protector.fake_backend_mut().set_managed_capacity(1);
+        protector
+            .fake_backend_mut()
+            .fail_next(FailurePoint::Retirement);
+        fail_next_staged_validation(StagedFault::EnvelopeMac);
+
+        let mut first = ScriptedInteraction::new(&[]);
+        assert!(matches!(
+            protector.create_root(Enrollment::managed_fido("first").unwrap(), &mut first),
+            Err(Error::Authenticator(
+                AuthenticatorFailure::CredentialMayRemain
+            ))
+        ));
+
+        let mut second = ScriptedInteraction::new(&[]);
+        assert!(matches!(
+            protector.create_root(Enrollment::managed_fido("second").unwrap(), &mut second),
+            Err(Error::Authenticator(
+                AuthenticatorFailure::CredentialStoreFull
+            ))
+        ));
     }
 
     #[test]

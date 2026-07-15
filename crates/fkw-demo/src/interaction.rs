@@ -53,6 +53,8 @@ fn selection_subject(operation: Operation, label: &str) -> String {
     match operation {
         Operation::Unlock => "the note".to_owned(),
         Operation::RewrapPassphrase => format!("the passphrase change for {label}"),
+        Operation::VerifyManagedRecipient => format!("verification of {label}"),
+        Operation::RetireManagedRecipient => format!("retirement of {label}"),
         Operation::CreateRoot | Operation::ProtectRoot | Operation::AddRecipient => {
             label.to_owned()
         }
@@ -63,6 +65,8 @@ fn action(operation: Operation, ceremony: FidoCeremony, label: &str) -> String {
     match (operation, ceremony) {
         (Operation::Unlock, _) => "open the note".to_owned(),
         (Operation::RewrapPassphrase, _) => format!("change the passphrase for {label}"),
+        (Operation::VerifyManagedRecipient, _) => format!("verify {label}"),
+        (Operation::RetireManagedRecipient, _) => format!("retire {label}"),
         (
             Operation::CreateRoot | Operation::ProtectRoot | Operation::AddRecipient,
             FidoCeremony::Enrollment,
