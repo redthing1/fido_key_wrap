@@ -19,8 +19,8 @@ signed and verified `hmac-secret` result from its dedicated non-discoverable
 credential, then derives a wrapping key with hkdf-sha-256.
 
 a managed fido recipient uses the same verified `hmac-secret` construction with
-a discoverable, user-verified credential. its distinct suite binds the managed
-storage semantics into the wrapping context.
+a discoverable credential. its distinct suite binds the managed storage
+semantics into the wrapping context.
 
 a combined recipient encrypts the root under the passphrase key and encrypts
 that result under the fido key. unlock verifies and removes the fido layer
@@ -60,10 +60,13 @@ packed attestation signature, the es256 key, the requested credential
 protection, and exact signed flags. the new credential is then exercised by a
 fresh assertion before the recipient is returned.
 
-`managed fido` requires user verification and a discoverable credential. the
-same nonbackup, attestation, assertion, and wrapping checks apply. enrollment
-also confirms the exact credential through authenticated credential management
-before returning it.
+`managed fido presence` and `managed fido user verification` use a discoverable
+credential under the corresponding exact fido policy. presence recovery is
+touch-only; user-verification recovery requires the authenticator pin and a
+touch. the same nonbackup, attestation, assertion, and wrapping checks apply.
+enrollment also confirms the exact credential through authenticated credential
+management before returning it. enrollment, verification, and retirement use
+pin-backed user verification under either managed policy.
 
 ## credential storage
 
@@ -140,8 +143,9 @@ memory. malware present during that unlock can capture them.
 ### managed fido recipient
 
 before retirement, a managed recipient has the same copied-envelope protection
-as a user-verified fido recipient. after successful retirement, retained copies
-cannot recover through that recipient because its credential is absent.
+as the corresponding ordinary fido policy. after successful retirement,
+retained copies cannot recover through that recipient because its credential is
+absent.
 
 this statement concerns one exact route. any surviving recipient still
 recovers the same root. passphrase and recovery-secret routes are unaffected,

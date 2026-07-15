@@ -64,16 +64,20 @@ or creating a credential.
 application-passphrase
 fido-presence
 fido-user-verification
-fido-managed
+fido-managed-presence
+fido-managed-user-verification
 fido-presence-plus-passphrase
 fido-user-verification-plus-passphrase
 ```
+
+the demo does not store recovery secrets. applications use the library's
+explicit recovery-secret methods and store each generated secret separately.
 
 examples:
 
 ```text
 printf 'a private note\n' | fkw new note.fkd -a fido-presence
-printf 'a private note\n' | fkw new note.fkd -a fido-managed
+printf 'a private note\n' | fkw new note.fkd -a fido-managed-presence
 printf 'a private note\n' | fkw new note.fkd -a fido-user-verification-plus-passphrase
 ```
 
@@ -85,8 +89,10 @@ the pin and a touch. combined policies authenticate the security-key layer
 before asking for the application passphrase.
 
 ordinary fido routes use non-discoverable credentials and take no resident
-credential slot. `fido-managed` uses one discoverable slot and requires user
-verification. it supports exact verification and deletion of that credential.
+credential slot. each managed route uses one discoverable slot and supports
+exact verification and deletion of that credential. managed presence opens
+with a touch; managed user verification opens with the pin and a touch. both
+managed policies require the pin when created, verified, or retired.
 
 the application passphrase and security-key pin are different factors.
 

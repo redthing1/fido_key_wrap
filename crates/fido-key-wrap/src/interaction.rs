@@ -119,7 +119,7 @@ pub enum Operation {
 pub enum FidoCeremony {
     /// create a dedicated credential.
     Enrollment,
-    /// prove an existing credential and evaluate its prf.
+    /// perform an assertion with an existing credential.
     Assertion,
 }
 
@@ -164,7 +164,7 @@ impl SelectionPrompt {
         &self.label
     }
 
-    /// returns the exact security-key policy.
+    /// returns the recipient's exact security-key recovery policy.
     #[must_use]
     pub const fn policy(&self) -> FidoPolicy {
         self.policy
@@ -287,7 +287,7 @@ impl TouchPrompt {
         self.ceremony
     }
 
-    /// returns the exact security-key policy.
+    /// returns the recipient's exact security-key recovery policy.
     #[must_use]
     pub const fn policy(&self) -> FidoPolicy {
         self.policy

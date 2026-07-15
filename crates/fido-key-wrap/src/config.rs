@@ -19,7 +19,7 @@ pub struct FidoConfig {
 impl FidoConfig {
     /// constructs validated native-operation limits.
     ///
-    /// timeouts must be positive, exact whole milliseconds representable by
+    /// timeouts must be positive whole-millisecond values representable by
     /// libfido2. the device bound must be between one and 32.
     pub fn new(
         operation_timeout: Duration,

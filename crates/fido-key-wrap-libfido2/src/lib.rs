@@ -16,6 +16,7 @@ mod native;
 pub use error::{Error, Result};
 pub use native::{
     Authenticator, Backend, Capabilities, Config, CredentialProtection, CredentialStorage,
-    DeviceReport, DeviceStatus, Enrollment, EnrollmentRequest, ExactPolicy, Incompatibility,
-    ManagedCapability, ManagedCredential, Pin, PreparedSelection, PrfRequest,
+    DeviceReport, DeviceStatus, EnrolledCredential, Enrollment, EnrollmentFailure,
+    EnrollmentRequest, ExactPolicy, Incompatibility, ManagedCapability, ManagedCleanup,
+    ManagedCredential, PendingManagedCredential, Pin, PreparedSelection, PrfRequest,
 };

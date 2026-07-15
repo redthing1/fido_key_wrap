@@ -55,9 +55,10 @@ class Policy:
     RECOVERY_SECRET: Final[Policy]
     FIDO_PRESENCE: Final[Policy]
     FIDO_USER_VERIFICATION: Final[Policy]
+    MANAGED_FIDO_PRESENCE: Final[Policy]
+    MANAGED_FIDO_USER_VERIFICATION: Final[Policy]
     FIDO_PRESENCE_AND_PASSPHRASE: Final[Policy]
     FIDO_USER_VERIFICATION_AND_PASSPHRASE: Final[Policy]
-    MANAGED_FIDO: Final[Policy]
 
 class FidoPolicy:
     PRESENCE: Final[FidoPolicy]

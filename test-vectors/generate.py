@@ -688,16 +688,28 @@ def specs() -> list[RecordSpec]:
             recovery_nonce=sequence(0xE0, 12),
         ),
         RecordSpec(
-            name="managed-fido",
+            name="managed-fido-presence",
             suite=SUITE_MANAGED_FIDO,
             recipient_id=sequence(0xA0, 32),
-            label="managed fido",
+            label="managed presence",
             credential_id=sequence(0xA0, 16),
             public_key=p256_public_key(5),
-            policy=POLICY_USER_VERIFICATION,
+            policy=POLICY_PRESENCE,
             prf_nonce=sequence(0xC0, 32),
             fido_nonce=sequence(0xF0, 12),
             prf_result=sequence(0x60, 32),
+        ),
+        RecordSpec(
+            name="managed-fido-user-verification",
+            suite=SUITE_MANAGED_FIDO,
+            recipient_id=sequence(0xA8, 32),
+            label="managed user verification",
+            credential_id=sequence(0xA8, 16),
+            public_key=p256_public_key(6),
+            policy=POLICY_USER_VERIFICATION,
+            prf_nonce=sequence(0xC8, 32),
+            fido_nonce=sequence(0xF8, 12),
+            prf_result=sequence(0x68, 32),
         ),
     ]
 
@@ -758,7 +770,7 @@ def render_demo_vector(
         ("container", container),
     )
     lines = [
-        "# fkw-demo format-1 data-key, AEAD, and container vector",
+        "# fkw-demo format-1 data-key, aead, and container vector",
         "# deterministic correctness vector; byte values are lowercase hexadecimal.",
         "",
     ]
@@ -788,7 +800,7 @@ def main() -> None:
     )
     (output_directory / "format-1-mixed.txt").write_text(
         render_fixture(
-            "fido-key-wrap format 1, seven-recipient mixed envelope",
+            "fido-key-wrap format 1, eight-recipient mixed envelope",
             mixed_records,
             mixed_common,
         ),

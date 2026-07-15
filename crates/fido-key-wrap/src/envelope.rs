@@ -131,7 +131,7 @@ impl RecipientRecord {
             Self::RecoverySecret(_) => RecipientPolicy::RecoverySecret,
             Self::Fido(record) => match record.storage {
                 FidoStorage::NonDiscoverable => RecipientPolicy::Fido(record.policy),
-                FidoStorage::Managed => RecipientPolicy::ManagedFido,
+                FidoStorage::Managed => RecipientPolicy::ManagedFido(record.policy),
             },
             Self::FidoAndPassphrase(record) => RecipientPolicy::FidoAndPassphrase(record.policy),
         }
@@ -467,9 +467,6 @@ fn decode_fido_recipient(
     let credential_id = decode_credential_id(decoder)?;
     let public_key = PublicKey64::new(exact_bytes::<PUBLIC_KEY_BYTES>(decoder)?)?;
     let policy = FidoPolicy::from_code(decoder.u8().map_err(invalid)?)?;
-    if storage == FidoStorage::Managed && policy != FidoPolicy::UserVerification {
-        return Err(Error::InvalidEnvelope);
-    }
     let prf_nonce = exact_bytes::<PRF_NONCE_BYTES>(decoder)?;
     let fido_nonce = exact_bytes::<GCM_NONCE_BYTES>(decoder)?;
     let wrapped_root = exact_bytes::<WRAPPED_ROOT_BYTES>(decoder)?;
@@ -869,7 +866,8 @@ mod tests {
             include_str!("../../../test-vectors/format-1-recovery-secret.txt"),
             include_str!("../../../test-vectors/format-1-fido-presence.txt"),
             include_str!("../../../test-vectors/format-1-fido-user-verification.txt"),
-            include_str!("../../../test-vectors/format-1-managed-fido.txt"),
+            include_str!("../../../test-vectors/format-1-managed-fido-presence.txt"),
+            include_str!("../../../test-vectors/format-1-managed-fido-user-verification.txt"),
             include_str!("../../../test-vectors/format-1-fido-presence-plus-passphrase.txt"),
             include_str!(
                 "../../../test-vectors/format-1-fido-user-verification-plus-passphrase.txt"
@@ -884,19 +882,20 @@ mod tests {
     }
 
     #[test]
-    fn managed_fido_requires_user_verification() {
+    fn managed_fido_accepts_both_exact_policies() {
         let encoded = vector_envelope(include_str!(
-            "../../../test-vectors/format-1-managed-fido.txt"
+            "../../../test-vectors/format-1-managed-fido-user-verification.txt"
         ));
         let mut envelope = KeyEnvelope::decode(&encoded).unwrap();
         let RecipientRecord::Fido(record) = &mut envelope.recipients[0] else {
             panic!("fixture has the wrong suite");
         };
         record.policy = FidoPolicy::Presence;
-        assert!(matches!(
-            KeyEnvelope::decode(&envelope.encode()),
-            Err(Error::InvalidEnvelope)
-        ));
+        let decoded = KeyEnvelope::decode(&envelope.encode()).unwrap();
+        assert_eq!(
+            decoded.recipients[0].policy(),
+            RecipientPolicy::ManagedFido(FidoPolicy::Presence)
+        );
     }
 
     #[test]

@@ -36,13 +36,28 @@ pub enum CredentialProtection {
     UserVerificationRequired,
 }
 
+impl CredentialProtection {
+    fn native(self) -> i32 {
+        match self {
+            Self::OptionalWithCredentialId => ffi::FIDO_CRED_PROT_UV_OPTIONAL_WITH_ID,
+            Self::UserVerificationRequired => ffi::FIDO_CRED_PROT_UV_REQUIRED,
+        }
+    }
+
+    fn from_native(protection: i32) -> Option<Self> {
+        match protection {
+            ffi::FIDO_CRED_PROT_UV_OPTIONAL_WITH_ID => Some(Self::OptionalWithCredentialId),
+            ffi::FIDO_CRED_PROT_UV_REQUIRED => Some(Self::UserVerificationRequired),
+            _ => None,
+        }
+    }
+}
+
 /// capability required for one managed-credential operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedCapability {
     /// create and validate a new managed credential.
-    Enrollment,
-    /// recover a wrapping key through an existing managed credential.
-    Recovery,
+    Enrollment(ExactPolicy),
     /// verify or retire an existing managed credential.
     Management,
 }
@@ -56,12 +71,7 @@ impl ExactPolicy {
     }
 
     fn native_protection(self) -> i32 {
-        match self.protection() {
-            CredentialProtection::OptionalWithCredentialId => {
-                ffi::FIDO_CRED_PROT_UV_OPTIONAL_WITH_ID
-            }
-            CredentialProtection::UserVerificationRequired => ffi::FIDO_CRED_PROT_UV_REQUIRED,
-        }
+        self.protection().native()
     }
 }
 
@@ -217,13 +227,13 @@ impl Capabilities {
             && self.client_pin_configured
             && self.credential_management;
         match capability {
-            ManagedCapability::Enrollment => {
+            ManagedCapability::Enrollment(policy) => {
                 management
                     && self.hmac_secret
                     && self.credential_protection
                     && self.discoverable_credentials
+                    && self.supports_policy(policy)
             }
-            ManagedCapability::Recovery => management && self.hmac_secret,
             ManagedCapability::Management => management,
         }
     }
@@ -289,21 +299,91 @@ pub enum CredentialStorage<'a> {
 }
 
 /// a newly enrolled credential.
-#[derive(PartialEq, Eq)]
 pub struct Enrollment {
+    credential: EnrolledCredential,
+    managed_cleanup: Option<Box<PendingManagedCredential>>,
+}
+
+/// public material returned by credential enrollment.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EnrolledCredential {
     pub credential_id: Vec<u8>,
     pub es256_public_key: [u8; ES256_PUBLIC_KEY_BYTES],
     pub protection: CredentialProtection,
+}
+
+impl Enrollment {
+    /// borrows the enrolled public credential material.
+    #[must_use]
+    pub const fn credential(&self) -> &EnrolledCredential {
+        &self.credential
+    }
+
+    /// decomposes the enrollment into public material and its cleanup token.
+    ///
+    /// the token is present only for managed enrollment. retain it until the
+    /// credential is accepted; it can begin cleanup only on the authenticator
+    /// that created it.
+    #[must_use]
+    pub fn into_parts(self) -> (EnrolledCredential, Option<Box<PendingManagedCredential>>) {
+        (self.credential, self.managed_cleanup)
+    }
+}
+
+/// an enrollment error and any managed credential pending cleanup.
+///
+/// `pending_managed` is present only when managed credential creation succeeded
+/// but subsequent validation failed. its cleanup affinity is enforced by the
+/// adapter.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EnrollmentFailure {
+    error: Error,
+    pending_managed: Option<Box<PendingManagedCredential>>,
+}
+
+impl EnrollmentFailure {
+    /// borrows the enrollment error.
+    #[must_use]
+    pub const fn error(&self) -> &Error {
+        &self.error
+    }
+
+    /// decomposes the failure into its error and optional cleanup token.
+    #[must_use]
+    pub fn into_parts(self) -> (Error, Option<Box<PendingManagedCredential>>) {
+        (self.error, self.pending_managed)
+    }
+}
+
+impl std::fmt::Display for EnrollmentFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for EnrollmentFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl From<Error> for EnrollmentFailure {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            pending_managed: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for Enrollment {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Enrollment")
-            .field("credential_id_len", &self.credential_id.len())
+            .field("credential_id_len", &self.credential.credential_id.len())
             .field("es256_public_key", &"[PUBLIC KEY]")
-            .field("protection", &self.protection)
-            .finish()
+            .field("protection", &self.credential.protection)
+            .finish_non_exhaustive()
     }
 }
 
@@ -324,6 +404,74 @@ pub struct ManagedCredential<'a> {
     pub user_id: &'a [u8],
     pub credential_id: &'a [u8],
     pub es256_public_key: &'a [u8; ES256_PUBLIC_KEY_BYTES],
+    pub protection: CredentialProtection,
+}
+
+/// a complete but unverified identity returned by a failed managed enrollment.
+///
+/// this is accepted only by [`Authenticator::prepare_managed_cleanup`].
+pub struct PendingManagedCredential {
+    relying_party_id: String,
+    user_id: Vec<u8>,
+    credential_id: Vec<u8>,
+    es256_public_key: [u8; ES256_PUBLIC_KEY_BYTES],
+    affinity: Rc<()>,
+}
+
+impl PendingManagedCredential {
+    fn belongs_to(&self, affinity: &Rc<()>) -> bool {
+        Rc::ptr_eq(&self.affinity, affinity)
+    }
+}
+
+impl PartialEq for PendingManagedCredential {
+    fn eq(&self, other: &Self) -> bool {
+        self.relying_party_id == other.relying_party_id
+            && self.user_id == other.user_id
+            && self.credential_id == other.credential_id
+            && self.es256_public_key == other.es256_public_key
+            && Rc::ptr_eq(&self.affinity, &other.affinity)
+    }
+}
+
+impl Eq for PendingManagedCredential {}
+
+/// one present enrollment credential awaiting signed proof and deletion.
+///
+/// this value borrows the authenticator that created the credential, so the
+/// cleanup cannot move to another device handle.
+pub struct ManagedCleanup<'authenticator, 'credential> {
+    authenticator: &'authenticator mut Authenticator,
+    credential: &'credential PendingManagedCredential,
+    pin: &'authenticator Pin,
+}
+
+impl ManagedCleanup<'_, '_> {
+    /// proves control, deletes the exact credential, and confirms absence.
+    ///
+    /// # Errors
+    ///
+    /// returns an assertion, management, identity, or uncertain-retirement
+    /// error.
+    pub fn finish(self) -> Result<()> {
+        let expected = InventoryExpectation::Pending(self.credential);
+        self.authenticator
+            .verify_managed_assertion(expected, self.pin)?;
+        self.authenticator
+            .delete_managed(expected.credential_id(), expected, self.pin)
+    }
+}
+
+impl std::fmt::Debug for PendingManagedCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingManagedCredential")
+            .field("relying_party_id", &self.relying_party_id)
+            .field("user_id_len", &self.user_id.len())
+            .field("credential_id_len", &self.credential_id.len())
+            .field("es256_public_key", &"[PUBLIC KEY]")
+            .finish_non_exhaustive()
+    }
 }
 
 /// entry point for system-backed operations.
@@ -386,8 +534,6 @@ impl Backend {
     }
 
     /// opens only devices satisfying one managed-credential operation.
-    ///
-    /// managed credentials always use the exact user-verified policy.
     ///
     /// # Errors
     ///
@@ -496,7 +642,7 @@ impl Default for Backend {
 pub struct Authenticator {
     device: RawDevice,
     capabilities: Capabilities,
-    _thread_affine: PhantomData<Rc<()>>,
+    affinity: Rc<()>,
 }
 
 impl std::fmt::Debug for Authenticator {
@@ -513,7 +659,7 @@ impl Authenticator {
         Self {
             device,
             capabilities,
-            _thread_affine: PhantomData,
+            affinity: Rc::new(()),
         }
     }
 
@@ -530,18 +676,13 @@ impl Authenticator {
     ///
     /// returns a sanitized validation, capability, pin, transport, timeout,
     /// protocol, or verification error. an incorrect pin is never retried.
-    pub fn enroll(&mut self, request: EnrollmentRequest<'_>, pin: &Pin) -> Result<Enrollment> {
+    pub fn enroll(
+        &mut self,
+        request: EnrollmentRequest<'_>,
+        pin: &Pin,
+    ) -> core::result::Result<Enrollment, EnrollmentFailure> {
         let managed = self.validate_enrollment(request)?;
 
-        let rp_id = c_string(
-            request.relying_party_id,
-            "relying-party ID contains a NUL byte",
-        )?;
-        let rp_name = c_string(
-            request.relying_party_name,
-            "relying-party name contains a NUL byte",
-        )?;
-        let user_name = c_string("fido-key-wrap", "fixed user name is invalid")?;
         let client_data_hash = Zeroizing::new(random_array()?);
         let generated_user_id = match request.storage {
             CredentialStorage::NonDiscoverable => Some(Zeroizing::new(random_array()?)),
@@ -553,78 +694,49 @@ impl Authenticator {
             }
             CredentialStorage::ManagedDiscoverable { user_id } => user_id,
         };
-        let mut credential = Credential::new()?;
-
-        credential.call("set client-data hash", |raw| unsafe {
-            ffi::fido_cred_set_clientdata_hash(
-                raw,
-                client_data_hash.as_ptr(),
-                client_data_hash.len(),
-            )
-        })?;
-        credential.call("set relying party", |raw| unsafe {
-            ffi::fido_cred_set_rp(raw, rp_id.as_ptr(), rp_name.as_ptr())
-        })?;
-        credential.call("set user", |raw| unsafe {
-            ffi::fido_cred_set_user(
-                raw,
-                user_id.as_ptr(),
-                user_id.len(),
-                user_name.as_ptr(),
-                user_name.as_ptr(),
-                ptr::null(),
-            )
-        })?;
-        credential.call("set ES256", |raw| unsafe {
-            ffi::fido_cred_set_type(raw, ffi::COSE_ES256)
-        })?;
-        credential.call("set extensions", |raw| unsafe {
-            ffi::fido_cred_set_extensions(
-                raw,
-                ffi::FIDO_EXT_HMAC_SECRET | ffi::FIDO_EXT_CRED_PROTECT,
-            )
-        })?;
-        credential.call("set credential protection", |raw| unsafe {
-            ffi::fido_cred_set_prot(raw, request.policy.native_protection())
-        })?;
-        credential.call("set credential storage", |raw| unsafe {
-            ffi::fido_cred_set_rk(
-                raw,
-                if managed {
-                    ffi::FIDO_OPT_TRUE
-                } else {
-                    ffi::FIDO_OPT_FALSE
-                },
-            )
-        })?;
-        credential.call("require user verification", |raw| unsafe {
-            ffi::fido_cred_set_uv(raw, ffi::FIDO_OPT_TRUE)
-        })?;
+        let mut credential =
+            Credential::for_enrollment(request, user_id, &client_data_hash, managed)?;
         let result = unsafe {
             ffi::fido_dev_make_cred(self.device.as_ptr(), credential.as_ptr(), pin.as_ptr())
         };
         if result != ffi::FIDO_OK {
             if managed && managed_enrollment_status_is_uncertain(result) {
-                return Err(Error::CredentialMayRemain);
+                return Err(Error::CredentialMayRemain.into());
             }
-            return Err(self.device.translate(result, "make credential"));
+            return Err(self.device.translate(result, "make credential").into());
         }
         drop(client_data_hash);
         drop(generated_user_id);
 
-        let enrollment = (|| {
-            credential.verify(request.policy)?;
-            let credential_id = credential.copy_id()?;
-            let es256_public_key = credential.copy_public_key()?;
-            Ok(Enrollment {
-                credential_id,
-                es256_public_key,
-                protection: request.policy.protection(),
-            })
-        })();
-        match enrollment {
-            Err(_) if managed => Err(Error::CredentialMayRemain),
-            result => result,
+        let pending_managed =
+            if let CredentialStorage::ManagedDiscoverable { user_id } = request.storage {
+                match credential.copy_pending_managed(
+                    request.relying_party_id,
+                    user_id,
+                    Rc::clone(&self.affinity),
+                ) {
+                    Ok(pending) => Some(Box::new(pending)),
+                    Err(_) => return Err(Error::CredentialMayRemain.into()),
+                }
+            } else {
+                None
+            };
+        let mut enrollment = match credential.copy_enrollment() {
+            Ok(enrollment) => enrollment,
+            Err(error) => {
+                return Err(EnrollmentFailure {
+                    error,
+                    pending_managed,
+                });
+            }
+        };
+        enrollment.managed_cleanup = pending_managed;
+        match credential.verify(request.policy) {
+            Ok(()) => Ok(enrollment),
+            Err(error) => Err(EnrollmentFailure {
+                error,
+                pending_managed: enrollment.managed_cleanup.take(),
+            }),
         }
     }
 
@@ -638,15 +750,10 @@ impl Authenticator {
         if let CredentialStorage::ManagedDiscoverable { user_id } = request.storage {
             validate_user_id(user_id)?;
         }
-        if managed && request.policy != ExactPolicy::UserVerified {
-            return Err(Error::InvalidInput(
-                "managed credentials require user verification",
-            ));
-        }
         if managed
             && !self
                 .capabilities
-                .supports_managed(ManagedCapability::Enrollment)
+                .supports_managed(ManagedCapability::Enrollment(request.policy))
         {
             return Err(Error::CredentialManagementUnsupported);
         }
@@ -745,35 +852,6 @@ impl Authenticator {
         )
     }
 
-    /// evaluates a managed credential's PRF and confirms its exact management
-    /// record without asking for a second assertion.
-    ///
-    /// # Errors
-    ///
-    /// returns a validation, capability, assertion, management, or identity
-    /// error. no secret is returned unless both checks succeed.
-    pub fn evaluate_managed(
-        &mut self,
-        request: PrfRequest<'_>,
-        credential: ManagedCredential<'_>,
-        pin: &Pin,
-    ) -> Result<Zeroizing<[u8; SECRET_BYTES]>> {
-        self.validate_managed(credential, ManagedCapability::Recovery)?;
-        if request.policy != ExactPolicy::UserVerified
-            || request.relying_party_id != credential.relying_party_id
-            || request.credential_id != credential.credential_id
-            || request.es256_public_key != credential.es256_public_key
-        {
-            return Err(Error::CredentialMismatch);
-        }
-
-        let secret = self.evaluate(request, Some(pin))?;
-        match self.managed_presence(credential, pin)? {
-            ManagedPresence::Present => Ok(secret),
-            ManagedPresence::Absent => Err(Error::CredentialNotFound),
-        }
-    }
-
     /// proves control of the exact managed credential, then confirms its
     /// stored user ID, credential ID, and public key through credential
     /// management on this open authenticator.
@@ -783,9 +861,49 @@ impl Authenticator {
     /// returns a validation, capability, assertion, management, or identity
     /// error.
     pub fn verify_managed(&mut self, credential: ManagedCredential<'_>, pin: &Pin) -> Result<()> {
-        self.validate_managed(credential, ManagedCapability::Management)?;
-        self.verify_managed_assertion(credential, pin)?;
-        match self.managed_presence(credential, pin)? {
+        let expected = InventoryExpectation::Exact(credential);
+        self.validate_managed(expected)?;
+        self.verify_managed_assertion(expected, pin)?;
+        self.confirm_managed_inventory(expected, pin)
+    }
+
+    /// evaluates a newly enrolled managed credential and confirms its exact
+    /// management record on this open authenticator.
+    ///
+    /// presence evaluates the PRF without a pin; user verification evaluates
+    /// it with the supplied pin. exact inventory confirmation remains
+    /// pin-authenticated for both policies.
+    ///
+    /// # Errors
+    ///
+    /// returns a validation, policy, pin, assertion, management, or identity
+    /// error. no secret is returned unless every check succeeds.
+    pub fn evaluate_managed_enrollment(
+        &mut self,
+        request: PrfRequest<'_>,
+        credential: ManagedCredential<'_>,
+        pin: &Pin,
+    ) -> Result<Zeroizing<[u8; SECRET_BYTES]>> {
+        let expected = InventoryExpectation::Exact(credential);
+        self.validate_managed(expected)?;
+        if !managed_enrollment_matches(request, credential) {
+            return Err(Error::CredentialMismatch);
+        }
+        let assertion_pin = match request.policy {
+            ExactPolicy::Presence => None,
+            ExactPolicy::UserVerified => Some(pin),
+        };
+        let secret = self.evaluate(request, assertion_pin)?;
+        self.confirm_managed_inventory(expected, pin)?;
+        Ok(secret)
+    }
+
+    fn confirm_managed_inventory(
+        &mut self,
+        expected: InventoryExpectation<'_>,
+        pin: &Pin,
+    ) -> Result<()> {
+        match self.managed_presence(expected, pin)? {
             ManagedPresence::Present => Ok(()),
             ManagedPresence::Absent => Err(Error::CredentialNotFound),
         }
@@ -804,12 +922,55 @@ impl Authenticator {
     /// uncertain-retirement error.
     pub fn retire_managed(&mut self, credential: ManagedCredential<'_>, pin: &Pin) -> Result<()> {
         self.verify_managed(credential, pin)?;
+        self.delete_managed(
+            credential.credential_id,
+            InventoryExpectation::Exact(credential),
+            pin,
+        )
+    }
 
+    /// begins cleanup of a just-created managed credential.
+    ///
+    /// the token is accepted only by the authenticator that created it.
+    /// authenticated exact absence returns `None`. a present exact match
+    /// returns an authenticator-borrowing cleanup value; the caller can then
+    /// announce the touch ceremony before calling [`ManagedCleanup::finish`].
+    ///
+    /// # Errors
+    ///
+    /// returns a validation, handle-affinity, capability, management, or
+    /// identity error.
+    pub fn prepare_managed_cleanup<'authenticator, 'credential>(
+        &'authenticator mut self,
+        credential: &'credential PendingManagedCredential,
+        pin: &'authenticator Pin,
+    ) -> Result<Option<ManagedCleanup<'authenticator, 'credential>>> {
+        if !credential.belongs_to(&self.affinity) {
+            return Err(Error::CredentialMismatch);
+        }
+        let expected = InventoryExpectation::Pending(credential);
+        self.validate_managed(expected)?;
+        match self.managed_presence(expected, pin)? {
+            ManagedPresence::Present => Ok(Some(ManagedCleanup {
+                authenticator: self,
+                credential,
+                pin,
+            })),
+            ManagedPresence::Absent => Ok(None),
+        }
+    }
+
+    fn delete_managed(
+        &mut self,
+        credential_id: &[u8],
+        expected: InventoryExpectation<'_>,
+        pin: &Pin,
+    ) -> Result<()> {
         let status = unsafe {
             ffi::fido_credman_del_dev_rk(
                 self.device.as_ptr(),
-                credential.credential_id.as_ptr(),
-                credential.credential_id.len(),
+                credential_id.as_ptr(),
+                credential_id.len(),
                 pin.as_ptr(),
             )
         };
@@ -826,29 +987,28 @@ impl Authenticator {
                 .device
                 .translate_management(status, "delete managed credential"))
         };
-        retirement_outcome(delete, self.managed_presence(credential, pin))
+        retirement_outcome(delete, self.managed_presence(expected, pin))
     }
 
-    fn validate_managed(
-        &self,
-        credential: ManagedCredential<'_>,
-        capability: ManagedCapability,
-    ) -> Result<()> {
-        if !self.capabilities.supports_managed(capability) {
+    fn validate_managed(&self, credential: InventoryExpectation<'_>) -> Result<()> {
+        if !self
+            .capabilities
+            .supports_managed(ManagedCapability::Management)
+        {
             return Err(Error::CredentialManagementUnsupported);
         }
-        validate_rp_id(credential.relying_party_id)?;
-        validate_user_id(credential.user_id)?;
-        validate_credential_id(credential.credential_id)
+        validate_rp_id(credential.relying_party_id())?;
+        validate_user_id(credential.user_id())?;
+        validate_credential_id(credential.credential_id())
     }
 
     fn verify_managed_assertion(
         &mut self,
-        credential: ManagedCredential<'_>,
+        credential: InventoryExpectation<'_>,
         pin: &Pin,
     ) -> Result<()> {
         let rp_id = c_string(
-            credential.relying_party_id,
+            credential.relying_party_id(),
             "relying-party ID contains a NUL byte",
         )?;
         let client_data_hash = Zeroizing::new(random_array()?);
@@ -866,8 +1026,8 @@ impl Authenticator {
         assertion.call("set allowed credential", |raw| unsafe {
             ffi::fido_assert_allow_cred(
                 raw,
-                credential.credential_id.as_ptr(),
-                credential.credential_id.len(),
+                credential.credential_id().as_ptr(),
+                credential.credential_id().len(),
             )
         })?;
         assertion.call("require user presence", |raw| unsafe {
@@ -886,19 +1046,19 @@ impl Authenticator {
         drop(client_data_hash);
 
         assertion.verify_identity(
-            credential.credential_id,
-            credential.es256_public_key,
+            credential.credential_id(),
+            credential.es256_public_key(),
             ExactPolicy::UserVerified,
         )
     }
 
     fn managed_presence(
         &mut self,
-        credential: ManagedCredential<'_>,
+        credential: InventoryExpectation<'_>,
         pin: &Pin,
     ) -> Result<ManagedPresence> {
         let rp_id = c_string(
-            credential.relying_party_id,
+            credential.relying_party_id(),
             "relying-party ID contains a NUL byte",
         )?;
         let credentials = ManagedCredentials::new()?;
@@ -920,6 +1080,13 @@ impl Authenticator {
         }
         credentials.find(credential)
     }
+}
+
+fn managed_enrollment_matches(request: PrfRequest<'_>, credential: ManagedCredential<'_>) -> bool {
+    request.relying_party_id == credential.relying_party_id
+        && request.credential_id == credential.credential_id
+        && request.es256_public_key == credential.es256_public_key
+        && request.policy.protection() == credential.protection
 }
 
 fn retirement_outcome(delete: Result<()>, presence: Result<ManagedPresence>) -> Result<()> {
@@ -1393,6 +1560,49 @@ enum ManagedPresence {
     Absent,
 }
 
+#[derive(Clone, Copy)]
+enum InventoryExpectation<'a> {
+    Exact(ManagedCredential<'a>),
+    Pending(&'a PendingManagedCredential),
+}
+
+impl<'a> InventoryExpectation<'a> {
+    fn relying_party_id(self) -> &'a str {
+        match self {
+            Self::Exact(credential) => credential.relying_party_id,
+            Self::Pending(credential) => &credential.relying_party_id,
+        }
+    }
+
+    fn user_id(self) -> &'a [u8] {
+        match self {
+            Self::Exact(credential) => credential.user_id,
+            Self::Pending(credential) => &credential.user_id,
+        }
+    }
+
+    fn credential_id(self) -> &'a [u8] {
+        match self {
+            Self::Exact(credential) => credential.credential_id,
+            Self::Pending(credential) => &credential.credential_id,
+        }
+    }
+
+    fn es256_public_key(self) -> &'a [u8; ES256_PUBLIC_KEY_BYTES] {
+        match self {
+            Self::Exact(credential) => credential.es256_public_key,
+            Self::Pending(credential) => &credential.es256_public_key,
+        }
+    }
+
+    fn protection(self) -> Option<CredentialProtection> {
+        match self {
+            Self::Exact(credential) => Some(credential.protection),
+            Self::Pending(_) => None,
+        }
+    }
+}
+
 struct ManagedCredentials(NonNull<ffi::fido_credman_rk_t>);
 
 impl ManagedCredentials {
@@ -1406,7 +1616,7 @@ impl ManagedCredentials {
         self.0.as_ptr()
     }
 
-    fn find(&self, expected: ManagedCredential<'_>) -> Result<ManagedPresence> {
+    fn find(&self, expected: InventoryExpectation<'_>) -> Result<ManagedPresence> {
         let count = unsafe { ffi::fido_credman_rk_count(self.0.as_ptr()) };
         if count > MAX_MANAGED_CREDENTIALS_PER_RP {
             return Err(Error::Protocol);
@@ -1431,17 +1641,18 @@ impl ManagedCredentials {
             if !managed_identity_matches(&id, &user_id, expected)? {
                 continue;
             }
-            if unsafe { ffi::fido_cred_type(credential) } != ffi::COSE_ES256
-                || unsafe { ffi::fido_cred_prot(credential) } != ffi::FIDO_CRED_PROT_UV_REQUIRED
-            {
-                return Err(Error::CredentialMismatch);
-            }
             let public_key = copy_native_bytes(
                 unsafe { ffi::fido_cred_pubkey_ptr(credential) },
                 unsafe { ffi::fido_cred_pubkey_len(credential) },
                 ES256_PUBLIC_KEY_BYTES,
             )?;
-            include_managed_match(&mut found, &public_key, expected.es256_public_key)?;
+            include_managed_match(
+                &mut found,
+                unsafe { ffi::fido_cred_type(credential) },
+                unsafe { ffi::fido_cred_prot(credential) },
+                &public_key,
+                expected,
+            )?;
         }
 
         Ok(if found {
@@ -1455,10 +1666,10 @@ impl ManagedCredentials {
 fn managed_identity_matches(
     actual_id: &[u8],
     actual_user_id: &[u8],
-    expected: ManagedCredential<'_>,
+    expected: InventoryExpectation<'_>,
 ) -> Result<bool> {
-    let id_matches = actual_id == expected.credential_id;
-    let user_matches = actual_user_id == expected.user_id;
+    let id_matches = actual_id == expected.credential_id();
+    let user_matches = actual_user_id == expected.user_id();
     match (id_matches, user_matches) {
         (false, false) => Ok(false),
         (true, true) => Ok(true),
@@ -1468,10 +1679,19 @@ fn managed_identity_matches(
 
 fn include_managed_match(
     found: &mut bool,
+    actual_type: i32,
+    actual_protection: i32,
     actual_public_key: &[u8],
-    expected_public_key: &[u8; ES256_PUBLIC_KEY_BYTES],
+    expected: InventoryExpectation<'_>,
 ) -> Result<()> {
-    if *found || actual_public_key != expected_public_key {
+    let protection_matches = expected
+        .protection()
+        .is_none_or(|protection| actual_protection == protection.native());
+    if *found
+        || actual_type != ffi::COSE_ES256
+        || !protection_matches
+        || actual_public_key != expected.es256_public_key()
+    {
         return Err(Error::CredentialMismatch);
     }
     *found = true;
@@ -1497,6 +1717,70 @@ impl Credential {
         NonNull::new(unsafe { ffi::fido_cred_new() })
             .map(Self)
             .ok_or(Error::AllocationFailed)
+    }
+
+    fn for_enrollment(
+        request: EnrollmentRequest<'_>,
+        user_id: &[u8],
+        client_data_hash: &[u8; 32],
+        managed: bool,
+    ) -> Result<Self> {
+        let rp_id = c_string(
+            request.relying_party_id,
+            "relying-party ID contains a NUL byte",
+        )?;
+        let rp_name = c_string(
+            request.relying_party_name,
+            "relying-party name contains a NUL byte",
+        )?;
+        let user_name = c_string("fido-key-wrap", "fixed user name is invalid")?;
+        let mut credential = Self::new()?;
+        credential.call("set client-data hash", |raw| unsafe {
+            ffi::fido_cred_set_clientdata_hash(
+                raw,
+                client_data_hash.as_ptr(),
+                client_data_hash.len(),
+            )
+        })?;
+        credential.call("set relying party", |raw| unsafe {
+            ffi::fido_cred_set_rp(raw, rp_id.as_ptr(), rp_name.as_ptr())
+        })?;
+        credential.call("set user", |raw| unsafe {
+            ffi::fido_cred_set_user(
+                raw,
+                user_id.as_ptr(),
+                user_id.len(),
+                user_name.as_ptr(),
+                user_name.as_ptr(),
+                ptr::null(),
+            )
+        })?;
+        credential.call("set ES256", |raw| unsafe {
+            ffi::fido_cred_set_type(raw, ffi::COSE_ES256)
+        })?;
+        credential.call("set extensions", |raw| unsafe {
+            ffi::fido_cred_set_extensions(
+                raw,
+                ffi::FIDO_EXT_HMAC_SECRET | ffi::FIDO_EXT_CRED_PROTECT,
+            )
+        })?;
+        credential.call("set credential protection", |raw| unsafe {
+            ffi::fido_cred_set_prot(raw, request.policy.native_protection())
+        })?;
+        credential.call("set credential storage", |raw| unsafe {
+            ffi::fido_cred_set_rk(
+                raw,
+                if managed {
+                    ffi::FIDO_OPT_TRUE
+                } else {
+                    ffi::FIDO_OPT_FALSE
+                },
+            )
+        })?;
+        credential.call("require user verification", |raw| unsafe {
+            ffi::fido_cred_set_uv(raw, ffi::FIDO_OPT_TRUE)
+        })?;
+        Ok(credential)
     }
 
     fn as_ptr(&mut self) -> *mut ffi::fido_cred_t {
@@ -1552,6 +1836,35 @@ impl Credential {
         }
 
         Ok(())
+    }
+
+    fn copy_enrollment(&self) -> Result<Enrollment> {
+        let raw = self.0.as_ptr();
+        let protection = CredentialProtection::from_native(unsafe { ffi::fido_cred_prot(raw) })
+            .ok_or(Error::VerificationFailed)?;
+        Ok(Enrollment {
+            credential: EnrolledCredential {
+                credential_id: self.copy_id()?,
+                es256_public_key: self.copy_public_key()?,
+                protection,
+            },
+            managed_cleanup: None,
+        })
+    }
+
+    fn copy_pending_managed(
+        &self,
+        relying_party_id: &str,
+        user_id: &[u8],
+        affinity: Rc<()>,
+    ) -> Result<PendingManagedCredential> {
+        Ok(PendingManagedCredential {
+            relying_party_id: relying_party_id.to_owned(),
+            user_id: user_id.to_vec(),
+            credential_id: self.copy_id()?,
+            es256_public_key: self.copy_public_key()?,
+            affinity,
+        })
     }
 
     fn copy_id(&self) -> Result<Vec<u8>> {
@@ -2065,14 +2378,22 @@ mod tests {
         assert!(capabilities.supports_presence_policy());
         assert!(capabilities.supports_policy(ExactPolicy::Presence));
         assert!(capabilities.supports_policy(ExactPolicy::UserVerified));
-        assert!(capabilities.supports_managed(ManagedCapability::Enrollment));
-        assert!(capabilities.supports_managed(ManagedCapability::Recovery));
+        assert!(
+            capabilities.supports_managed(ManagedCapability::Enrollment(ExactPolicy::Presence))
+        );
+        assert!(
+            capabilities.supports_managed(ManagedCapability::Enrollment(ExactPolicy::UserVerified))
+        );
         assert!(capabilities.supports_managed(ManagedCapability::Management));
 
         let mut always_uv = capabilities.clone();
         always_uv.always_uv = true;
         assert!(!always_uv.supports_policy(ExactPolicy::Presence));
         assert!(always_uv.supports_policy(ExactPolicy::UserVerified));
+        assert!(!always_uv.supports_managed(ManagedCapability::Enrollment(ExactPolicy::Presence)));
+        assert!(
+            always_uv.supports_managed(ManagedCapability::Enrollment(ExactPolicy::UserVerified))
+        );
 
         let candidates = [&capabilities, &always_uv];
         assert_eq!(
@@ -2093,28 +2414,47 @@ mod tests {
         let mut missing_es256 = capabilities;
         missing_es256.es256 = false;
         assert!(!missing_es256.compatible());
-        assert!(!missing_es256.supports_managed(ManagedCapability::Enrollment));
-        assert!(!missing_es256.supports_managed(ManagedCapability::Recovery));
+        assert!(
+            !missing_es256.supports_managed(ManagedCapability::Enrollment(ExactPolicy::Presence))
+        );
+        assert!(
+            !missing_es256
+                .supports_managed(ManagedCapability::Enrollment(ExactPolicy::UserVerified))
+        );
         assert!(!missing_es256.supports_managed(ManagedCapability::Management));
 
         let mut missing_rk = always_uv.clone();
         missing_rk.discoverable_credentials = false;
         assert!(missing_rk.supports_verified_policy());
-        assert!(!missing_rk.supports_managed(ManagedCapability::Enrollment));
-        assert!(missing_rk.supports_managed(ManagedCapability::Recovery));
+        assert!(!missing_rk.supports_managed(ManagedCapability::Enrollment(ExactPolicy::Presence)));
+        assert!(
+            !missing_rk.supports_managed(ManagedCapability::Enrollment(ExactPolicy::UserVerified))
+        );
         assert!(missing_rk.supports_managed(ManagedCapability::Management));
 
         let mut missing_management = always_uv;
         missing_management.credential_management = false;
         assert!(missing_management.supports_verified_policy());
-        assert!(!missing_management.supports_managed(ManagedCapability::Enrollment));
-        assert!(!missing_management.supports_managed(ManagedCapability::Recovery));
+        assert!(
+            !missing_management
+                .supports_managed(ManagedCapability::Enrollment(ExactPolicy::Presence))
+        );
+        assert!(
+            !missing_management
+                .supports_managed(ManagedCapability::Enrollment(ExactPolicy::UserVerified))
+        );
         assert!(!missing_management.supports_managed(ManagedCapability::Management));
 
         let mut missing_hmac_secret = missing_rk;
         missing_hmac_secret.hmac_secret = false;
-        assert!(!missing_hmac_secret.supports_managed(ManagedCapability::Enrollment));
-        assert!(!missing_hmac_secret.supports_managed(ManagedCapability::Recovery));
+        assert!(
+            !missing_hmac_secret
+                .supports_managed(ManagedCapability::Enrollment(ExactPolicy::Presence))
+        );
+        assert!(
+            !missing_hmac_secret
+                .supports_managed(ManagedCapability::Enrollment(ExactPolicy::UserVerified))
+        );
         assert!(missing_hmac_secret.supports_managed(ManagedCapability::Management));
     }
 
@@ -2137,32 +2477,131 @@ mod tests {
             user_id: b"opaque-user",
             credential_id: b"credential-id",
             es256_public_key: &SIGNED_EXTENSION_PUBLIC_KEY,
+            protection: CredentialProtection::UserVerificationRequired,
         };
+        let exact = InventoryExpectation::Exact(expected);
 
-        assert!(!managed_identity_matches(b"other", b"other", expected).unwrap());
-        assert!(managed_identity_matches(b"credential-id", b"opaque-user", expected).unwrap());
+        assert!(!managed_identity_matches(b"other", b"other", exact).unwrap());
+        assert!(managed_identity_matches(b"credential-id", b"opaque-user", exact).unwrap());
         assert!(matches!(
-            managed_identity_matches(b"credential-id", b"other", expected),
+            managed_identity_matches(b"credential-id", b"other", exact),
             Err(Error::CredentialMismatch)
         ));
         assert!(matches!(
-            managed_identity_matches(b"other", b"opaque-user", expected),
+            managed_identity_matches(b"other", b"opaque-user", exact),
             Err(Error::CredentialMismatch)
         ));
+    }
+
+    #[test]
+    fn managed_enrollment_binds_one_request_to_one_inventory_record() {
+        let salt = [0_u8; SECRET_BYTES];
+        let request = PrfRequest {
+            relying_party_id: "managed.example",
+            credential_id: b"credential-id",
+            es256_public_key: &SIGNED_EXTENSION_PUBLIC_KEY,
+            salt: &salt,
+            policy: ExactPolicy::UserVerified,
+        };
+        let credential = ManagedCredential {
+            relying_party_id: "managed.example",
+            user_id: b"opaque-user",
+            credential_id: b"credential-id",
+            es256_public_key: &SIGNED_EXTENSION_PUBLIC_KEY,
+            protection: CredentialProtection::UserVerificationRequired,
+        };
+        assert!(managed_enrollment_matches(request, credential));
+        assert!(!managed_enrollment_matches(
+            PrfRequest {
+                relying_party_id: "other.example",
+                ..request
+            },
+            credential
+        ));
+        assert!(!managed_enrollment_matches(
+            PrfRequest {
+                credential_id: b"other",
+                ..request
+            },
+            credential
+        ));
+        assert!(!managed_enrollment_matches(
+            PrfRequest {
+                es256_public_key: &ALTERED_VALID_PUBLIC_KEY,
+                ..request
+            },
+            credential
+        ));
+        assert!(!managed_enrollment_matches(
+            PrfRequest {
+                policy: ExactPolicy::Presence,
+                ..request
+            },
+            credential
+        ));
+        assert!(managed_enrollment_matches(
+            PrfRequest {
+                policy: ExactPolicy::Presence,
+                ..request
+            },
+            ManagedCredential {
+                protection: CredentialProtection::OptionalWithCredentialId,
+                ..credential
+            }
+        ));
+    }
+
+    #[test]
+    fn managed_cleanup_tokens_are_handle_bound() {
+        let affinity = Rc::new(());
+        let token = PendingManagedCredential {
+            relying_party_id: "managed.example".to_owned(),
+            user_id: b"opaque-user".to_vec(),
+            credential_id: b"credential-id".to_vec(),
+            es256_public_key: SIGNED_EXTENSION_PUBLIC_KEY,
+            affinity: Rc::clone(&affinity),
+        };
+        assert!(token.belongs_to(&affinity));
+        assert!(!token.belongs_to(&Rc::new(())));
+
+        let other_handle = PendingManagedCredential {
+            relying_party_id: token.relying_party_id.clone(),
+            user_id: token.user_id.clone(),
+            credential_id: token.credential_id.clone(),
+            es256_public_key: token.es256_public_key,
+            affinity: Rc::new(()),
+        };
+        assert_ne!(token, other_handle);
+    }
+
+    #[test]
+    fn managed_inventory_enforces_exact_properties() {
+        let expected = ManagedCredential {
+            relying_party_id: "managed.example",
+            user_id: b"opaque-user",
+            credential_id: b"credential-id",
+            es256_public_key: &SIGNED_EXTENSION_PUBLIC_KEY,
+            protection: CredentialProtection::UserVerificationRequired,
+        };
+        let exact = InventoryExpectation::Exact(expected);
 
         let mut found = false;
         include_managed_match(
             &mut found,
+            ffi::COSE_ES256,
+            ffi::FIDO_CRED_PROT_UV_REQUIRED,
             &SIGNED_EXTENSION_PUBLIC_KEY,
-            expected.es256_public_key,
+            exact,
         )
         .unwrap();
         assert!(found);
         assert!(matches!(
             include_managed_match(
                 &mut found,
+                ffi::COSE_ES256,
+                ffi::FIDO_CRED_PROT_UV_REQUIRED,
                 &SIGNED_EXTENSION_PUBLIC_KEY,
-                expected.es256_public_key
+                exact,
             ),
             Err(Error::CredentialMismatch)
         ));
@@ -2171,11 +2610,87 @@ mod tests {
         assert!(matches!(
             include_managed_match(
                 &mut found,
+                ffi::COSE_ES256,
+                ffi::FIDO_CRED_PROT_UV_REQUIRED,
                 &ALTERED_VALID_PUBLIC_KEY,
-                expected.es256_public_key
+                exact,
             ),
             Err(Error::CredentialMismatch)
         ));
+
+        let mut found = false;
+        assert!(matches!(
+            include_managed_match(
+                &mut found,
+                ffi::COSE_ES256,
+                ffi::FIDO_CRED_PROT_UV_OPTIONAL_WITH_ID,
+                &SIGNED_EXTENSION_PUBLIC_KEY,
+                exact,
+            ),
+            Err(Error::CredentialMismatch)
+        ));
+
+        let presence = InventoryExpectation::Exact(ManagedCredential {
+            protection: CredentialProtection::OptionalWithCredentialId,
+            ..expected
+        });
+        let mut found = false;
+        include_managed_match(
+            &mut found,
+            ffi::COSE_ES256,
+            ffi::FIDO_CRED_PROT_UV_OPTIONAL_WITH_ID,
+            &SIGNED_EXTENSION_PUBLIC_KEY,
+            presence,
+        )
+        .unwrap();
+
+        let mut found = false;
+        assert!(matches!(
+            include_managed_match(
+                &mut found,
+                ffi::COSE_ES256 + 1,
+                ffi::FIDO_CRED_PROT_UV_REQUIRED,
+                &SIGNED_EXTENSION_PUBLIC_KEY,
+                exact,
+            ),
+            Err(Error::CredentialMismatch)
+        ));
+
+        let pending = PendingManagedCredential {
+            relying_party_id: expected.relying_party_id.to_owned(),
+            user_id: expected.user_id.to_vec(),
+            credential_id: expected.credential_id.to_vec(),
+            es256_public_key: *expected.es256_public_key,
+            affinity: Rc::new(()),
+        };
+        let pending_expectation = InventoryExpectation::Pending(&pending);
+        let mut found = false;
+        include_managed_match(
+            &mut found,
+            ffi::COSE_ES256,
+            ffi::FIDO_CRED_PROT_UV_OPTIONAL_WITH_ID,
+            &SIGNED_EXTENSION_PUBLIC_KEY,
+            pending_expectation,
+        )
+        .unwrap();
+
+        let debug = format!("{pending:?}");
+        assert!(!debug.contains("opaque-user"));
+        assert!(!debug.contains("credential-id"));
+    }
+
+    #[test]
+    fn credential_protection_round_trips_exact_native_levels() {
+        for protection in [
+            CredentialProtection::OptionalWithCredentialId,
+            CredentialProtection::UserVerificationRequired,
+        ] {
+            assert_eq!(
+                CredentialProtection::from_native(protection.native()),
+                Some(protection)
+            );
+        }
+        assert_eq!(CredentialProtection::from_native(0), None);
     }
 
     #[test]

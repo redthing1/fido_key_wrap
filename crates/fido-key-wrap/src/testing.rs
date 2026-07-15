@@ -1,7 +1,7 @@
 //! deterministic security-key support for downstream rust tests.
 //!
-//! enabling this feature creates a non-hardware authenticator. keep it in
-//! development dependencies and never use it as a production authenticator.
+//! the `testing` feature provides an in-memory authenticator. enable it only
+//! as a development dependency.
 
 use crate::{
     ApplicationId, AuthenticatorFailure, Error, KeyEnvelope, KeyProtector, RecipientId, Result,
@@ -429,7 +429,7 @@ mod tests {
         let (root, envelope, recipient) = authenticator
             .protector()
             .create_root(
-                Enrollment::managed_fido("managed").unwrap(),
+                Enrollment::managed_fido("managed", FidoPolicy::UserVerification).unwrap(),
                 &mut interaction,
             )
             .unwrap();
@@ -461,7 +461,7 @@ mod tests {
         let mut interaction = RecordingInteraction::default();
         assert!(matches!(
             authenticator.protector().create_root(
-                Enrollment::managed_fido("managed").unwrap(),
+                Enrollment::managed_fido("managed", FidoPolicy::UserVerification).unwrap(),
                 &mut interaction,
             ),
             Err(Error::Authenticator(
@@ -483,7 +483,7 @@ mod tests {
         let mut interaction = RecordingInteraction::default();
         assert!(matches!(
             authenticator.protector().create_root(
-                Enrollment::managed_fido("uncertain").unwrap(),
+                Enrollment::managed_fido("uncertain", FidoPolicy::UserVerification).unwrap(),
                 &mut interaction,
             ),
             Err(Error::Authenticator(
@@ -491,9 +491,10 @@ mod tests {
             ))
         ));
         assert!(matches!(
-            authenticator
-                .protector()
-                .create_root(Enrollment::managed_fido("next").unwrap(), &mut interaction,),
+            authenticator.protector().create_root(
+                Enrollment::managed_fido("next", FidoPolicy::UserVerification).unwrap(),
+                &mut interaction,
+            ),
             Err(Error::Authenticator(
                 AuthenticatorFailure::CredentialStoreFull
             ))
@@ -521,7 +522,7 @@ mod tests {
             let (root, envelope, recipient) = authenticator
                 .protector()
                 .create_root(
-                    Enrollment::managed_fido("managed").unwrap(),
+                    Enrollment::managed_fido("managed", FidoPolicy::UserVerification).unwrap(),
                     &mut interaction,
                 )
                 .unwrap();

@@ -38,7 +38,7 @@ application.
 
 ## choosing a recovery model
 
-the seven policies are building blocks. an application may expose one, several,
+the eight policies are building blocks. an application may expose one, several,
 or all of them.
 
 | policy | recovery requirement | main consequence |
@@ -47,7 +47,8 @@ or all of them.
 | recovery secret | generated 256-bit secret | the separate secret is sufficient to recover this route |
 | fido presence | credential and touch | possession and touch are sufficient |
 | fido user verification | credential, authenticator verification, and touch | adds the authenticator's verification check |
-| managed fido | managed credential, authenticator verification, and touch | uses one discoverable slot and supports exact retirement |
+| managed fido presence | managed credential and touch | uses one discoverable slot and supports exact retirement |
+| managed fido user verification | managed credential, authenticator verification, and touch | uses one discoverable slot and supports exact retirement |
 | fido presence plus passphrase | credential, touch, and passphrase | the copied envelope alone exposes no passphrase verifier |
 | fido user verification plus passphrase | verified security-key ceremony and passphrase | requires both factors and authenticator verification |
 
@@ -119,18 +120,25 @@ applications should not retry a pin automatically.
 
 ## managed security-key routes
 
-`Enrollment::managed_fido` creates a user-verified discoverable credential:
+`Enrollment::managed_fido` creates a discoverable credential under one exact
+recovery policy:
 
 ```rust,ignore
-let enrollment = Enrollment::managed_fido("local key")?;
+let enrollment = Enrollment::managed_fido("local key", FidoPolicy::Presence)?;
 let (root, envelope, recipient) =
     protector.create_root(enrollment, &mut interaction)?;
 ```
 
 each managed recipient occupies one discoverable credential slot. enrollment
-requires es256, `hmac-secret`, user verification, credential protection,
-discoverable storage, and credential management. backup-eligible or backed-up
-credentials are rejected. labels are not written to authenticator metadata.
+requires es256, `hmac-secret`, pin-backed user verification, credential
+protection, discoverable storage, and credential management. backup-eligible
+or backed-up credentials are rejected. labels are not written to authenticator
+metadata.
+
+the selected policy governs recovery. presence recovery requires only a touch;
+user-verification recovery requires the authenticator pin and a touch.
+verification and retirement are credential-management operations and require
+the pin for either recovery policy.
 
 verification authenticates the envelope with the supplied root before asking
 for a pin or touch, then proves and enumerates the exact credential recorded by

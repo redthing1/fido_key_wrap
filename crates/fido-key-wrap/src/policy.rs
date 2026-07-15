@@ -47,9 +47,8 @@ pub enum RecipientPolicy {
     RecoverySecret,
     /// one exact security-key ceremony.
     Fido(FidoPolicy),
-    /// one user-verified security-key ceremony backed by managed credential
-    /// storage.
-    ManagedFido,
+    /// one exact security-key ceremony backed by managed credential storage.
+    ManagedFido(FidoPolicy),
     /// one exact security-key ceremony followed by an application passphrase.
     FidoAndPassphrase(FidoPolicy),
 }
@@ -210,10 +209,11 @@ impl Enrollment {
         Self::build(label, RecipientPolicy::Fido(policy), None)
     }
 
-    /// requests a user-verified route whose discoverable credential can later
-    /// be retired.
-    pub fn managed_fido(label: impl Into<String>) -> Result<Self> {
-        Self::build(label, RecipientPolicy::ManagedFido, None)
+    /// requests a security-key route whose discoverable credential can later
+    /// be retired. recovery uses `policy`; enrollment, verification, and
+    /// retirement require pin-backed user verification.
+    pub fn managed_fido(label: impl Into<String>, policy: FidoPolicy) -> Result<Self> {
+        Self::build(label, RecipientPolicy::ManagedFido(policy), None)
     }
 
     /// requests a security-key plus passphrase route using the desktop profile.
@@ -308,7 +308,9 @@ mod tests {
             Enrollment::fido("verified", FidoPolicy::UserVerification)
                 .unwrap()
                 .policy(),
-            Enrollment::managed_fido("managed").unwrap().policy(),
+            Enrollment::managed_fido("managed", FidoPolicy::UserVerification)
+                .unwrap()
+                .policy(),
             Enrollment::fido_and_passphrase("both", FidoPolicy::Presence)
                 .unwrap()
                 .policy(),
@@ -321,7 +323,10 @@ mod tests {
         assert!(!RecipientPolicy::RecoverySecret.uses_passphrase());
         assert!(policies[0].uses_passphrase());
         assert_eq!(policies[1], RecipientPolicy::Fido(FidoPolicy::Presence));
-        assert_eq!(policies[3], RecipientPolicy::ManagedFido);
+        assert_eq!(
+            policies[3],
+            RecipientPolicy::ManagedFido(FidoPolicy::UserVerification)
+        );
     }
 
     #[test]

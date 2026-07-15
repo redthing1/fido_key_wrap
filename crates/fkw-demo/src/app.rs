@@ -149,7 +149,7 @@ impl<'a> Application<'a> {
         storage::ensure_absent(path)?;
         validate_plaintext(plaintext)?;
         let enrollment = enrollment(access, label, kdf)?;
-        let managed = enrollment.policy() == RecipientPolicy::ManagedFido;
+        let managed = is_managed_policy(enrollment.policy());
         let (root, envelope, recipient) = self.access.create_root(enrollment)?;
         managed_publication(
             (|| {
@@ -193,7 +193,7 @@ impl<'a> Application<'a> {
         kdf: KdfOptions,
     ) -> Result<RecipientId> {
         let enrollment = enrollment(access, label.to_owned(), kdf)?;
-        let managed = enrollment.policy() == RecipientPolicy::ManagedFido;
+        let managed = is_managed_policy(enrollment.policy());
         let _lock = storage::NoteLock::acquire(path)?;
         let mut loaded = self.load(path)?;
         if loaded
@@ -252,7 +252,7 @@ impl<'a> Application<'a> {
             .into_iter()
             .find(|choice| choice.id == recipient)
             .context("recipient not found")?;
-        if removed.policy == RecipientPolicy::ManagedFido {
+        if is_managed_policy(removed.policy) {
             bail!("retire managed security-key routes with `fkw retire-key`");
         }
         if loaded.envelope.recipients().len() == 1 {
@@ -330,7 +330,7 @@ impl<'a> Application<'a> {
             .into_iter()
             .find(|choice| choice.id == recipient)
             .context("recipient not found")?;
-        if selected.policy != RecipientPolicy::ManagedFido {
+        if !is_managed_policy(selected.policy) {
             bail!("the selected recipient is not a managed security-key route");
         }
         let authorizer = self.select_recipient(&loaded.envelope, using)?;
@@ -354,7 +354,7 @@ impl<'a> Application<'a> {
             .into_iter()
             .find(|choice| choice.id == recipient)
             .context("recipient not found")?;
-        if selected.policy != RecipientPolicy::ManagedFido {
+        if !is_managed_policy(selected.policy) {
             bail!("the selected recipient is not a managed security-key route");
         }
         let final_route = loaded.envelope.recipients().len() == 1;
@@ -408,7 +408,7 @@ impl<'a> Application<'a> {
         confirmed: bool,
     ) -> Result<RecipientId> {
         let enrollment = enrollment(access, label, kdf)?;
-        let managed = enrollment.policy() == RecipientPolicy::ManagedFido;
+        let managed = is_managed_policy(enrollment.policy());
         let _lock = storage::NoteLock::acquire(path)?;
         let loaded = self.load(path)?;
         if !confirmed {
@@ -520,6 +520,10 @@ fn managed_publication<T>(result: Result<T>, managed: bool) -> Result<T> {
     }
 }
 
+const fn is_managed_policy(policy: RecipientPolicy) -> bool {
+    matches!(policy, RecipientPolicy::ManagedFido(_))
+}
+
 struct LoadedNote {
     original_bytes: Vec<u8>,
     container: NoteFile,
@@ -592,7 +596,12 @@ pub(crate) fn enrollment(access: Access, label: String, kdf: KdfOptions) -> Resu
         (Access::FidoUserVerification, None) => {
             Enrollment::fido(label, FidoPolicy::UserVerification)
         }
-        (Access::FidoManaged, None) => Enrollment::managed_fido(label),
+        (Access::FidoManagedPresence, None) => {
+            Enrollment::managed_fido(label, FidoPolicy::Presence)
+        }
+        (Access::FidoManagedUserVerification, None) => {
+            Enrollment::managed_fido(label, FidoPolicy::UserVerification)
+        }
         (Access::FidoPresencePlusPassphrase, None) => {
             Enrollment::fido_and_passphrase(label, FidoPolicy::Presence)
         }
@@ -609,7 +618,13 @@ pub(crate) fn enrollment(access: Access, label: String, kdf: KdfOptions) -> Resu
                 parameters,
             )
         }
-        (Access::FidoPresence | Access::FidoUserVerification | Access::FidoManaged, Some(_)) => {
+        (
+            Access::FidoPresence
+            | Access::FidoUserVerification
+            | Access::FidoManagedPresence
+            | Access::FidoManagedUserVerification,
+            Some(_),
+        ) => {
             bail!("argon2 options apply only to passphrase-bearing access policies")
         }
     }?;
@@ -637,7 +652,7 @@ fn ensure_allowed_policy(policy: RecipientPolicy) -> Result<()> {
     match policy {
         RecipientPolicy::Passphrase
         | RecipientPolicy::Fido(FidoPolicy::Presence | FidoPolicy::UserVerification)
-        | RecipientPolicy::ManagedFido
+        | RecipientPolicy::ManagedFido(FidoPolicy::Presence | FidoPolicy::UserVerification)
         | RecipientPolicy::FidoAndPassphrase(FidoPolicy::Presence | FidoPolicy::UserVerification) => {
             Ok(())
         }
@@ -661,7 +676,10 @@ pub(crate) const fn policy_text(policy: RecipientPolicy) -> &'static str {
         RecipientPolicy::RecoverySecret => "recovery secret",
         RecipientPolicy::Fido(FidoPolicy::Presence) => "security key: presence",
         RecipientPolicy::Fido(FidoPolicy::UserVerification) => "security key: user verification",
-        RecipientPolicy::ManagedFido => "managed security key: user verification",
+        RecipientPolicy::ManagedFido(FidoPolicy::Presence) => "managed security key: presence",
+        RecipientPolicy::ManagedFido(FidoPolicy::UserVerification) => {
+            "managed security key: user verification"
+        }
         RecipientPolicy::FidoAndPassphrase(FidoPolicy::Presence) => {
             "security key: presence + application passphrase"
         }
@@ -715,6 +733,18 @@ mod tests {
         };
         assert!(enrollment(Access::ApplicationPassphrase, "primary".into(), complete).is_ok());
         assert!(enrollment(Access::FidoPresence, "primary".into(), complete).is_err());
+
+        for (access, policy) in [
+            (Access::FidoManagedPresence, FidoPolicy::Presence),
+            (
+                Access::FidoManagedUserVerification,
+                FidoPolicy::UserVerification,
+            ),
+        ] {
+            let request = enrollment(access, "managed".into(), KdfOptions::default()).unwrap();
+            assert_eq!(request.policy(), RecipientPolicy::ManagedFido(policy));
+            assert!(enrollment(access, "managed".into(), complete).is_err());
+        }
     }
 
     #[test]
@@ -723,7 +753,8 @@ mod tests {
             RecipientPolicy::Passphrase,
             RecipientPolicy::Fido(FidoPolicy::Presence),
             RecipientPolicy::Fido(FidoPolicy::UserVerification),
-            RecipientPolicy::ManagedFido,
+            RecipientPolicy::ManagedFido(FidoPolicy::Presence),
+            RecipientPolicy::ManagedFido(FidoPolicy::UserVerification),
             RecipientPolicy::FidoAndPassphrase(FidoPolicy::Presence),
             RecipientPolicy::FidoAndPassphrase(FidoPolicy::UserVerification),
         ] {
@@ -927,7 +958,8 @@ mod tests {
         for (index, access_policy) in [
             Access::FidoPresence,
             Access::FidoUserVerification,
-            Access::FidoManaged,
+            Access::FidoManagedPresence,
+            Access::FidoManagedUserVerification,
             Access::FidoPresencePlusPassphrase,
             Access::FidoUserVerificationPlusPassphrase,
         ]
@@ -972,7 +1004,7 @@ mod tests {
 
         let result = application.create(
             &path,
-            Access::FidoManaged,
+            Access::FidoManagedUserVerification,
             "managed".into(),
             KdfOptions::default(),
             b"not published",
@@ -983,7 +1015,7 @@ mod tests {
             Err(error) if error.to_string().contains("a managed credential may remain")
         ));
         assert_eq!(storage::read_private(&path).unwrap(), concurrent);
-        assert_eq!(access.created, [Access::FidoManaged]);
+        assert_eq!(access.created, [Access::FidoManagedUserVerification]);
     }
 
     #[test]
@@ -1002,13 +1034,13 @@ mod tests {
         let sole_path = directory.path.join("sole-managed.fkd");
         let managed = managed_envelope();
         store_vector_note(&sole_path, &managed, b"sole managed route");
-        let sole_removal = application.remove_recipient(&sole_path, "managed fido", None);
+        let sole_removal = application.remove_recipient(&sole_path, "managed presence", None);
         assert!(matches!(
             sole_removal,
             Err(error) if error.to_string().contains("retire-key")
         ));
 
-        let removal = application.remove_recipient(&path, "managed fido", Some("passphrase"));
+        let removal = application.remove_recipient(&path, "managed presence", Some("passphrase"));
         assert!(matches!(
             removal,
             Err(error) if error.to_string().contains("retire-key")
@@ -1033,10 +1065,10 @@ mod tests {
         let mut application = Application::new(application_id, &mut access, &mut ui);
 
         application
-            .verify_managed_recipient(&path, "managed fido", Some("passphrase"))
+            .verify_managed_recipient(&path, "managed presence", Some("passphrase"))
             .unwrap();
         let (_, final_route) = application
-            .retire_managed_recipient(&path, "managed fido", Some("passphrase"), false)
+            .retire_managed_recipient(&path, "managed presence", Some("passphrase"), false)
             .unwrap();
         assert!(!final_route);
         assert_ne!(storage::read_private(&path).unwrap(), original);
@@ -1066,8 +1098,12 @@ mod tests {
             ..TestUi::default()
         };
         let mut application = Application::new(application_id, &mut access, &mut ui);
-        let result =
-            application.retire_managed_recipient(&path, "managed fido", Some("passphrase"), false);
+        let result = application.retire_managed_recipient(
+            &path,
+            "managed presence",
+            Some("passphrase"),
+            false,
+        );
 
         assert!(matches!(result, Err(error) if error.to_string() == "retirement cancelled"));
         assert_eq!(storage::read_private(&path).unwrap(), original);
@@ -1093,8 +1129,12 @@ mod tests {
         };
         let mut ui = TestUi::default();
         let mut application = Application::new(application_id, &mut access, &mut ui);
-        let result =
-            application.retire_managed_recipient(&path, "managed fido", Some("passphrase"), true);
+        let result = application.retire_managed_recipient(
+            &path,
+            "managed presence",
+            Some("passphrase"),
+            true,
+        );
 
         assert!(matches!(
             result,
@@ -1120,7 +1160,7 @@ mod tests {
         let mut ui = TestUi::default();
         let mut application = Application::new(application_id, &mut access, &mut ui);
         let (_, final_route) = application
-            .retire_managed_recipient(&path, "managed fido", None, false)
+            .retire_managed_recipient(&path, "managed presence", None, false)
             .unwrap();
 
         assert!(final_route);
@@ -1479,9 +1519,13 @@ mod tests {
                     "../../../test-vectors/format-1-fido-user-verification-plus-passphrase.txt"
                 ),
             )),
-            RecipientPolicy::ManagedFido => Ok((
-                Access::FidoManaged,
-                include_str!("../../../test-vectors/format-1-managed-fido.txt"),
+            RecipientPolicy::ManagedFido(FidoPolicy::Presence) => Ok((
+                Access::FidoManagedPresence,
+                include_str!("../../../test-vectors/format-1-managed-fido-presence.txt"),
+            )),
+            RecipientPolicy::ManagedFido(FidoPolicy::UserVerification) => Ok((
+                Access::FidoManagedUserVerification,
+                include_str!("../../../test-vectors/format-1-managed-fido-user-verification.txt"),
             )),
             RecipientPolicy::Passphrase | RecipientPolicy::RecoverySecret => {
                 bail!("expected a fido policy")
@@ -1507,7 +1551,7 @@ mod tests {
     }
 
     fn managed_envelope() -> KeyEnvelope {
-        let vector = include_str!("../../../test-vectors/format-1-managed-fido.txt");
+        let vector = include_str!("../../../test-vectors/format-1-managed-fido-presence.txt");
         KeyEnvelope::decode(&vector_bytes(vector, "envelope")).unwrap()
     }
 

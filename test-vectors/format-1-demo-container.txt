@@ -1,4 +1,4 @@
-# fkw-demo format-1 data-key, AEAD, and container vector
+# fkw-demo format-1 data-key, aead, and container vector
 # deterministic correctness vector; byte values are lowercase hexadecimal.
 
 format=1

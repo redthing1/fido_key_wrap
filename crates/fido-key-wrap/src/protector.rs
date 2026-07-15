@@ -7,7 +7,9 @@ use crate::{
     ApplicationId, AuthenticatorFailure, Enrollment, Error, Interaction, KeyEnvelope, Operation,
     Passphrase, PassphraseLimits, PassphraseParameters, PassphrasePrompt, PassphrasePurpose,
     RecipientId, RecoverySecret, RecoverySecretRecipient, Result, RootKey,
-    backend::{AuthenticatorBackend, ManagedEnrollment, ManagedRequest, PrfRequest},
+    backend::{
+        AuthenticatorBackend, CredentialBinding, ManagedEnrollment, ManagedRequest, PrfRequest,
+    },
     crypto::{self, DerivedKey},
     envelope::{
         FidoAndPassphraseRecipient, FidoRecipient, KdfDescriptor, MAX_CREDENTIAL_ID,
@@ -406,11 +408,14 @@ impl KeyProtector {
         }
         self.backend.verify_managed(
             &ManagedRequest {
-                application_id: &self.application_id,
-                recipient_id: record.id(),
-                credential_id: &inner.credential_id,
-                public_key: &inner.public_key,
-                label: record.label(),
+                credential: CredentialBinding {
+                    application_id: &self.application_id,
+                    recipient_id: record.id(),
+                    credential_id: &inner.credential_id,
+                    public_key: &inner.public_key,
+                    policy: inner.policy,
+                    label: record.label(),
+                },
                 operation: Operation::VerifyManagedRecipient,
             },
             interaction,
@@ -439,11 +444,14 @@ impl KeyProtector {
         }
         self.backend.retire_managed(
             &ManagedRequest {
-                application_id: &self.application_id,
-                recipient_id: record.id(),
-                credential_id: &inner.credential_id,
-                public_key: &inner.public_key,
-                label: record.label(),
+                credential: CredentialBinding {
+                    application_id: &self.application_id,
+                    recipient_id: record.id(),
+                    credential_id: &inner.credential_id,
+                    public_key: &inner.public_key,
+                    policy: inner.policy,
+                    label: record.label(),
+                },
                 operation: Operation::RetireManagedRecipient,
             },
             interaction,
@@ -529,11 +537,12 @@ impl KeyProtector {
                 operation,
                 interaction,
             ),
-            RecipientPolicy::ManagedFido => {
+            RecipientPolicy::ManagedFido(policy) => {
                 return self.enroll_managed_fido_recipient(
                     envelope,
                     root,
                     &enrollment.label,
+                    policy,
                     operation,
                     interaction,
                 );
@@ -670,18 +679,25 @@ impl KeyProtector {
         envelope: &KeyEnvelope,
         root: &RootKey,
         label: &str,
+        policy: crate::FidoPolicy,
         operation: Operation,
         interaction: &mut dyn Interaction,
     ) -> Result<(RecipientRecord, RecoveryKeys, Option<ManagedEnrollment>)> {
         let id = Self::unique_recipient_id(envelope)?;
-        let mut enrollment =
-            self.backend
-                .enroll_managed(&self.application_id, id, label, operation, interaction)?;
+        let mut enrollment = self.backend.enroll_managed(
+            &self.application_id,
+            id,
+            policy,
+            label,
+            operation,
+            interaction,
+        )?;
         let result = self.finish_managed_fido_recipient(
             envelope,
             root,
             id,
             label,
+            policy,
             operation,
             &mut enrollment,
             interaction,
@@ -711,11 +727,14 @@ impl KeyProtector {
         match self.backend.cleanup_managed_enrollment(
             enrollment,
             &ManagedRequest {
-                application_id: &self.application_id,
-                recipient_id,
-                credential_id: &credential_id,
-                public_key: &public_key,
-                label,
+                credential: CredentialBinding {
+                    application_id: &self.application_id,
+                    recipient_id,
+                    credential_id: &credential_id,
+                    public_key: &public_key,
+                    policy: enrollment.policy,
+                    label,
+                },
                 operation: Operation::RetireManagedRecipient,
             },
             interaction,
@@ -732,6 +751,7 @@ impl KeyProtector {
         root: &RootKey,
         id: RecipientId,
         label: &str,
+        policy: crate::FidoPolicy,
         operation: Operation,
         enrollment: &mut ManagedEnrollment,
         interaction: &mut dyn Interaction,
@@ -742,7 +762,7 @@ impl KeyProtector {
             label: label.to_owned(),
             credential_id: enrollment.credential.credential_id.clone(),
             public_key: enrollment.credential.public_key.clone(),
-            policy: crate::FidoPolicy::UserVerification,
+            policy,
             storage: FidoStorage::Managed,
             prf_nonce: random_array()?,
             fido_nonce: random_array()?,
@@ -753,28 +773,20 @@ impl KeyProtector {
             unreachable!("constructed managed FIDO record")
         };
         let prf_request = PrfRequest {
-            application_id: &self.application_id,
-            credential_id: &inner.credential_id,
-            public_key: &inner.public_key,
-            policy: inner.policy,
+            credential: CredentialBinding {
+                application_id: &self.application_id,
+                recipient_id: id,
+                credential_id: &inner.credential_id,
+                public_key: &inner.public_key,
+                policy: inner.policy,
+                label,
+            },
             input: &input,
-            label,
             operation,
         };
-        let managed_request = ManagedRequest {
-            application_id: &self.application_id,
-            recipient_id: id,
-            credential_id: &inner.credential_id,
-            public_key: &inner.public_key,
-            label,
-            operation,
-        };
-        let prf = self.backend.evaluate_managed_enrollment(
-            enrollment,
-            &prf_request,
-            &managed_request,
-            interaction,
-        )?;
+        let prf =
+            self.backend
+                .evaluate_managed_enrollment(enrollment, &prf_request, interaction)?;
         let key =
             crypto::derive_fido_key(&record, &self.application_id, &envelope.envelope_id, &prf)?;
         drop(prf);
@@ -1101,36 +1113,18 @@ impl KeyProtector {
         };
         let input = crypto::prf_input(record, &self.application_id, &envelope.envelope_id)?;
         let request = PrfRequest {
-            application_id: &self.application_id,
-            credential_id,
-            public_key,
-            policy,
+            credential: CredentialBinding {
+                application_id: &self.application_id,
+                recipient_id: record.id(),
+                credential_id,
+                public_key,
+                policy,
+                label: record.label(),
+            },
             input: &input,
-            label: record.label(),
             operation,
         };
-        if matches!(
-            record,
-            RecipientRecord::Fido(FidoRecipient {
-                storage: FidoStorage::Managed,
-                ..
-            })
-        ) {
-            self.backend.evaluate_managed(
-                &request,
-                &ManagedRequest {
-                    application_id: &self.application_id,
-                    recipient_id: record.id(),
-                    credential_id,
-                    public_key,
-                    label: record.label(),
-                    operation,
-                },
-                interaction,
-            )
-        } else {
-            self.backend.evaluate(&request, interaction)
-        }
+        self.backend.evaluate(&request, interaction)
     }
 
     fn require_application(&self, envelope: &KeyEnvelope) -> Result<()> {
@@ -1334,6 +1328,7 @@ mod tests {
     struct ScriptedInteraction {
         passphrases: VecDeque<Vec<u8>>,
         events: Vec<&'static str>,
+        touch_policies: Vec<FidoPolicy>,
     }
 
     impl ScriptedInteraction {
@@ -1341,6 +1336,7 @@ mod tests {
             Self {
                 passphrases: values.iter().map(|value| value.to_vec()).collect(),
                 events: Vec::new(),
+                touch_policies: Vec::new(),
             }
         }
     }
@@ -1375,6 +1371,7 @@ mod tests {
             &mut self,
             prompt: &crate::TouchPrompt,
         ) -> std::result::Result<(), InteractionError> {
+            self.touch_policies.push(prompt.policy());
             self.events.push(match prompt.ceremony() {
                 crate::FidoCeremony::Enrollment => "enrollment touch",
                 crate::FidoCeremony::Assertion => "assertion touch",
@@ -2098,7 +2095,7 @@ mod tests {
         let mut create = ScriptedInteraction::new(&[]);
         let (root, mut envelope, recipient) = protector
             .create_root(
-                Enrollment::managed_fido("managed key").unwrap(),
+                Enrollment::managed_fido("managed key", FidoPolicy::UserVerification).unwrap(),
                 &mut create,
             )
             .unwrap();
@@ -2107,15 +2104,20 @@ mod tests {
             ["pin", "enrollment touch", "assertion touch"]
         );
         assert_eq!(
+            create.touch_policies,
+            [FidoPolicy::UserVerification, FidoPolicy::UserVerification]
+        );
+        assert_eq!(
             envelope.recipients()[0].policy(),
-            RecipientPolicy::ManagedFido
+            RecipientPolicy::ManagedFido(FidoPolicy::UserVerification)
         );
         let mut add = ScriptedInteraction::new(&[]);
         let other = protector
             .add_recipient(
                 &mut envelope,
                 &root,
-                Enrollment::managed_fido("other managed key").unwrap(),
+                Enrollment::managed_fido("other managed key", FidoPolicy::UserVerification)
+                    .unwrap(),
                 &mut add,
             )
             .unwrap();
@@ -2150,12 +2152,65 @@ mod tests {
     }
 
     #[test]
+    fn managed_presence_uses_touch_only_for_recovery_and_uv_for_management() {
+        let mut protector = KeyProtector::fake(application());
+        let mut create = ScriptedInteraction::new(&[]);
+        let (root, envelope, recipient) = protector
+            .create_root(
+                Enrollment::managed_fido("managed presence", FidoPolicy::Presence).unwrap(),
+                &mut create,
+            )
+            .unwrap();
+        assert_eq!(
+            create.events,
+            ["pin", "enrollment touch", "assertion touch"]
+        );
+        assert_eq!(
+            create.touch_policies,
+            [FidoPolicy::Presence, FidoPolicy::Presence]
+        );
+        assert_eq!(
+            envelope.recipients()[0].policy(),
+            RecipientPolicy::ManagedFido(FidoPolicy::Presence)
+        );
+
+        let mut open = ScriptedInteraction::new(&[]);
+        let recovered = protector.unlock(&envelope, recipient, &mut open).unwrap();
+        assert!(roots_match(&root, &recovered));
+        assert_eq!(open.events, ["assertion touch"]);
+        assert_eq!(open.touch_policies, [FidoPolicy::Presence]);
+
+        let mut verify = ScriptedInteraction::new(&[]);
+        protector
+            .verify_managed_recipient(&envelope, &root, recipient, &mut verify)
+            .unwrap();
+        assert_eq!(verify.events, ["pin", "assertion touch"]);
+        assert_eq!(verify.touch_policies, [FidoPolicy::Presence]);
+
+        let mut retire = ScriptedInteraction::new(&[]);
+        protector
+            .retire_managed_recipient(&envelope, &root, recipient, &mut retire)
+            .unwrap();
+        assert_eq!(retire.events, ["pin", "assertion touch"]);
+        assert_eq!(retire.touch_policies, [FidoPolicy::Presence]);
+
+        let mut after = ScriptedInteraction::new(&[]);
+        assert!(matches!(
+            protector.unlock(&envelope, recipient, &mut after),
+            Err(Error::Authenticator(
+                AuthenticatorFailure::CredentialUnavailable
+            ))
+        ));
+        assert_eq!(after.events, ["assertion touch"]);
+    }
+
+    #[test]
     fn managed_lifecycle_authenticates_before_interaction() {
         let mut protector = KeyProtector::fake(application());
         let mut create = ScriptedInteraction::new(&[]);
         let (root, envelope, recipient) = protector
             .create_root(
-                Enrollment::managed_fido("managed key").unwrap(),
+                Enrollment::managed_fido("managed key", FidoPolicy::UserVerification).unwrap(),
                 &mut create,
             )
             .unwrap();
@@ -2197,7 +2252,10 @@ mod tests {
 
         let mut first = ScriptedInteraction::new(&[]);
         assert!(matches!(
-            protector.create_root(Enrollment::managed_fido("first").unwrap(), &mut first,),
+            protector.create_root(
+                Enrollment::managed_fido("first", FidoPolicy::UserVerification).unwrap(),
+                &mut first,
+            ),
             Err(Error::UnlockFailed)
         ));
         assert_eq!(
@@ -2214,7 +2272,10 @@ mod tests {
         let mut second = ScriptedInteraction::new(&[]);
         assert!(
             protector
-                .create_root(Enrollment::managed_fido("second").unwrap(), &mut second,)
+                .create_root(
+                    Enrollment::managed_fido("second", FidoPolicy::UserVerification).unwrap(),
+                    &mut second,
+                )
                 .is_ok()
         );
     }
@@ -2232,7 +2293,10 @@ mod tests {
 
         let mut first = ScriptedInteraction::new(&[]);
         assert!(matches!(
-            protector.create_root(Enrollment::managed_fido("first").unwrap(), &mut first),
+            protector.create_root(
+                Enrollment::managed_fido("first", FidoPolicy::UserVerification).unwrap(),
+                &mut first,
+            ),
             Err(Error::Authenticator(
                 AuthenticatorFailure::CredentialMayRemain
             ))
@@ -2240,7 +2304,10 @@ mod tests {
 
         let mut second = ScriptedInteraction::new(&[]);
         assert!(matches!(
-            protector.create_root(Enrollment::managed_fido("second").unwrap(), &mut second),
+            protector.create_root(
+                Enrollment::managed_fido("second", FidoPolicy::UserVerification).unwrap(),
+                &mut second,
+            ),
             Err(Error::Authenticator(
                 AuthenticatorFailure::CredentialStoreFull
             ))

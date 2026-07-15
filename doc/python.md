@@ -76,13 +76,14 @@ operation returns to python.
 
 ## recovery policies
 
-`Policy` contains the complete seven-route model:
+`Policy` contains the complete eight-route model:
 
 - `PASSPHRASE`
 - `RECOVERY_SECRET`
 - `FIDO_PRESENCE`
 - `FIDO_USER_VERIFICATION`
-- `MANAGED_FIDO`
+- `MANAGED_FIDO_PRESENCE`
+- `MANAGED_FIDO_USER_VERIFICATION`
 - `FIDO_PRESENCE_AND_PASSPHRASE`
 - `FIDO_USER_VERIFICATION_AND_PASSPHRASE`
 
@@ -96,9 +97,11 @@ fido policies use the system backend in a fido-capable build. they fail with
 build. `inspect_authenticators()` returns bounded capability reports without
 device identity.
 
-`MANAGED_FIDO` uses one discoverable credential slot and requires user
-verification. verify or retire its exact credential with the authenticated
-envelope and root:
+each managed policy uses one discoverable credential slot. presence recovery
+requires a touch; user-verification recovery requires the authenticator pin and
+a touch. enrollment, verification, and retirement require the pin under either
+policy. verify or retire the exact credential with the authenticated envelope
+and root:
 
 ```python
 protector.verify_managed_recipient(envelope, root, recipient, interaction)
@@ -165,9 +168,9 @@ without nul. the binding clears every exact bytearray received as secret input,
 including values with invalid lengths. selection and touch callbacks must
 return `None`.
 
-raising `Cancelled` cancels an operation. other callback exceptions normally
-return unchanged. a later managed-credential state error takes precedence when
-cleanup cannot be confirmed.
+raising `Cancelled` cancels an operation. other callback exceptions are
+normally propagated unchanged. a later managed-credential state error takes
+precedence when cleanup cannot be confirmed.
 
 prompt objects contain the operation, recipient label, and the exact purpose or
 fido ceremony needed by the interface. labels decoded from envelopes are

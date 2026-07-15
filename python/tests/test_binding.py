@@ -8,6 +8,15 @@ import fido_key_wrap as fkw
 
 
 PARAMETERS = fkw.PassphraseParameters(65_536, 3, 1)
+FIDO_POLICIES = (
+    fkw.Policy.FIDO_PRESENCE,
+    fkw.Policy.FIDO_USER_VERIFICATION,
+    fkw.Policy.MANAGED_FIDO_PRESENCE,
+    fkw.Policy.MANAGED_FIDO_USER_VERIFICATION,
+    fkw.Policy.FIDO_PRESENCE_AND_PASSPHRASE,
+    fkw.Policy.FIDO_USER_VERIFICATION_AND_PASSPHRASE,
+)
+ALL_POLICIES = (fkw.Policy.PASSPHRASE, fkw.Policy.RECOVERY_SECRET, *FIDO_POLICIES)
 
 
 class Passphrases:
@@ -317,10 +326,7 @@ class BindingTests(unittest.TestCase):
             def __getattr__(self, _name):
                 raise AssertionError("interaction was requested")
 
-        for policy in (
-            fkw.Policy.FIDO_USER_VERIFICATION,
-            fkw.Policy.MANAGED_FIDO,
-        ):
+        for policy in FIDO_POLICIES:
             enrollment = fkw.Enrollment("security key", policy)
             with self.assertRaises(fkw.Error) as caught:
                 fkw.KeyProtector("fido-disabled.example").create_root(
@@ -394,7 +400,7 @@ class BindingTests(unittest.TestCase):
             thread.join()
         self.assertGreater(ticks, 0)
 
-    def test_values_are_validated_and_immutable(self) -> None:
+    def test_policy_and_enrollment_values_are_validated(self) -> None:
         with self.assertRaises(fkw.Error) as caught:
             fkw.KeyProtector("invalid")
         self.assertEqual(caught.exception.code, fkw.ErrorCode.INVALID_APPLICATION_ID)
@@ -408,24 +414,18 @@ class BindingTests(unittest.TestCase):
             )
         with self.assertRaises(TypeError):
             fkw.Enrollment("recovery", fkw.Policy.RECOVERY_SECRET)
-        policies = (
-            fkw.Policy.PASSPHRASE,
-            fkw.Policy.RECOVERY_SECRET,
-            fkw.Policy.FIDO_PRESENCE,
-            fkw.Policy.FIDO_USER_VERIFICATION,
-            fkw.Policy.FIDO_PRESENCE_AND_PASSPHRASE,
-            fkw.Policy.FIDO_USER_VERIFICATION_AND_PASSPHRASE,
-            fkw.Policy.MANAGED_FIDO,
-        )
         for index, policy in enumerate(
-            policy for policy in policies if policy != fkw.Policy.RECOVERY_SECRET
+            policy for policy in ALL_POLICIES if policy != fkw.Policy.RECOVERY_SECRET
         ):
             enrollment = fkw.Enrollment(f"policy {index}", policy, None)
             self.assertEqual(enrollment.policy, policy)
-        self.assertEqual(len(set(policies)), len(policies))
+        self.assertEqual(len(set(ALL_POLICIES)), len(ALL_POLICIES))
+        self.assertFalse(hasattr(fkw.Policy, "MANAGED_FIDO"))
         self.assertNotEqual(fkw.Policy.PASSPHRASE, 1)
         self.assertIsInstance(hash(fkw.Policy.PASSPHRASE), int)
         self.assertIsInstance(hash(fkw.ErrorCode.UNLOCK_FAILED), int)
+
+    def test_value_objects_are_validated_and_immutable(self) -> None:
         with self.assertRaises(fkw.Error):
             fkw.RecipientId("AA" * 32)
         with self.assertRaises(fkw.Error):

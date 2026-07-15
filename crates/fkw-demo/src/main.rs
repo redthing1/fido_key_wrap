@@ -345,7 +345,7 @@ fn check(details: bool, inspection: &mut dyn AuthenticatorInspection) -> Result<
         }
         Inspection::Reports(reports) if reports.is_empty() => {
             println!("no inspectable security key was found");
-            println!("no pin, touch, credential, or prf operation was requested");
+            println!("no pin or touch was requested, and no credential was created or used");
         }
         Inspection::Reports(reports) => {
             for (index, report) in reports.iter().enumerate() {
@@ -364,7 +364,7 @@ fn check(details: bool, inspection: &mut dyn AuthenticatorInspection) -> Result<
                     }
                 }
             }
-            println!("no pin, touch, credential, or prf operation was requested");
+            println!("no pin or touch was requested, and no credential was created or used");
         }
     }
     Ok(())

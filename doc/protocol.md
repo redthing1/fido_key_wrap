@@ -209,15 +209,17 @@ only after packed attestation, es256, the requested protection, and signed
 a managed fido recipient creates one discoverable es256 credential with
 `rk=true`, user id `rid`, and relying-party id `app`. its authenticator-visible
 user name is fixed and contains no recipient label. managed enrollment requires
-`hmac-secret`, credential management, discoverable storage, and
-`credProtect=userVerificationRequired`.
+`hmac-secret`, credential management, discoverable storage, and the credential
+protection selected by `fp`: optional with the credential id for presence, or
+user verification required for user verification.
 
 the creation response is accepted under the same attestation, key, and signed
-flag checks as ordinary enrollment. the new credential is then exercised by a
-user-verified `hmac-secret` assertion on the same open authenticator. before the
-recipient is returned, complete relying-party enumeration must find exactly the
-record with user id `rid`, credential id `cid`, public key `pk`, and required
-credential protection.
+flag checks as ordinary enrollment. the new credential is then exercised by an
+exact-policy `hmac-secret` assertion on the same open authenticator. presence
+uses `uv=0`; user verification uses `uv=1`. before the recipient is returned,
+complete relying-party enumeration must find exactly the record with user id
+`rid`, credential id `cid`, public key `pk`, and required credential
+protection.
 
 ### assertion
 
@@ -237,10 +239,9 @@ binding, fresh client-data hash, exact credential id, exact signed
 `up`/`uv`/`be`/`bs` flags, single assertion count, and 32-byte extension result
 have been verified. call the verified extension result `r`.
 
-for the managed suite, the verified assertion is followed by complete
-relying-party enumeration on the same open authenticator. no prf result is
-released unless the record exactly matches `rid`, `cid`, `pk`, and required
-credential protection.
+ordinary recovery does not enumerate managed credentials. the signed assertion
+already proves the exact credential and recovery policy; enumeration belongs
+to managed enrollment, verification, and retirement.
 
 ```text
 kfido = hkdf-sha-256(
@@ -256,7 +257,8 @@ kfido = hkdf-sha-256(
 managed verification first authenticates the complete envelope with `root`.
 it then obtains a fresh user-verified signed assertion for `cid` without
 requesting `hmac-secret`, and completes exact relying-party enumeration on the
-same open authenticator.
+same open authenticator. verification and retirement require pin-backed user
+verification even when `fp` selects presence for recovery.
 
 managed retirement performs that verification, deletes exactly `cid`, then
 completes another enumeration proving that the exact record is absent. a
@@ -386,12 +388,14 @@ fido:
 [2, rid, label, cid, pk, fp, np, nf, wrapped_root]
 
 managed fido:
-[5, rid, label, cid, pk, 2, np, nf, wrapped_root]
+[5, rid, label, cid, pk, fp, np, nf, wrapped_root]
 
 fido and passphrase:
 [3, rid, label, cid, pk, fp, np, nf,
  [1, memory_kib, passes, lanes, s], npass, wrapped_root]
 ```
+
+suite 5 accepts `fp=1` for presence and `fp=2` for user verification.
 
 recipients are ordered by ascending `rid`. ids are unique. fido-bearing
 recipients have unique credential ids, and passphrase-bearing recipients have
@@ -405,8 +409,7 @@ input is rejected before factor interaction.
 
 ## interoperability vectors
 
-`test-vectors/` contains deterministic format-1 fixtures for passphrase,
-recovery secret, presence, user verification, both combined policies, a mixed
-envelope, managed fido, and the demo container. `test-vectors/generate.py`
-implements transcript framing, hkdf, cbor, and envelope construction
-independently from the rust code.
+`test-vectors/` contains deterministic format-1 fixtures for every recipient
+policy, an eight-recipient mixed envelope, and the demo container.
+`test-vectors/generate.py` implements transcript framing, hkdf, cbor, and
+envelope construction independently from the rust code.

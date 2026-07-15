@@ -623,8 +623,10 @@ mod tests {
         include_str!("../../../test-vectors/format-1-fido-presence.txt");
     const FIDO_UV_VECTOR: &str =
         include_str!("../../../test-vectors/format-1-fido-user-verification.txt");
-    const MANAGED_FIDO_VECTOR: &str =
-        include_str!("../../../test-vectors/format-1-managed-fido.txt");
+    const MANAGED_PRESENCE_VECTOR: &str =
+        include_str!("../../../test-vectors/format-1-managed-fido-presence.txt");
+    const MANAGED_UV_VECTOR: &str =
+        include_str!("../../../test-vectors/format-1-managed-fido-user-verification.txt");
     const COMBINED_PRESENCE_VECTOR: &str =
         include_str!("../../../test-vectors/format-1-fido-presence-plus-passphrase.txt");
     const COMBINED_UV_VECTOR: &str =
@@ -1041,7 +1043,8 @@ mod tests {
         for vector in [
             FIDO_PRESENCE_VECTOR,
             FIDO_UV_VECTOR,
-            MANAGED_FIDO_VECTOR,
+            MANAGED_PRESENCE_VECTOR,
+            MANAGED_UV_VECTOR,
             COMBINED_PRESENCE_VECTOR,
             COMBINED_UV_VECTOR,
         ] {
@@ -1097,7 +1100,12 @@ mod tests {
 
     #[test]
     fn fido_only_vectors_wrap_and_unwrap_exactly() {
-        for vector in [FIDO_PRESENCE_VECTOR, FIDO_UV_VECTOR, MANAGED_FIDO_VECTOR] {
+        for vector in [
+            FIDO_PRESENCE_VECTOR,
+            FIDO_UV_VECTOR,
+            MANAGED_PRESENCE_VECTOR,
+            MANAGED_UV_VECTOR,
+        ] {
             let envelope = envelope(vector);
             let recipient = &envelope.recipients[0];
             let RecipientRecord::Fido(record) = recipient else {
@@ -1141,7 +1149,7 @@ mod tests {
 
     #[test]
     fn managed_storage_is_bound_to_fido_derivation_and_wrapping() {
-        let envelope = envelope(MANAGED_FIDO_VECTOR);
+        let envelope = envelope(MANAGED_UV_VECTOR);
         let recipient = &envelope.recipients[0];
         let RecipientRecord::Fido(record) = recipient else {
             panic!("fixture has the wrong suite");
@@ -1158,7 +1166,7 @@ mod tests {
             &altered,
             &envelope.application_id,
             &envelope.envelope_id,
-            &array(MANAGED_FIDO_VECTOR, "verified_prf_result"),
+            &array(MANAGED_UV_VECTOR, "verified_prf_result"),
         )
         .unwrap();
         assert!(
@@ -1360,7 +1368,7 @@ mod tests {
     #[test]
     fn mixed_recipient_body_and_whole_envelope_mac_match_vector() {
         let envelope = envelope(MIXED_VECTOR);
-        assert_eq!(envelope.recipients.len(), 7);
+        assert_eq!(envelope.recipients.len(), 8);
         let root = root(MIXED_VECTOR);
         check_envelope_mac_intermediates(MIXED_VECTOR, &envelope, &root);
         verify_envelope_mac(&envelope, &root).unwrap();

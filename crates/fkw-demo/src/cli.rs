@@ -18,7 +18,8 @@ pub(crate) enum Access {
     ApplicationPassphrase,
     FidoPresence,
     FidoUserVerification,
-    FidoManaged,
+    FidoManagedPresence,
+    FidoManagedUserVerification,
     FidoPresencePlusPassphrase,
     FidoUserVerificationPlusPassphrase,
 }
@@ -200,13 +201,18 @@ mod tests {
             "application-passphrase",
             "fido-presence",
             "fido-user-verification",
-            "fido-managed",
+            "fido-managed-presence",
+            "fido-managed-user-verification",
             "fido-presence-plus-passphrase",
             "fido-user-verification-plus-passphrase",
         ] {
             let cli = Cli::try_parse_from(["fkw", "new", "note.fkd", "--access", access]);
             assert!(cli.is_ok(), "failed to parse {access}");
         }
+
+        assert!(
+            Cli::try_parse_from(["fkw", "new", "note.fkd", "--access", "fido-managed"]).is_err()
+        );
 
         let cli = Cli::try_parse_from([
             "fkw",
