@@ -4,16 +4,18 @@ use subtle::ConstantTimeEq;
 use std::cell::Cell;
 
 use crate::{
-    ApplicationId, AuthenticatorFailure, Enrollment, Error, Interaction, KeyEnvelope, Operation,
-    Passphrase, PassphraseLimits, PassphraseParameters, PassphrasePrompt, PassphrasePurpose,
-    RecipientId, RecoverySecret, RecoverySecretRecipient, Result, RootKey,
+    ApplicationId, AuthenticatorFailure, Enrollment, Error, Interaction, KeyEnvelope, LocalSecret,
+    LocalSecretRecipient, Operation, Passphrase, PassphraseLimits, PassphraseParameters,
+    PassphrasePrompt, PassphrasePurpose, RecipientId, RecoverySecret, RecoverySecretRecipient,
+    Result, RootKey,
     backend::{
         AuthenticatorBackend, CredentialBinding, ManagedEnrollment, ManagedRequest, PrfRequest,
     },
     crypto::{self, DerivedKey},
     envelope::{
-        FidoAndPassphraseRecipient, FidoRecipient, KdfDescriptor, MAX_CREDENTIAL_ID,
-        MAX_RECIPIENTS, PassphraseRecipient, RecipientRecord, RecoverySecretRecord,
+        FidoAndLocalSecretRecipient, FidoAndPassphraseRecipient, FidoRecipient, KdfDescriptor,
+        MAX_CREDENTIAL_ID, MAX_RECIPIENTS, PassphraseRecipient, RecipientRecord,
+        RecoverySecretRecord,
     },
     policy::{FidoStorage, RecipientPolicy, validate_label},
 };
@@ -155,7 +157,7 @@ impl KeyProtector {
         root: &RootKey,
         label: impl Into<String>,
     ) -> Result<(KeyEnvelope, RecoverySecretRecipient)> {
-        let label = validate_recovery_label(label)?;
+        let label = validate_dedicated_label(label)?;
         let envelope = KeyEnvelope {
             application_id: self.application_id.clone(),
             envelope_id: random_array()?,
@@ -166,6 +168,40 @@ impl KeyProtector {
         let id = record.id();
         let envelope = Self::stage_record(envelope, record, root, &RecoveryKeys::Recovery(key))?;
         Ok((envelope, RecoverySecretRecipient::new(id, secret)))
+    }
+
+    /// generates a random root protected by security-key presence and a local secret.
+    ///
+    /// the local secret is returned only after the complete staged route has
+    /// been recovered and authenticated.
+    pub fn create_root_with_fido_and_local_secret(
+        &mut self,
+        label: impl Into<String>,
+        interaction: &mut dyn Interaction,
+    ) -> Result<(RootKey, KeyEnvelope, LocalSecretRecipient)> {
+        let root = RootKey::random()?;
+        let (envelope, local) = self.protect_root_with_fido_and_local_secret_for_operation(
+            &root,
+            label,
+            Operation::CreateRoot,
+            interaction,
+        )?;
+        Ok((root, envelope, local))
+    }
+
+    /// protects an existing root with security-key presence and a local secret.
+    pub fn protect_root_with_fido_and_local_secret(
+        &mut self,
+        root: &RootKey,
+        label: impl Into<String>,
+        interaction: &mut dyn Interaction,
+    ) -> Result<(KeyEnvelope, LocalSecretRecipient)> {
+        self.protect_root_with_fido_and_local_secret_for_operation(
+            root,
+            label,
+            Operation::ProtectRoot,
+            interaction,
+        )
     }
 
     /// recovers a root through exactly one selected recipient.
@@ -206,7 +242,9 @@ impl KeyProtector {
                     &key,
                 )?
             }
-            RecipientRecord::RecoverySecret(_) => return Err(Error::UnlockFailed),
+            RecipientRecord::RecoverySecret(_) | RecipientRecord::FidoAndLocalSecret(_) => {
+                return Err(Error::UnlockFailed);
+            }
             RecipientRecord::Fido(fido_record) => {
                 let prf = self.evaluate(record, envelope, Operation::Unlock, interaction)?;
                 let key = crypto::derive_fido_key(
@@ -302,6 +340,41 @@ impl KeyProtector {
         }
     }
 
+    /// recovers a root through security-key presence and the selected local secret.
+    pub fn unlock_with_fido_and_local_secret(
+        &mut self,
+        envelope: &KeyEnvelope,
+        recipient: RecipientId,
+        secret: &LocalSecret,
+        interaction: &mut dyn Interaction,
+    ) -> Result<RootKey> {
+        self.require_application(envelope)?;
+        let record = envelope.find(recipient).map_err(|_| Error::UnlockFailed)?;
+        let RecipientRecord::FidoAndLocalSecret(inner) = record else {
+            return Err(Error::UnlockFailed);
+        };
+        let prf = self.evaluate(record, envelope, Operation::Unlock, interaction)?;
+        let key = crypto::derive_fido_local_key(
+            inner,
+            &self.application_id,
+            &envelope.envelope_id,
+            &prf,
+            secret,
+        )?;
+        drop(prf);
+        let root = crypto::unwrap_fido_local_root(
+            inner,
+            &self.application_id,
+            &envelope.envelope_id,
+            &key,
+        )?;
+        if crypto::envelope_mac_matches(envelope, &root)? {
+            Ok(root)
+        } else {
+            Err(Error::UnlockFailed)
+        }
+    }
+
     /// adds another alternative recovery route transactionally.
     ///
     /// # errors
@@ -346,13 +419,44 @@ impl KeyProtector {
         if envelope.recipients.len() >= MAX_RECIPIENTS {
             return Err(Error::TooManyRecipients);
         }
-        let label = validate_recovery_label(label)?;
+        let label = validate_dedicated_label(label)?;
         let (record, secret, key) = Self::new_recovery_secret_record(envelope, root, label)?;
         let id = record.id();
         let staged =
             Self::stage_record(envelope.clone(), record, root, &RecoveryKeys::Recovery(key))?;
         *envelope = staged;
         Ok(RecoverySecretRecipient::new(id, secret))
+    }
+
+    /// adds a security-key-presence and local-secret route transactionally.
+    pub fn add_fido_and_local_secret(
+        &mut self,
+        envelope: &mut KeyEnvelope,
+        root: &RootKey,
+        label: impl Into<String>,
+        interaction: &mut dyn Interaction,
+    ) -> Result<LocalSecretRecipient> {
+        self.require_authenticated(envelope, root)?;
+        if envelope.recipients.len() >= MAX_RECIPIENTS {
+            return Err(Error::TooManyRecipients);
+        }
+        let label = validate_dedicated_label(label)?;
+        let (record, secret, key) = self.enroll_fido_local_recipient(
+            envelope,
+            root,
+            label,
+            Operation::AddRecipient,
+            interaction,
+        )?;
+        let id = record.id();
+        let staged = Self::stage_record(
+            envelope.clone(),
+            record,
+            root,
+            &RecoveryKeys::FidoAndLocal(key),
+        )?;
+        *envelope = staged;
+        Ok(LocalSecretRecipient::new(id, secret))
     }
 
     /// removes one recovery route transactionally.
@@ -509,6 +613,28 @@ impl KeyProtector {
         Ok((envelope, id))
     }
 
+    fn protect_root_with_fido_and_local_secret_for_operation(
+        &mut self,
+        root: &RootKey,
+        label: impl Into<String>,
+        operation: Operation,
+        interaction: &mut dyn Interaction,
+    ) -> Result<(KeyEnvelope, LocalSecretRecipient)> {
+        let label = validate_dedicated_label(label)?;
+        let envelope = KeyEnvelope {
+            application_id: self.application_id.clone(),
+            envelope_id: random_array()?,
+            recipients: Vec::new(),
+            mac: [0; ROOT_BYTES],
+        };
+        let (record, secret, key) =
+            self.enroll_fido_local_recipient(&envelope, root, label, operation, interaction)?;
+        let id = record.id();
+        let envelope =
+            Self::stage_record(envelope, record, root, &RecoveryKeys::FidoAndLocal(key))?;
+        Ok((envelope, LocalSecretRecipient::new(id, secret)))
+    }
+
     fn enroll_recipient(
         &mut self,
         envelope: &KeyEnvelope,
@@ -528,7 +654,9 @@ impl KeyProtector {
                 operation,
                 interaction,
             ),
-            RecipientPolicy::RecoverySecret => Err(Error::InvalidEnvelope),
+            RecipientPolicy::RecoverySecret | RecipientPolicy::FidoPresenceAndLocalSecret => {
+                Err(Error::InvalidEnvelope)
+            }
             RecipientPolicy::Fido(policy) => self.enroll_fido_recipient(
                 envelope,
                 root,
@@ -672,6 +800,57 @@ impl KeyProtector {
             )?;
         }
         Ok((record, RecoveryKeys::Fido(key)))
+    }
+
+    fn enroll_fido_local_recipient(
+        &mut self,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        label: String,
+        operation: Operation,
+        interaction: &mut dyn Interaction,
+    ) -> Result<(RecipientRecord, LocalSecret, DerivedKey)> {
+        let id = Self::unique_recipient_id(envelope)?;
+        let secret = LocalSecret::random()?;
+        let prf_nonce = random_array()?;
+        let wrap_nonce = random_array()?;
+        let credential = self.backend.enroll(
+            &self.application_id,
+            crate::FidoPolicy::Presence,
+            &label,
+            operation,
+            interaction,
+        )?;
+        Self::validate_credential(envelope, &credential.credential_id)?;
+        let mut record = RecipientRecord::FidoAndLocalSecret(FidoAndLocalSecretRecipient {
+            id,
+            label,
+            credential_id: credential.credential_id,
+            public_key: credential.public_key,
+            prf_nonce,
+            wrap_nonce,
+            wrapped_root: [0; WRAPPED_ROOT_BYTES],
+        });
+        let prf = self.evaluate(&record, envelope, operation, interaction)?;
+        let RecipientRecord::FidoAndLocalSecret(inner) = &mut record else {
+            unreachable!("constructed fido-and-local-secret record")
+        };
+        let key = crypto::derive_fido_local_key(
+            inner,
+            &self.application_id,
+            &envelope.envelope_id,
+            &prf,
+            &secret,
+        )?;
+        drop(prf);
+        inner.wrapped_root = crypto::wrap_fido_local_root(
+            inner,
+            &self.application_id,
+            &envelope.envelope_id,
+            root,
+            &key,
+        )?;
+        Ok((record, secret, key))
     }
 
     fn enroll_managed_fido_recipient(
@@ -883,7 +1062,7 @@ impl KeyProtector {
             RecipientRecord::Passphrase(old) => {
                 self.rewrap_passphrase_record(envelope, root, old, parameters, interaction)?
             }
-            RecipientRecord::RecoverySecret(_) => {
+            RecipientRecord::RecoverySecret(_) | RecipientRecord::FidoAndLocalSecret(_) => {
                 return Err(Error::RecipientDoesNotUsePassphrase);
             }
             RecipientRecord::Fido(_) => return Err(Error::RecipientDoesNotUsePassphrase),
@@ -1110,6 +1289,11 @@ impl KeyProtector {
             RecipientRecord::FidoAndPassphrase(inner) => {
                 (&inner.credential_id, &inner.public_key, inner.policy)
             }
+            RecipientRecord::FidoAndLocalSecret(inner) => (
+                &inner.credential_id,
+                &inner.public_key,
+                crate::FidoPolicy::Presence,
+            ),
         };
         let input = crypto::prf_input(record, &self.application_id, &envelope.envelope_id)?;
         let request = PrfRequest {
@@ -1177,7 +1361,9 @@ impl KeyProtector {
             let salt = random_array()?;
             let duplicate = envelope.recipients.iter().any(|record| match record {
                 RecipientRecord::Passphrase(inner) => inner.kdf.salt == salt,
-                RecipientRecord::RecoverySecret(_) | RecipientRecord::Fido(_) => false,
+                RecipientRecord::RecoverySecret(_)
+                | RecipientRecord::Fido(_)
+                | RecipientRecord::FidoAndLocalSecret(_) => false,
                 RecipientRecord::FidoAndPassphrase(inner) => inner.kdf.salt == salt,
             });
             if !duplicate {
@@ -1194,6 +1380,7 @@ impl KeyProtector {
                 RecipientRecord::Passphrase(_) | RecipientRecord::RecoverySecret(_) => false,
                 RecipientRecord::Fido(inner) => inner.credential_id == credential_id,
                 RecipientRecord::FidoAndPassphrase(inner) => inner.credential_id == credential_id,
+                RecipientRecord::FidoAndLocalSecret(inner) => inner.credential_id == credential_id,
             })
         {
             return Err(Error::AuthenticatorResponseInvalid);
@@ -1220,6 +1407,7 @@ enum RecoveryKeys {
     Passphrase(DerivedKey),
     Recovery(DerivedKey),
     Fido(DerivedKey),
+    FidoAndLocal(DerivedKey),
     Combined {
         passphrase: DerivedKey,
         fido: DerivedKey,
@@ -1242,6 +1430,9 @@ fn recover_with_keys(
         (RecipientRecord::Fido(record), RecoveryKeys::Fido(key)) => {
             crypto::unwrap_fido_root(record, application_id, envelope_id, key)
         }
+        (RecipientRecord::FidoAndLocalSecret(record), RecoveryKeys::FidoAndLocal(key)) => {
+            crypto::unwrap_fido_local_root(record, application_id, envelope_id, key)
+        }
         (
             RecipientRecord::FidoAndPassphrase(record),
             RecoveryKeys::Combined { passphrase, fido },
@@ -1253,7 +1444,7 @@ fn recover_with_keys(
     }
 }
 
-fn validate_recovery_label(label: impl Into<String>) -> Result<String> {
+fn validate_dedicated_label(label: impl Into<String>) -> Result<String> {
     let label = label.into();
     validate_label(&label).map_err(|()| Error::InvalidLabel)?;
     Ok(label)
@@ -1750,6 +1941,7 @@ mod tests {
         let cases = [
             Enrollment::passphrase_with_parameters("passphrase", test_parameters()).unwrap(),
             Enrollment::fido("fido", FidoPolicy::Presence).unwrap(),
+            Enrollment::managed_fido("managed fido", FidoPolicy::Presence).unwrap(),
             Enrollment::fido_and_passphrase_with_parameters(
                 "combined",
                 FidoPolicy::Presence,
@@ -1781,6 +1973,62 @@ mod tests {
             Err(Error::WouldRemoveLastRecipient)
         ));
         assert_eq!(envelope.encode(), original);
+
+        let mut protector = KeyProtector::fake(application());
+        let mut interaction = ScriptedInteraction::new(&[]);
+        let (root, mut envelope, local) = protector
+            .create_root_with_fido_and_local_secret("paired machine", &mut interaction)
+            .unwrap();
+        let original = envelope.encode();
+        assert!(matches!(
+            protector.remove_recipient(&mut envelope, &root, local.recipient_id()),
+            Err(Error::WouldRemoveLastRecipient)
+        ));
+        assert_eq!(envelope.encode(), original);
+    }
+
+    #[test]
+    fn local_secret_creation_and_addition_validate_before_publication() {
+        let mut protector = KeyProtector::fake(application());
+        let mut root_bytes = [0x39; 32];
+        let root = RootKey::import(&mut root_bytes);
+        let mut interaction = ScriptedInteraction::new(&[]);
+        let (protected, local) = protector
+            .protect_root_with_fido_and_local_secret(&root, "paired machine", &mut interaction)
+            .unwrap();
+        let recovered = protector
+            .unlock_with_fido_and_local_secret(
+                &protected,
+                local.recipient_id(),
+                local.secret(),
+                &mut interaction,
+            )
+            .unwrap();
+        assert!(roots_match(&root, &recovered));
+
+        let (root, mut envelope, _recovery) = KeyProtector::new(application())
+            .create_root_with_recovery_secret("recovery")
+            .unwrap();
+        let original = envelope.encode();
+        for fault in [
+            StagedFault::CanonicalDecode,
+            StagedFault::RootMismatch,
+            StagedFault::EnvelopeMac,
+        ] {
+            fail_next_staged_validation(fault);
+            let mut interaction = ScriptedInteraction::new(&[]);
+            assert!(
+                protector
+                    .add_fido_and_local_secret(
+                        &mut envelope,
+                        &root,
+                        "paired machine",
+                        &mut interaction,
+                    )
+                    .is_err()
+            );
+            assert_eq!(envelope.encode(), original);
+        }
     }
 
     #[test]
@@ -1988,6 +2236,12 @@ mod tests {
                 Enrollment::fido("key", FidoPolicy::Presence).unwrap(),
                 &mut interaction
             ),
+            Err(Error::FidoSupportUnavailable)
+        ));
+        assert!(interaction.events.is_empty());
+
+        assert!(matches!(
+            protector.create_root_with_fido_and_local_secret("paired machine", &mut interaction),
             Err(Error::FidoSupportUnavailable)
         ));
         assert!(interaction.events.is_empty());

@@ -25,6 +25,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<types::RootKey>()?;
     module.add_class::<types::RecoverySecret>()?;
     module.add_class::<types::RecoverySecretRecipient>()?;
+    module.add_class::<types::LocalSecret>()?;
+    module.add_class::<types::LocalSecretRecipient>()?;
     module
         .getattr("RootKey")?
         .setattr("__hash__", module.py().None())?;
@@ -33,6 +35,12 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         .setattr("__hash__", module.py().None())?;
     module
         .getattr("RecoverySecretRecipient")?
+        .setattr("__hash__", module.py().None())?;
+    module
+        .getattr("LocalSecret")?
+        .setattr("__hash__", module.py().None())?;
+    module
+        .getattr("LocalSecretRecipient")?
         .setattr("__hash__", module.py().None())?;
     module.add_class::<prompts::Operation>()?;
     module.add_class::<prompts::FidoCeremony>()?;

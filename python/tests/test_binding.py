@@ -16,7 +16,11 @@ FIDO_POLICIES = (
     fkw.Policy.FIDO_PRESENCE_AND_PASSPHRASE,
     fkw.Policy.FIDO_USER_VERIFICATION_AND_PASSPHRASE,
 )
-ALL_POLICIES = (fkw.Policy.PASSPHRASE, fkw.Policy.RECOVERY_SECRET, *FIDO_POLICIES)
+DEDICATED_POLICIES = (
+    fkw.Policy.RECOVERY_SECRET,
+    fkw.Policy.FIDO_PRESENCE_AND_LOCAL_SECRET,
+)
+ALL_POLICIES = (fkw.Policy.PASSPHRASE, *DEDICATED_POLICIES, *FIDO_POLICIES)
 
 
 class Passphrases:
@@ -244,6 +248,40 @@ class BindingTests(unittest.TestCase):
             protector.unlock(envelope, recovery.recipient_id, Unexpected())
         self.assertEqual(caught.exception.code, fkw.ErrorCode.UNLOCK_FAILED)
 
+    def test_local_secret_boundary_and_dedicated_surface(self) -> None:
+        material = bytearray(range(32))
+        secret = fkw.LocalSecret.from_bytearray(material)
+        self.assertEqual(material, bytearray(32))
+        self.assertEqual(repr(secret), "LocalSecret([REDACTED])")
+
+        exported = secret.export()
+        self.assertIs(type(exported), bytearray)
+        self.assertEqual(exported, bytearray(range(32)))
+        imported = fkw.LocalSecret.from_bytearray(exported)
+        self.assertEqual(exported, bytearray(32))
+        self.assertEqual(repr(imported), "LocalSecret([REDACTED])")
+
+        short = bytearray(b"short")
+        with self.assertRaises(TypeError):
+            fkw.LocalSecret.from_bytearray(short)
+        self.assertEqual(short, bytearray(len(short)))
+
+        for operation in (copy.copy, copy.deepcopy, pickle.dumps, hash):
+            with self.assertRaises(TypeError):
+                operation(secret)
+
+        self.assertIsNone(fkw.LocalSecret.__hash__)
+        self.assertIsNone(fkw.LocalSecretRecipient.__hash__)
+
+        protector = fkw.KeyProtector("local-secret.example")
+        for name in (
+            "create_root_with_fido_and_local_secret",
+            "protect_root_with_fido_and_local_secret",
+            "add_fido_and_local_secret",
+            "unlock_with_fido_and_local_secret",
+        ):
+            self.assertTrue(callable(getattr(protector, name)))
+
     def test_callback_failures_are_preserved_and_inputs_are_cleared(self) -> None:
         protector = fkw.KeyProtector("callbacks.example")
         enrollment = self.enrollment()
@@ -338,6 +376,11 @@ class BindingTests(unittest.TestCase):
         with self.assertRaises(fkw.Error) as caught:
             fkw.inspect_authenticators()
         self.assertEqual(caught.exception.code, fkw.ErrorCode.FIDO_SUPPORT_UNAVAILABLE)
+        with self.assertRaises(fkw.Error) as caught:
+            fkw.KeyProtector(
+                "local-secret-disabled.example"
+            ).create_root_with_fido_and_local_secret("primary", Unexpected())
+        self.assertEqual(caught.exception.code, fkw.ErrorCode.FIDO_SUPPORT_UNAVAILABLE)
 
     def test_same_protector_reentrancy_fails_without_deadlock(self) -> None:
         protector = fkw.KeyProtector("busy.example")
@@ -412,10 +455,11 @@ class BindingTests(unittest.TestCase):
                 fkw.Policy.FIDO_PRESENCE,
                 PARAMETERS,
             )
-        with self.assertRaises(TypeError):
-            fkw.Enrollment("recovery", fkw.Policy.RECOVERY_SECRET)
+        for policy in DEDICATED_POLICIES:
+            with self.assertRaises(TypeError):
+                fkw.Enrollment("dedicated", policy)
         for index, policy in enumerate(
-            policy for policy in ALL_POLICIES if policy != fkw.Policy.RECOVERY_SECRET
+            policy for policy in ALL_POLICIES if policy not in DEDICATED_POLICIES
         ):
             enrollment = fkw.Enrollment(f"policy {index}", policy, None)
             self.assertEqual(enrollment.policy, policy)

@@ -51,6 +51,8 @@ pub enum RecipientPolicy {
     ManagedFido(FidoPolicy),
     /// one exact security-key ceremony followed by an application passphrase.
     FidoAndPassphrase(FidoPolicy),
+    /// security-key presence and a separately stored local secret.
+    FidoPresenceAndLocalSecret,
 }
 
 impl RecipientPolicy {
@@ -321,6 +323,8 @@ mod tests {
         assert_eq!(policies.len(), 6);
         assert!(!policies.contains(&RecipientPolicy::RecoverySecret));
         assert!(!RecipientPolicy::RecoverySecret.uses_passphrase());
+        assert!(!policies.contains(&RecipientPolicy::FidoPresenceAndLocalSecret));
+        assert!(!RecipientPolicy::FidoPresenceAndLocalSecret.uses_passphrase());
         assert!(policies[0].uses_passphrase());
         assert_eq!(policies[1], RecipientPolicy::Fido(FidoPolicy::Presence));
         assert_eq!(

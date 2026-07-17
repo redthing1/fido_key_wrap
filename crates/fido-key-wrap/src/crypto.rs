@@ -13,10 +13,10 @@ use zeroize::Zeroizing;
 use std::cell::Cell;
 
 use crate::{
-    ApplicationId, Error, KeyEnvelope, Passphrase, RecoverySecret, Result, RootKey,
+    ApplicationId, Error, KeyEnvelope, LocalSecret, Passphrase, RecoverySecret, Result, RootKey,
     envelope::{
-        FidoAndPassphraseRecipient, FidoRecipient, KdfDescriptor, PassphraseRecipient,
-        RecipientRecord, RecoverySecretRecord,
+        FidoAndLocalSecretRecipient, FidoAndPassphraseRecipient, FidoRecipient, KdfDescriptor,
+        PassphraseRecipient, RecipientRecord, RecoverySecretRecord,
     },
     policy::FidoStorage,
     transcript,
@@ -28,6 +28,7 @@ const FIDO_SUITE: [u8; 1] = [2];
 const COMBINED_SUITE: [u8; 1] = [3];
 const RECOVERY_SECRET_SUITE: [u8; 1] = [4];
 const MANAGED_FIDO_SUITE: [u8; 1] = [5];
+const FIDO_AND_LOCAL_SECRET_SUITE: [u8; 1] = [6];
 const ARGON2ID_KDF: [u8; 1] = [1];
 const ROOT_BYTES: usize = 32;
 const TAG_BYTES: usize = 16;
@@ -38,9 +39,13 @@ const RECIPIENT_CONTEXT_DOMAIN: &[u8] = b"fido_key_wrap/format_1/recipient_conte
 const PRF_INPUT_DOMAIN: &[u8] = b"fido_key_wrap/format_1/prf_input";
 const PASSPHRASE_KEY_DOMAIN: &[u8] = b"fido_key_wrap/format_1/passphrase_key";
 const FIDO_KEY_DOMAIN: &[u8] = b"fido_key_wrap/format_1/fido_key";
+const FIDO_LOCAL_FIDO_KEY_DOMAIN: &[u8] = b"fido_key_wrap/format_1/fido_local_fido_key";
+const FIDO_LOCAL_SECRET_KEY_DOMAIN: &[u8] = b"fido_key_wrap/format_1/fido_local_secret_key";
+const FIDO_LOCAL_COMBINED_KEY_DOMAIN: &[u8] = b"fido_key_wrap/format_1/fido_local_combined_key";
 const RECOVERY_SECRET_KEY_DOMAIN: &[u8] = b"fido_key_wrap/format_1/recovery_secret_key";
 const PASSPHRASE_AAD_DOMAIN: &[u8] = b"fido_key_wrap/format_1/passphrase_aad";
 const FIDO_AAD_DOMAIN: &[u8] = b"fido_key_wrap/format_1/fido_aad";
+const FIDO_LOCAL_AAD_DOMAIN: &[u8] = b"fido_key_wrap/format_1/fido_local_aad";
 const RECOVERY_SECRET_AAD_DOMAIN: &[u8] = b"fido_key_wrap/format_1/recovery_secret_aad";
 const COMBINED_PASSPHRASE_AAD_DOMAIN: &[u8] = b"fido_key_wrap/format_1/combined_passphrase_aad";
 const COMBINED_FIDO_AAD_DOMAIN: &[u8] = b"fido_key_wrap/format_1/combined_fido_aad";
@@ -107,15 +112,34 @@ pub(crate) fn derive_fido_key(
     envelope_id: &[u8; 32],
     verified_prf_result: &[u8; 32],
 ) -> Result<DerivedKey> {
-    if matches!(
+    if !matches!(
         recipient,
-        RecipientRecord::Passphrase(_) | RecipientRecord::RecoverySecret(_)
+        RecipientRecord::Fido(_) | RecipientRecord::FidoAndPassphrase(_)
     ) {
         return Err(Error::InvalidEnvelope);
     }
     let context = recipient_context(recipient, application, envelope_id)?;
     let info = transcript::encode(&[FIDO_KEY_DOMAIN, &context])?;
     derive_key(verified_prf_result, envelope_id, &info)
+}
+
+pub(crate) fn derive_fido_local_key(
+    recipient: &FidoAndLocalSecretRecipient,
+    application: &ApplicationId,
+    envelope_id: &[u8; 32],
+    verified_prf_result: &[u8; 32],
+    local_secret: &LocalSecret,
+) -> Result<DerivedKey> {
+    let context = fido_local_context(recipient, application, envelope_id)?;
+    let fido_info = transcript::encode(&[FIDO_LOCAL_FIDO_KEY_DOMAIN, &context])?;
+    let fido_key = derive_key(verified_prf_result, envelope_id, &fido_info)?;
+    let local_info = transcript::encode(&[FIDO_LOCAL_SECRET_KEY_DOMAIN, &context])?;
+    let local_key = derive_key(local_secret.bytes(), envelope_id, &local_info)?;
+    let combined_info = transcript::encode(&[FIDO_LOCAL_COMBINED_KEY_DOMAIN, &context])?;
+    let key = derive_key(fido_key.as_bytes(), local_key.as_bytes(), &combined_info)?;
+    drop(fido_key);
+    drop(local_key);
+    Ok(key)
 }
 
 pub(crate) fn derive_recovery_secret_key(
@@ -208,6 +232,30 @@ pub(crate) fn unwrap_fido_root(
     let context = fido_context(recipient, application, envelope_id)?;
     let aad = transcript::encode(&[FIDO_AAD_DOMAIN, &context])?;
     let root = decrypt_fixed(key, &recipient.fido_nonce, &recipient.wrapped_root, &aad)?;
+    Ok(RootKey::from_zeroizing(root))
+}
+
+pub(crate) fn wrap_fido_local_root(
+    recipient: &FidoAndLocalSecretRecipient,
+    application: &ApplicationId,
+    envelope_id: &[u8; 32],
+    root: &RootKey,
+    key: &DerivedKey,
+) -> Result<[u8; WRAPPED_ROOT_BYTES]> {
+    let context = fido_local_context(recipient, application, envelope_id)?;
+    let aad = transcript::encode(&[FIDO_LOCAL_AAD_DOMAIN, &context])?;
+    encrypt_fixed(key, &recipient.wrap_nonce, root.bytes(), &aad)
+}
+
+pub(crate) fn unwrap_fido_local_root(
+    recipient: &FidoAndLocalSecretRecipient,
+    application: &ApplicationId,
+    envelope_id: &[u8; 32],
+    key: &DerivedKey,
+) -> Result<RootKey> {
+    let context = fido_local_context(recipient, application, envelope_id)?;
+    let aad = transcript::encode(&[FIDO_LOCAL_AAD_DOMAIN, &context])?;
+    let root = decrypt_fixed(key, &recipient.wrap_nonce, &recipient.wrapped_root, &aad)?;
     Ok(RootKey::from_zeroizing(root))
 }
 
@@ -329,6 +377,9 @@ fn recipient_context_transcript(
         RecipientRecord::FidoAndPassphrase(record) => {
             combined_context_transcript(record, application, envelope_id)
         }
+        RecipientRecord::FidoAndLocalSecret(record) => {
+            fido_local_context_transcript(record, application, envelope_id)
+        }
     }
 }
 
@@ -428,6 +479,26 @@ fn combined_context_transcript(
     ])
 }
 
+fn fido_local_context_transcript(
+    recipient: &FidoAndLocalSecretRecipient,
+    application: &ApplicationId,
+    envelope_id: &[u8; 32],
+) -> Result<Vec<u8>> {
+    transcript::encode(&[
+        RECIPIENT_CONTEXT_DOMAIN,
+        &FORMAT,
+        &FIDO_AND_LOCAL_SECRET_SUITE,
+        application.as_str().as_bytes(),
+        envelope_id,
+        recipient.id.as_bytes(),
+        recipient.label.as_bytes(),
+        &recipient.credential_id,
+        recipient.public_key.as_bytes(),
+        &recipient.prf_nonce,
+        &recipient.wrap_nonce,
+    ])
+}
+
 fn passphrase_context(
     recipient: &PassphraseRecipient,
     application: &ApplicationId,
@@ -480,6 +551,19 @@ fn combined_context(
     .into())
 }
 
+fn fido_local_context(
+    recipient: &FidoAndLocalSecretRecipient,
+    application: &ApplicationId,
+    envelope_id: &[u8; 32],
+) -> Result<[u8; 32]> {
+    Ok(Sha256::digest(fido_local_context_transcript(
+        recipient,
+        application,
+        envelope_id,
+    )?)
+    .into())
+}
+
 fn prf_input_transcript(context: &[u8; 32]) -> Result<Vec<u8>> {
     transcript::encode(&[PRF_INPUT_DOMAIN, context])
 }
@@ -493,7 +577,9 @@ fn derive_passphrase_key_inner(
 ) -> Result<DerivedKey> {
     let kdf = match recipient {
         RecipientRecord::Passphrase(record) => record.kdf,
-        RecipientRecord::RecoverySecret(_) | RecipientRecord::Fido(_) => {
+        RecipientRecord::RecoverySecret(_)
+        | RecipientRecord::Fido(_)
+        | RecipientRecord::FidoAndLocalSecret(_) => {
             return Err(Error::InvalidEnvelope);
         }
         RecipientRecord::FidoAndPassphrase(record) => record.kdf,
@@ -631,6 +717,8 @@ mod tests {
         include_str!("../../../test-vectors/format-1-fido-presence-plus-passphrase.txt");
     const COMBINED_UV_VECTOR: &str =
         include_str!("../../../test-vectors/format-1-fido-user-verification-plus-passphrase.txt");
+    const FIDO_LOCAL_VECTOR: &str =
+        include_str!("../../../test-vectors/format-1-fido-presence-plus-local-secret.txt");
     const MIXED_VECTOR: &str = include_str!("../../../test-vectors/format-1-mixed.txt");
 
     fn field<'a>(vector: &'a str, name: &str) -> &'a str {
@@ -839,6 +927,166 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered.bytes(), expected_root.bytes());
+    }
+
+    #[test]
+    fn fido_local_vector_matches_every_intermediate() {
+        let envelope = envelope(FIDO_LOCAL_VECTOR);
+        let recipient = &envelope.recipients[0];
+        let RecipientRecord::FidoAndLocalSecret(record) = recipient else {
+            panic!("fixture has the wrong suite");
+        };
+        let context_transcript =
+            fido_local_context_transcript(record, &envelope.application_id, &envelope.envelope_id)
+                .unwrap();
+        assert_eq!(
+            context_transcript,
+            hex(FIDO_LOCAL_VECTOR, "recipient_context_transcript")
+        );
+        let context =
+            recipient_context(recipient, &envelope.application_id, &envelope.envelope_id).unwrap();
+        assert_eq!(context, array(FIDO_LOCAL_VECTOR, "recipient_context"));
+        assert_eq!(
+            prf_input_transcript(&context).unwrap(),
+            hex(FIDO_LOCAL_VECTOR, "prf_input_transcript")
+        );
+        assert_eq!(
+            prf_input(recipient, &envelope.application_id, &envelope.envelope_id).unwrap(),
+            array(FIDO_LOCAL_VECTOR, "prf_input")
+        );
+
+        let fido_info = transcript::encode(&[FIDO_LOCAL_FIDO_KEY_DOMAIN, &context]).unwrap();
+        assert_eq!(fido_info, hex(FIDO_LOCAL_VECTOR, "fido_key_info"));
+        let fido_key = derive_key(
+            &array::<32>(FIDO_LOCAL_VECTOR, "verified_prf_result"),
+            &envelope.envelope_id,
+            &fido_info,
+        )
+        .unwrap();
+        assert_eq!(fido_key.as_bytes(), &array(FIDO_LOCAL_VECTOR, "fido_key"));
+
+        let mut local_bytes = array(FIDO_LOCAL_VECTOR, "local_secret");
+        let local = LocalSecret::import(&mut local_bytes);
+        assert_eq!(local_bytes, [0; 32]);
+        let local_info = transcript::encode(&[FIDO_LOCAL_SECRET_KEY_DOMAIN, &context]).unwrap();
+        assert_eq!(local_info, hex(FIDO_LOCAL_VECTOR, "local_key_info"));
+        let local_key = derive_key(local.bytes(), &envelope.envelope_id, &local_info).unwrap();
+        assert_eq!(local_key.as_bytes(), &array(FIDO_LOCAL_VECTOR, "local_key"));
+        let combined_info =
+            transcript::encode(&[FIDO_LOCAL_COMBINED_KEY_DOMAIN, &context]).unwrap();
+        assert_eq!(combined_info, hex(FIDO_LOCAL_VECTOR, "combined_key_info"));
+        let expected_key =
+            derive_key(fido_key.as_bytes(), local_key.as_bytes(), &combined_info).unwrap();
+        assert_eq!(
+            expected_key.as_bytes(),
+            &array(FIDO_LOCAL_VECTOR, "combined_key")
+        );
+        let key = derive_fido_local_key(
+            record,
+            &envelope.application_id,
+            &envelope.envelope_id,
+            &array(FIDO_LOCAL_VECTOR, "verified_prf_result"),
+            &local,
+        )
+        .unwrap();
+        assert_eq!(key.as_bytes(), expected_key.as_bytes());
+        assert!(
+            derive_fido_key(
+                recipient,
+                &envelope.application_id,
+                &envelope.envelope_id,
+                &array(FIDO_LOCAL_VECTOR, "verified_prf_result"),
+            )
+            .is_err()
+        );
+
+        let aad = transcript::encode(&[FIDO_LOCAL_AAD_DOMAIN, &context]).unwrap();
+        assert_eq!(aad, hex(FIDO_LOCAL_VECTOR, "fido_local_aad"));
+        let expected_root = root(FIDO_LOCAL_VECTOR);
+        check_envelope_mac_intermediates(FIDO_LOCAL_VECTOR, &envelope, &expected_root);
+        assert_eq!(
+            wrap_fido_local_root(
+                record,
+                &envelope.application_id,
+                &envelope.envelope_id,
+                &expected_root,
+                &key,
+            )
+            .unwrap(),
+            array(FIDO_LOCAL_VECTOR, "wrapped_root")
+        );
+        let recovered = unwrap_fido_local_root(
+            record,
+            &envelope.application_id,
+            &envelope.envelope_id,
+            &key,
+        )
+        .unwrap();
+        assert!(same_root(&expected_root, &recovered));
+    }
+
+    #[test]
+    fn fido_local_wrapping_rejects_every_context_transplant() {
+        let fixture = envelope(FIDO_LOCAL_VECTOR);
+        let RecipientRecord::FidoAndLocalSecret(record) = &fixture.recipients[0] else {
+            panic!("fixture has the wrong suite");
+        };
+        let mut local_bytes = array(FIDO_LOCAL_VECTOR, "local_secret");
+        let local = LocalSecret::import(&mut local_bytes);
+        let key = derive_fido_local_key(
+            record,
+            &fixture.application_id,
+            &fixture.envelope_id,
+            &array(FIDO_LOCAL_VECTOR, "verified_prf_result"),
+            &local,
+        )
+        .unwrap();
+        let rejects = |candidate: &FidoAndLocalSecretRecipient,
+                       application: &ApplicationId,
+                       envelope_id: &[u8; 32]| {
+            assert!(matches!(
+                unwrap_fido_local_root(candidate, application, envelope_id, &key),
+                Err(Error::UnlockFailed)
+            ));
+        };
+
+        rejects(
+            record,
+            &ApplicationId::new("other.example").unwrap(),
+            &fixture.envelope_id,
+        );
+
+        let mut envelope_id = fixture.envelope_id;
+        envelope_id[0] ^= 1;
+        rejects(record, &fixture.application_id, &envelope_id);
+
+        let mut candidate = record.clone();
+        candidate.id = crate::RecipientId::from_bytes([0xa5; 32]);
+        rejects(&candidate, &fixture.application_id, &fixture.envelope_id);
+
+        let mut candidate = record.clone();
+        candidate.label.push('x');
+        rejects(&candidate, &fixture.application_id, &fixture.envelope_id);
+
+        let mut candidate = record.clone();
+        candidate.credential_id.push(0xa5);
+        rejects(&candidate, &fixture.application_id, &fixture.envelope_id);
+
+        let other = envelope(FIDO_PRESENCE_VECTOR);
+        let RecipientRecord::Fido(other) = &other.recipients[0] else {
+            panic!("fixture has the wrong suite");
+        };
+        let mut candidate = record.clone();
+        candidate.public_key = other.public_key.clone();
+        rejects(&candidate, &fixture.application_id, &fixture.envelope_id);
+
+        let mut candidate = record.clone();
+        candidate.prf_nonce[0] ^= 1;
+        rejects(&candidate, &fixture.application_id, &fixture.envelope_id);
+
+        let mut candidate = record.clone();
+        candidate.wrap_nonce[0] ^= 1;
+        rejects(&candidate, &fixture.application_id, &fixture.envelope_id);
     }
 
     #[test]
@@ -1348,6 +1596,7 @@ mod tests {
                 RecipientRecord::RecoverySecret(record) => record.label.push('x'),
                 RecipientRecord::Fido(record) => record.label.push('x'),
                 RecipientRecord::FidoAndPassphrase(record) => record.label.push('x'),
+                RecipientRecord::FidoAndLocalSecret(record) => record.label.push('x'),
             }
             rejects(&candidate);
         }
@@ -1368,7 +1617,7 @@ mod tests {
     #[test]
     fn mixed_recipient_body_and_whole_envelope_mac_match_vector() {
         let envelope = envelope(MIXED_VECTOR);
-        assert_eq!(envelope.recipients.len(), 8);
+        assert_eq!(envelope.recipients.len(), 9);
         let root = root(MIXED_VECTOR);
         check_envelope_mac_intermediates(MIXED_VECTOR, &envelope, &root);
         verify_envelope_mac(&envelope, &root).unwrap();

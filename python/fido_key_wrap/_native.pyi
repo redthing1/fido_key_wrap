@@ -1,4 +1,4 @@
-from typing import Final
+from typing import ClassVar, Final
 
 FIDO_SUPPORT: Final[bool]
 
@@ -59,6 +59,7 @@ class Policy:
     MANAGED_FIDO_USER_VERIFICATION: Final[Policy]
     FIDO_PRESENCE_AND_PASSPHRASE: Final[Policy]
     FIDO_USER_VERIFICATION_AND_PASSPHRASE: Final[Policy]
+    FIDO_PRESENCE_AND_LOCAL_SECRET: Final[Policy]
 
 class FidoPolicy:
     PRESENCE: Final[FidoPolicy]
@@ -159,20 +160,36 @@ class KeyEnvelope:
     def recipients(self) -> tuple[RecipientSummary, ...]: ...
 
 class RootKey:
+    __hash__: ClassVar[None]
     @staticmethod
     def from_bytearray(material: bytearray) -> RootKey: ...
     def export(self) -> bytearray: ...
 
 class RecoverySecret:
+    __hash__: ClassVar[None]
     @staticmethod
     def from_bytearray(material: bytearray) -> RecoverySecret: ...
     def export(self) -> bytearray: ...
 
 class RecoverySecretRecipient:
+    __hash__: ClassVar[None]
     @property
     def recipient_id(self) -> RecipientId: ...
     @property
     def secret(self) -> RecoverySecret: ...
+
+class LocalSecret:
+    __hash__: ClassVar[None]
+    @staticmethod
+    def from_bytearray(material: bytearray) -> LocalSecret: ...
+    def export(self) -> bytearray: ...
+
+class LocalSecretRecipient:
+    __hash__: ClassVar[None]
+    @property
+    def recipient_id(self) -> RecipientId: ...
+    @property
+    def secret(self) -> LocalSecret: ...
 
 class SelectionPrompt:
     @property
@@ -287,6 +304,31 @@ class KeyProtector:
         root: RootKey,
         label: str,
     ) -> tuple[KeyEnvelope, RecoverySecretRecipient]: ...
+    def create_root_with_fido_and_local_secret(
+        self,
+        label: str,
+        interaction: object,
+    ) -> tuple[RootKey, KeyEnvelope, LocalSecretRecipient]: ...
+    def protect_root_with_fido_and_local_secret(
+        self,
+        root: RootKey,
+        label: str,
+        interaction: object,
+    ) -> tuple[KeyEnvelope, LocalSecretRecipient]: ...
+    def add_fido_and_local_secret(
+        self,
+        envelope: KeyEnvelope,
+        root: RootKey,
+        label: str,
+        interaction: object,
+    ) -> tuple[KeyEnvelope, LocalSecretRecipient]: ...
+    def unlock_with_fido_and_local_secret(
+        self,
+        envelope: KeyEnvelope,
+        recipient: RecipientId,
+        secret: LocalSecret,
+        interaction: object,
+    ) -> RootKey: ...
 
 class AuthenticatorIssue:
     UNAVAILABLE: Final[AuthenticatorIssue]

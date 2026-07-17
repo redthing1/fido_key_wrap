@@ -204,6 +204,7 @@ impl FakeAuthenticator {
         let credential_id = match envelope.find(recipient)? {
             RecipientRecord::Fido(record) => record.credential_id.clone(),
             RecipientRecord::FidoAndPassphrase(record) => record.credential_id.clone(),
+            RecipientRecord::FidoAndLocalSecret(record) => record.credential_id.clone(),
             RecipientRecord::Passphrase(_) | RecipientRecord::RecoverySecret(_) => {
                 return Err(Error::InvalidEnvelope);
             }
@@ -321,9 +322,9 @@ const fn failure_kind(failure: FakeFailure) -> FailureKind {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Enrollment, Error, FidoPolicy, Interaction, InteractionError, Passphrase,
-        PassphraseParameters, PassphrasePrompt, PassphrasePurpose, Pin, PinPrompt, SelectionPrompt,
-        TouchPrompt,
+        Enrollment, Error, FidoPolicy, Interaction, InteractionError, LocalSecret, Passphrase,
+        PassphraseParameters, PassphrasePrompt, PassphrasePurpose, Pin, PinPrompt, RecipientPolicy,
+        SelectionPrompt, TouchPrompt,
     };
 
     use super::*;
@@ -577,6 +578,122 @@ mod tests {
             .unlock(&envelope, recipient, &mut interaction)
             .unwrap();
         assert_eq!(interaction.events, ["assertion touch", "unlock passphrase"]);
+    }
+
+    #[test]
+    fn fido_and_local_secret_requires_both_factors() {
+        let mut authenticator = FakeAuthenticator::new(application());
+        let mut interaction = RecordingInteraction::default();
+        let (root, envelope, local) = authenticator
+            .protector()
+            .create_root_with_fido_and_local_secret("paired machine", &mut interaction)
+            .unwrap();
+
+        assert_eq!(
+            envelope.recipients()[0].policy(),
+            RecipientPolicy::FidoPresenceAndLocalSecret
+        );
+        assert_eq!(
+            interaction.events,
+            ["pin", "enrollment touch", "assertion touch"]
+        );
+        local.secret().expose(|secret| {
+            assert!(
+                !envelope
+                    .encode()
+                    .windows(secret.len())
+                    .any(|window| window == secret)
+            );
+        });
+
+        let assertions = authenticator.counters().assertions();
+        assert!(matches!(
+            authenticator
+                .protector()
+                .unlock(&envelope, local.recipient_id(), &mut interaction),
+            Err(Error::UnlockFailed)
+        ));
+        assert_eq!(authenticator.counters().assertions(), assertions);
+
+        let recovered = authenticator
+            .protector()
+            .unlock_with_fido_and_local_secret(
+                &envelope,
+                local.recipient_id(),
+                local.secret(),
+                &mut interaction,
+            )
+            .unwrap();
+        assert_eq!(recovered.bytes(), root.bytes());
+
+        let mut wrong_bytes = [0x5a; 32];
+        let wrong = LocalSecret::import(&mut wrong_bytes);
+        assert_eq!(wrong_bytes, [0; 32]);
+        assert!(matches!(
+            authenticator.protector().unlock_with_fido_and_local_secret(
+                &envelope,
+                local.recipient_id(),
+                &wrong,
+                &mut interaction,
+            ),
+            Err(Error::UnlockFailed)
+        ));
+
+        authenticator
+            .forget_recipient(&envelope, local.recipient_id())
+            .unwrap();
+        assert!(matches!(
+            authenticator.protector().unlock_with_fido_and_local_secret(
+                &envelope,
+                local.recipient_id(),
+                local.secret(),
+                &mut interaction,
+            ),
+            Err(Error::Authenticator(
+                AuthenticatorFailure::CredentialUnavailable
+            ))
+        ));
+    }
+
+    #[test]
+    fn fido_and_local_secret_addition_is_transactional() {
+        let mut authenticator = FakeAuthenticator::new(application());
+        let (root, mut envelope, _recovery) = authenticator
+            .protector()
+            .create_root_with_recovery_secret("recovery")
+            .unwrap();
+        let before = envelope.encode();
+        authenticator
+            .fail_next(FakeStep::Assertion, FakeFailure::Transport)
+            .unwrap();
+
+        let mut interaction = RecordingInteraction::default();
+        assert!(matches!(
+            authenticator.protector().add_fido_and_local_secret(
+                &mut envelope,
+                &root,
+                "paired machine",
+                &mut interaction,
+            ),
+            Err(Error::Authenticator(AuthenticatorFailure::Transport))
+        ));
+        assert_eq!(envelope.encode(), before);
+
+        let local = authenticator
+            .protector()
+            .add_fido_and_local_secret(&mut envelope, &root, "paired machine", &mut interaction)
+            .unwrap();
+        assert_ne!(envelope.encode(), before);
+        let recovered = authenticator
+            .protector()
+            .unlock_with_fido_and_local_secret(
+                &envelope,
+                local.recipient_id(),
+                local.secret(),
+                &mut interaction,
+            )
+            .unwrap();
+        assert_eq!(recovered.bytes(), root.bytes());
     }
 
     #[test]

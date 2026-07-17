@@ -2,12 +2,14 @@
 members = [
     "crates/fido-key-wrap",
     "crates/fido-key-wrap-libfido2",
+    "crates/fido-key-wrap-platform",
     "crates/fido-key-wrap-python",
     "crates/fkw-demo",
 ]
 default-members = [
     "crates/fido-key-wrap",
     "crates/fido-key-wrap-libfido2",
+    "crates/fido-key-wrap-platform",
     "crates/fkw-demo",
 ]
 resolver = "3"

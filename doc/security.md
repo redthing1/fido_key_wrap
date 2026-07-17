@@ -22,6 +22,11 @@ a managed fido recipient uses the same verified `hmac-secret` construction with
 a discoverable credential. its distinct suite binds the managed storage
 semantics into the wrapping context.
 
+a fido-presence and local-secret recipient derives independent keys from the
+verified `hmac-secret` result and a library-generated 256-bit local secret. a
+third hkdf extraction combines them before one authenticated root wrap. the
+application stores the local secret outside the envelope.
+
 a combined recipient encrypts the root under the passphrase key and encrypts
 that result under the fido key. unlock verifies and removes the fido layer
 before requesting the passphrase.
@@ -68,12 +73,21 @@ enrollment also confirms the exact credential through authenticated credential
 management before returning it. enrollment, verification, and retirement use
 pin-backed user verification under either managed policy.
 
+`fido presence and local secret` requires the dedicated credential, a touch,
+and the exact 32-byte local secret returned at enrollment. enrollment itself
+requires the authenticator pin and a touch. recovery requests exact presence
+without user verification, so daily use needs no pin.
+
+the generic one-factor unlock path rejects this recipient. only the dedicated
+two-factor method accepts it, and the final envelope mac must authenticate
+before the root is returned.
+
 ## credential storage
 
-ordinary fido and combined recipients request a non-discoverable credential
-with `rk=false`. the credential id is stored in the envelope and supplied to
-the authenticator for each assertion. these recipients do not consume a
-discoverable credential slot.
+ordinary fido, combined, and local-secret recipients request a
+non-discoverable credential with `rk=false`. the credential id is stored in the
+envelope and supplied to the authenticator for each assertion. these recipients
+do not consume a discoverable credential slot.
 
 credential-management tools enumerate and delete discoverable credentials;
 they do not manage this envelope-held credential id. removing a recipient
@@ -168,6 +182,24 @@ derived fido material can test passphrase guesses offline. protection against
 envelope-only guessing therefore assumes that no valid unlock has been
 captured.
 
+### fido presence and local secret
+
+a copied envelope alone is insufficient. recovery requires both the dedicated
+security-key credential and the separately stored local secret.
+
+the local secret raises the bar for theft of the security key: possession and
+touch alone no longer recover the route. theft of machine storage alone is also
+insufficient without the security key. compromise of the paired host during a
+valid unlock can capture the local secret, prf result, derived key, and root.
+
+the application controls local-secret storage and publication. the optional
+platform crate supplies exact native storage operations on macos and linux.
+the chosen store's access policy, backup behavior, synchronization, and
+migration determine which machines are paired. copying the secret extends the
+pairing; deleting it only disables copies that have no other copy of that
+secret. the non-discoverable credential cannot be retired individually, so
+this route does not provide cryptographic erasure of retained envelopes.
+
 ## host and native trust
 
 the process is trusted while creating or opening a recipient. it briefly owns
@@ -219,8 +251,9 @@ adopting values from the envelope.
 
 ## rollback, removal, and rotation
 
-an old complete envelope contains a valid old mac and remains usable. removing
-a recipient or changing a passphrase affects only the updated copy.
+an old complete envelope remains cryptographically valid and usable while its
+factors remain available. removing a recipient or changing a passphrase affects
+only the updated copy.
 
 successful managed retirement is different: every copy referring to that exact
 credential loses that route. this does not establish that the root is destroyed;
@@ -228,10 +261,16 @@ all other recipients must be accounted for separately. retirement leaves the
 envelope unchanged so the application can order credential deletion and its
 own atomic storage update safely.
 
+deleting every stored copy of a local secret also disables that exact route in
+retained envelopes. this depends on accounting for platform storage,
+synchronization, and backups. a confirmed native-store deletion does not prove
+that no restored or separately copied value exists.
+
 the envelope has no clock, trusted counter, or monotonic state. applications
 that need rollback detection must keep freshness state elsewhere.
 
-root rotation is the revocation boundary. replacing the root and re-encrypting
+root rotation is the revocation boundary that does not depend on accounting for
+individual routes and factor copies. replacing the root and re-encrypting
 application data prevents an old envelope from opening future data. the
 application owns this operation because it alone can decrypt, verify,
 re-encrypt, and atomically replace its data.
@@ -252,11 +291,13 @@ a bounded blocking pool and limit simultaneous work.
 
 ## secret lifetime
 
-`RootKey`, `RecoverySecret`, `Passphrase`, and `Pin` have no `Clone` or
-`Display`, redact `Debug`, and use zeroizing storage. their explicit exposure
-methods can still let application code copy or print secrets. owned argon2
-memory, kdf output, prf result, derived keys, decrypted layers, and transient
-root buffers are cleared when dropped.
+`RootKey`, `RecoverySecret`, `LocalSecret`, `Passphrase`, and `Pin` have no
+`Clone` or `Display`, redact `Debug`, and use zeroizing storage. their explicit
+exposure methods can still let application code copy or print secrets.
+secret-bearing buffers and value types owned by this repository are cleared
+when dropped, including argon2 memory, kdf output, prf results, derived keys,
+decrypted layers, and transient root buffers. cryptographic dependencies may
+hold their own internal state outside that guarantee.
 
 zeroization reduces ordinary secret lifetime; it is not forensic erasure. it
 cannot guarantee removal from registers, compiler temporaries, allocator
@@ -268,9 +309,10 @@ application. it also cannot protect a compromised process.
 the security model excludes:
 
 - application data encryption or storage
+- recovery-secret persistence or application-specific local-secret stores
 - protection from malware during a valid unlock
 - availability, backup, and rollback protection
-- deletion guarantees outside exact managed-credential retirement
+- global deletion or cryptographic erasure of copied or restored local secrets
 - cleanup of an unpublished managed credential after process termination;
   ambiguous creation and cleanup are reported
 - a trusted user interface for passphrase, pin, or touch prompts

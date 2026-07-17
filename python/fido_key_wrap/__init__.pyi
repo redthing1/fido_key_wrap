@@ -10,6 +10,8 @@ from ._native import FidoConfig as FidoConfig
 from ._native import FidoPolicy as FidoPolicy
 from ._native import KeyEnvelope as KeyEnvelope
 from ._native import KeyProtector as KeyProtector
+from ._native import LocalSecret as LocalSecret
+from ._native import LocalSecretRecipient as LocalSecretRecipient
 from ._native import Operation as Operation
 from ._native import PassphraseLimits as PassphraseLimits
 from ._native import PassphraseParameters as PassphraseParameters

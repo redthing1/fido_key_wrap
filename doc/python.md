@@ -76,7 +76,7 @@ operation returns to python.
 
 ## recovery policies
 
-`Policy` contains the complete eight-route model:
+`Policy` contains the complete nine-route model:
 
 - `PASSPHRASE`
 - `RECOVERY_SECRET`
@@ -86,6 +86,7 @@ operation returns to python.
 - `MANAGED_FIDO_USER_VERIFICATION`
 - `FIDO_PRESENCE_AND_PASSPHRASE`
 - `FIDO_USER_VERIFICATION_AND_PASSPHRASE`
+- `FIDO_PRESENCE_AND_LOCAL_SECRET`
 
 passphrase-bearing enrollments use `PassphraseParameters.desktop()` unless
 explicit parameters are supplied. the desktop profile uses 256 mib, three
@@ -134,6 +135,44 @@ root = protector.unlock_with_recovery_secret(
 `from_bytearray` requires exactly 32 bytes and clears its input. the application
 stores the secret separately from the envelope. it is generated binary key
 material, not a passphrase or a human recovery code.
+
+a paired-machine route also uses explicit methods. it combines a generated
+local secret with security-key presence:
+
+```python
+root, envelope, local = protector.create_root_with_fido_and_local_secret(
+    "paired machine", interaction
+)
+
+stored_secret = local.secret.export()
+try:
+    store_in_platform_secret_storage(
+        trusted_application_id,
+        local.recipient_id,
+        stored_secret,
+    )
+finally:
+    stored_secret[:] = b"\0" * len(stored_secret)
+
+secret_bytes = load_platform_secret_as_bytearray(
+    trusted_application_id,
+    local.recipient_id,
+)
+secret = fkw.LocalSecret.from_bytearray(secret_bytes)
+root = protector.unlock_with_fido_and_local_secret(
+    envelope, local.recipient_id, secret, interaction
+)
+```
+
+enrollment requires a pin and touch. recovery requires the local secret and a
+touch. `protect_root_with_fido_and_local_secret` protects an existing random
+root, and `add_fido_and_local_secret` returns a replacement envelope plus its
+new local secret. the python package does not choose a platform storage service
+or persist the secret. key each entry by a trusted application id and recipient
+id. store it durably before publishing the envelope. after a definite
+publication failure, remove the unpublished secret; after an uncertain result,
+retain it and reconcile the container. when removing the route, publish the
+replacement envelope before deleting the secret.
 
 `FidoConfig` supplies trusted operation timeout, selection timeout, and device
 count limits. pass it as the `fido_config` keyword when constructing a
@@ -220,8 +259,8 @@ states, timeout, authenticator busy, unavailable credential, and transport
 failure have distinct codes. managed capacity exhaustion and uncertain
 retirement are also distinct. ambiguous managed enrollment or cleanup reports
 `ErrorCode.FIDO_CREDENTIAL_MAY_REMAIN`. wrong passphrases, recovery secrets,
-and candidate roots that do not authenticate the envelope remain one generic
-`ErrorCode.UNLOCK_FAILED` result.
+local secrets, and candidate roots that do not authenticate the envelope remain
+one generic `ErrorCode.UNLOCK_FAILED` result.
 
 operations are synchronous and release the python interpreter while rust runs
 argon2 or fido work. different protectors may run concurrently. overlapping or

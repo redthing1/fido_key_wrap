@@ -39,6 +39,7 @@ allocation.
 | suite | fido and passphrase | `3` |
 | suite | recovery secret | `4` |
 | suite | managed fido | `5` |
+| suite | fido presence and local secret | `6` |
 | fido policy | presence | `1` |
 | fido policy | user verification | `2` |
 | kdf | argon2id | `1` |
@@ -52,8 +53,12 @@ fido_key_wrap/format_1/recipient_context
 fido_key_wrap/format_1/prf_input
 fido_key_wrap/format_1/passphrase_key
 fido_key_wrap/format_1/fido_key
+fido_key_wrap/format_1/fido_local_fido_key
+fido_key_wrap/format_1/fido_local_secret_key
+fido_key_wrap/format_1/fido_local_combined_key
 fido_key_wrap/format_1/passphrase_aad
 fido_key_wrap/format_1/fido_aad
+fido_key_wrap/format_1/fido_local_aad
 fido_key_wrap/format_1/combined_passphrase_aad
 fido_key_wrap/format_1/combined_fido_aad
 fido_key_wrap/format_1/recovery_secret_key
@@ -75,6 +80,7 @@ the ascii bytes of each displayed string are used directly.
 | `rid` | 32 bytes | random recipient id |
 | `root` | 32 bytes | random application root |
 | `rs` | 32 bytes | random recovery secret |
+| `ls` | 32 bytes | random local secret |
 | `cid` | 1–1,024 bytes | fido credential id |
 | `pk` | 64 bytes | es256 public key as `x || y` |
 | `fp` | 1 byte | fido policy code |
@@ -83,13 +89,15 @@ the ascii bytes of each displayed string are used directly.
 | `s` | 16 bytes | random argon2 salt |
 | `npass` | 12 bytes | random passphrase-layer nonce |
 | `nr` | 12 bytes | random recovery-secret nonce |
+| `nl` | 12 bytes | random local-secret route nonce |
 
 ### generation
 
 root-creation methods generate `root` with the operating-system random source.
 protection methods instead accept caller-supplied root bytes, which must already
-be uniformly random. each new recovery-secret route also generates `rs` from
-this source. library-generated ids, nonces, and salts use the same source.
+be uniformly random. each new recovery-secret route generates `rs`, and each
+new local-secret route generates `ls`, from this source. library-generated ids,
+nonces, and salts use the same source.
 recipient ids and passphrase salts use bounded collision rejection within an
 envelope; rewrap also rejects a repeated prior nonce. recipient ids are public
 random identifiers, not credential or physical-device identities.
@@ -97,9 +105,9 @@ random identifiers, not credential or physical-device identities.
 ### validation
 
 the p-256 point encoded by `pk` must be valid. labels are 1–64 printable ascii
-bytes, with no leading or trailing space. the recovery-secret context includes
-its label. other recipient contexts omit labels. the final envelope mac
-authenticates every label.
+bytes, with no leading or trailing space. recovery-secret and local-secret
+contexts include their labels. other recipient contexts omit labels. the final
+envelope mac authenticates every label.
 
 the application id is ascii lowercase dns-shaped text with at least two
 labels. each label contains 1–63 lowercase letters, digits, or `-`, begins and
@@ -152,6 +160,16 @@ c = sha256(t(
 ))
 ```
 
+for a fido-presence and local-secret recipient:
+
+```text
+c = sha256(t(
+  "fido_key_wrap/format_1/recipient_context",
+  f, su, app, eid, rid, label,
+  cid, pk, np, nl
+))
+```
+
 ## passphrase key
 
 passphrases contain 1–1,024 bytes. bytes are used exactly as supplied; there is
@@ -194,7 +212,7 @@ krecovery = hkdf-sha-256(
 
 ### ordinary enrollment
 
-each ordinary fido or combined recipient creates one dedicated
+each ordinary fido, combined, or local-secret recipient creates one dedicated
 non-discoverable es256 credential under relying-party id `app`. creation uses
 fresh random client-data and user-id values, requests `hmac-secret` and
 credential protection, and requires user verification.
@@ -203,6 +221,10 @@ presence credentials use protection optional with the credential id. user
 verification credentials require user verification. the result is accepted
 only after packed attestation, es256, the requested protection, and signed
 `up=1`, `uv=1`, `be=0`, `bs=0` have been verified.
+
+the local-secret suite fixes recovery to presence and uses a distinct
+non-discoverable credential. a fresh exact-presence assertion must succeed
+before the route and local secret are returned.
 
 ### managed enrollment
 
@@ -252,6 +274,38 @@ kfido = hkdf-sha-256(
 )
 ```
 
+### fido-presence and local-secret key
+
+the local-secret suite uses the same exact presence assertion and verified
+extension result `r`, but separate derivation domains:
+
+```text
+kfl_fido = hkdf-sha-256(
+  ikm  = r,
+  salt = eid,
+  info = t("fido_key_wrap/format_1/fido_local_fido_key", c),
+  len  = 32
+)
+
+kfl_local = hkdf-sha-256(
+  ikm  = ls,
+  salt = eid,
+  info = t("fido_key_wrap/format_1/fido_local_secret_key", c),
+  len  = 32
+)
+
+kfl = hkdf-sha-256(
+  ikm  = kfl_fido,
+  salt = kfl_local,
+  info = t("fido_key_wrap/format_1/fido_local_combined_key", c),
+  len  = 32
+)
+```
+
+`kfl_fido` and `kfl_local` are cleared after combination. `ls` is returned to
+the application only after the staged recipient has recovered and
+authenticated the complete envelope.
+
 ### managed verification and retirement
 
 managed verification first authenticates the complete envelope with `root`.
@@ -290,6 +344,13 @@ aad = t("fido_key_wrap/format_1/fido_aad", c)
 wrapped_root = aead(kfido, nf, root, aad)
 ```
 
+a fido-presence and local-secret recipient stores:
+
+```text
+aad = t("fido_key_wrap/format_1/fido_local_aad", c)
+wrapped_root = aead(kfl, nl, root, aad)
+```
+
 a combined recipient stores two layers:
 
 ```text
@@ -300,8 +361,9 @@ outer_aad = t("fido_key_wrap/format_1/combined_fido_aad", c)
 wrapped_root = aead(kfido, nf, inner, outer_aad)
 ```
 
-a wrapped root is 48 bytes for the passphrase, recovery-secret, and fido
-suites. the combined inner value is 48 bytes and its outer value is 64 bytes.
+a wrapped root is 48 bytes for the passphrase, recovery-secret, fido, and
+fido-local-secret suites. the combined inner value is 48 bytes and its outer
+value is 64 bytes.
 combined decryption authenticates the outer fido layer before requesting or
 deriving the passphrase.
 
@@ -354,6 +416,13 @@ a wrong recovery secret, absent or changed recipient id, context change,
 wrapping failure, or final envelope-mac failure returns the same unlock
 failure.
 
+a wrong local secret, a changed authenticated local-recipient field after a
+valid assertion, wrapping failure, or final envelope-mac failure returns the
+same unlock failure. credential lookup and assertion failures can instead
+return a bounded security-key error before local-secret verification. the
+general unlock method rejects this suite; its dedicated method always requires
+both a verified presence assertion and the local secret.
+
 security-key transport and verified-response failures are bounded public error
 classes. native error strings, credential material, prf output, pins,
 passphrases, derived keys, candidate roots, and plaintext are not included in
@@ -393,9 +462,13 @@ managed fido:
 fido and passphrase:
 [3, rid, label, cid, pk, fp, np, nf,
  [1, memory_kib, passes, lanes, s], npass, wrapped_root]
+
+fido presence and local secret:
+[6, rid, label, cid, pk, np, nl, wrapped_root]
 ```
 
-suite 5 accepts `fp=1` for presence and `fp=2` for user verification.
+suite 5 accepts `fp=1` for presence and `fp=2` for user verification. suite 6
+has fixed presence semantics and carries no policy byte.
 
 recipients are ordered by ascending `rid`. ids are unique. fido-bearing
 recipients have unique credential ids, and passphrase-bearing recipients have
@@ -410,6 +483,6 @@ input is rejected before factor interaction.
 ## interoperability vectors
 
 `test-vectors/` contains deterministic format-1 fixtures for every recipient
-policy, an eight-recipient mixed envelope, and the demo container.
+policy, a nine-recipient mixed envelope, and the demo container.
 `test-vectors/generate.py` implements transcript framing, hkdf, cbor, and
 envelope construction independently from the rust code.

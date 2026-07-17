@@ -1,0 +1,37 @@
+[package]
+name = "fido-key-wrap-platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+fido = ["fido-key-wrap/fido"]
+testing = []
+
+[[example]]
+name = "live-pairing"
+required-features = ["fido"]
+
+[dependencies]
+fido-key-wrap = { version = "0.1.0", path = "../fido-key-wrap", default-features = false }
+subtle.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "5.1.0", default-features = false, features = ["rt-async-io-crypto-rust"] }
+# keep the selected zbus line within the workspace rust 1.85 baseline.
+zbus = { version = ">=5.0, <5.14", default-features = false, features = ["async-io", "blocking-api"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+security-framework = { version = "3.7.0", default-features = false, features = ["OSX_10_15"] }
+security-framework-sys = { version = "2.17.0", default-features = false }
+
+[dev-dependencies]
+rpassword.workspace = true
+
+[lints]
+workspace = true

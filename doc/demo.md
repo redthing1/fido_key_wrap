@@ -70,8 +70,8 @@ fido-presence-plus-passphrase
 fido-user-verification-plus-passphrase
 ```
 
-the demo does not store recovery secrets. applications use the library's
-explicit recovery-secret methods and store each generated secret separately.
+the demo does not store recovery or local secrets. applications use the
+library's explicit methods and store each generated secret separately.
 
 examples:
 

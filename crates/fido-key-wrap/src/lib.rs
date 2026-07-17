@@ -12,6 +12,8 @@
 //! allowlist before asking the user for a factor. pass the selected
 //! [`RecipientId`] to [`KeyProtector::unlock`], or to
 //! [`KeyProtector::unlock_with_recovery_secret`] for a recovery-secret route.
+//! fido-presence and local-secret routes use
+//! [`KeyProtector::unlock_with_fido_and_local_secret`].
 //! the library never falls back to another route.
 //!
 //! the application derives its own data key from the recovered root with a
@@ -133,4 +135,6 @@ pub use interaction::{
 };
 pub use policy::{Enrollment, FidoPolicy, PassphraseLimits, PassphraseParameters, RecipientPolicy};
 pub use protector::KeyProtector;
-pub use secret::{RecoverySecret, RecoverySecretRecipient, RootKey};
+pub use secret::{
+    LocalSecret, LocalSecretRecipient, RecoverySecret, RecoverySecretRecipient, RootKey,
+};

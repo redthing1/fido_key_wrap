@@ -37,6 +37,8 @@ pub enum Policy {
     FidoPresenceAndPassphrase = 7,
     #[pyo3(name = "FIDO_USER_VERIFICATION_AND_PASSPHRASE")]
     FidoUserVerificationAndPassphrase = 8,
+    #[pyo3(name = "FIDO_PRESENCE_AND_LOCAL_SECRET")]
+    FidoPresenceAndLocalSecret = 9,
 }
 
 /// the authenticator requirement within a fido policy.
@@ -86,6 +88,7 @@ impl Policy {
             core::RecipientPolicy::FidoAndPassphrase(core::FidoPolicy::UserVerification) => {
                 Self::FidoUserVerificationAndPassphrase
             }
+            core::RecipientPolicy::FidoPresenceAndLocalSecret => Self::FidoPresenceAndLocalSecret,
         }
     }
 
@@ -110,6 +113,7 @@ impl Policy {
             Self::FidoUserVerificationAndPassphrase => {
                 "Policy.FIDO_USER_VERIFICATION_AND_PASSPHRASE"
             }
+            Self::FidoPresenceAndLocalSecret => "Policy.FIDO_PRESENCE_AND_LOCAL_SECRET",
         }
     }
 }
@@ -330,9 +334,12 @@ impl Enrollment {
         policy: Policy,
         parameters: Option<PassphraseParameters>,
     ) -> PyResult<Self> {
-        if policy == Policy::RecoverySecret {
+        if matches!(
+            policy,
+            Policy::RecoverySecret | Policy::FidoPresenceAndLocalSecret
+        ) {
             return Err(PyTypeError::new_err(
-                "recovery secrets use the dedicated KeyProtector recovery methods",
+                "this policy uses dedicated KeyProtector methods",
             ));
         }
         if !policy.uses_passphrase() && parameters.is_some() {
@@ -349,7 +356,9 @@ impl Enrollment {
             (Policy::Passphrase, Some(parameters)) => {
                 core::Enrollment::passphrase_with_parameters(label, parameters.core)
             }
-            (Policy::RecoverySecret, _) => unreachable!("handled above"),
+            (Policy::RecoverySecret | Policy::FidoPresenceAndLocalSecret, _) => {
+                unreachable!("handled above")
+            }
             (Policy::FidoPresence, None) => {
                 core::Enrollment::fido(label, core::FidoPolicy::Presence)
             }
@@ -660,6 +669,128 @@ impl RecoverySecretRecipient {
     fn __reduce_ex__(&self, _protocol: i32) -> PyResult<()> {
         Err(PyTypeError::new_err(
             "recovery secret recipients cannot be pickled",
+        ))
+    }
+}
+
+/// an opaque, zeroizing 256-bit secret held separately by the application.
+#[pyclass(name = "LocalSecret", frozen, module = "fido_key_wrap._native")]
+pub struct LocalSecret {
+    pub core: Arc<core::LocalSecret>,
+}
+
+impl LocalSecret {
+    pub fn new(core: core::LocalSecret) -> Self {
+        Self {
+            core: Arc::new(core),
+        }
+    }
+}
+
+#[allow(clippy::unused_self)]
+#[pymethods]
+impl LocalSecret {
+    /// imports a uniformly random 32-byte secret and clears the supplied bytearray.
+    #[staticmethod]
+    fn from_bytearray(py: Python<'_>, material: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let mut bytes =
+            take_secret_bytes(py, material, "local secret material must contain 32 bytes")?;
+        Ok(Self::new(core::LocalSecret::import(&mut bytes)))
+    }
+
+    /// returns one writable copy for application-defined storage.
+    fn export<'py>(&self, py: Python<'py>) -> Bound<'py, PyByteArray> {
+        self.core
+            .expose(|bytes| PyByteArray::new(py, bytes.as_slice()))
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "LocalSecret([REDACTED])"
+    }
+
+    fn __copy__(&self) -> PyResult<()> {
+        Err(PyTypeError::new_err("local secrets cannot be copied"))
+    }
+
+    fn __deepcopy__(&self, _memo: &Bound<'_, PyAny>) -> PyResult<()> {
+        Err(PyTypeError::new_err("local secrets cannot be copied"))
+    }
+
+    fn __reduce__(&self) -> PyResult<()> {
+        Err(PyTypeError::new_err("local secrets cannot be pickled"))
+    }
+
+    fn __reduce_ex__(&self, _protocol: i32) -> PyResult<()> {
+        Err(PyTypeError::new_err("local secrets cannot be pickled"))
+    }
+}
+
+/// a newly generated fido route and its separately stored local secret.
+#[pyclass(
+    name = "LocalSecretRecipient",
+    frozen,
+    module = "fido_key_wrap._native"
+)]
+pub struct LocalSecretRecipient {
+    recipient_id: core::RecipientId,
+    secret: Arc<core::LocalSecret>,
+}
+
+impl LocalSecretRecipient {
+    pub fn new(core: core::LocalSecretRecipient) -> Self {
+        let recipient_id = core.recipient_id();
+        Self {
+            recipient_id,
+            secret: Arc::new(core.into_secret()),
+        }
+    }
+}
+
+#[allow(clippy::unused_self)]
+#[pymethods]
+impl LocalSecretRecipient {
+    #[getter]
+    fn recipient_id(&self) -> RecipientId {
+        RecipientId {
+            core: self.recipient_id,
+        }
+    }
+
+    #[getter]
+    fn secret(&self) -> LocalSecret {
+        LocalSecret {
+            core: Arc::clone(&self.secret),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "LocalSecretRecipient(recipient_id=RecipientId('{}'), secret=[REDACTED])",
+            self.recipient_id
+        )
+    }
+
+    fn __copy__(&self) -> PyResult<()> {
+        Err(PyTypeError::new_err(
+            "local secret recipients cannot be copied",
+        ))
+    }
+
+    fn __deepcopy__(&self, _memo: &Bound<'_, PyAny>) -> PyResult<()> {
+        Err(PyTypeError::new_err(
+            "local secret recipients cannot be copied",
+        ))
+    }
+
+    fn __reduce__(&self) -> PyResult<()> {
+        Err(PyTypeError::new_err(
+            "local secret recipients cannot be pickled",
+        ))
+    }
+
+    fn __reduce_ex__(&self, _protocol: i32) -> PyResult<()> {
+        Err(PyTypeError::new_err(
+            "local secret recipients cannot be pickled",
         ))
     }
 }

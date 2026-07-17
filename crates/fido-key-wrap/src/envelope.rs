@@ -17,6 +17,7 @@ const FIDO_SUITE: u8 = 2;
 const FIDO_AND_PASSPHRASE_SUITE: u8 = 3;
 const RECOVERY_SECRET_SUITE: u8 = 4;
 const MANAGED_FIDO_SUITE: u8 = 5;
+const FIDO_AND_LOCAL_SECRET_SUITE: u8 = 6;
 const ARGON2ID_KDF: u8 = 1;
 
 const ROOT_BYTES: usize = 32;
@@ -97,6 +98,17 @@ pub(crate) struct FidoAndPassphraseRecipient {
     pub(crate) wrapped_root: [u8; COMBINED_WRAPPED_ROOT_BYTES],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FidoAndLocalSecretRecipient {
+    pub(crate) id: RecipientId,
+    pub(crate) label: String,
+    pub(crate) credential_id: Vec<u8>,
+    pub(crate) public_key: PublicKey64,
+    pub(crate) prf_nonce: [u8; PRF_NONCE_BYTES],
+    pub(crate) wrap_nonce: [u8; GCM_NONCE_BYTES],
+    pub(crate) wrapped_root: [u8; WRAPPED_ROOT_BYTES],
+}
+
 /// one structurally valid route to the envelope root.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RecipientRecord {
@@ -104,6 +116,7 @@ pub(crate) enum RecipientRecord {
     RecoverySecret(RecoverySecretRecord),
     Fido(FidoRecipient),
     FidoAndPassphrase(FidoAndPassphraseRecipient),
+    FidoAndLocalSecret(FidoAndLocalSecretRecipient),
 }
 
 impl RecipientRecord {
@@ -113,6 +126,7 @@ impl RecipientRecord {
             Self::RecoverySecret(record) => record.id,
             Self::Fido(record) => record.id,
             Self::FidoAndPassphrase(record) => record.id,
+            Self::FidoAndLocalSecret(record) => record.id,
         }
     }
 
@@ -122,6 +136,7 @@ impl RecipientRecord {
             Self::RecoverySecret(record) => &record.label,
             Self::Fido(record) => &record.label,
             Self::FidoAndPassphrase(record) => &record.label,
+            Self::FidoAndLocalSecret(record) => &record.label,
         }
     }
 
@@ -134,13 +149,14 @@ impl RecipientRecord {
                 FidoStorage::Managed => RecipientPolicy::ManagedFido(record.policy),
             },
             Self::FidoAndPassphrase(record) => RecipientPolicy::FidoAndPassphrase(record.policy),
+            Self::FidoAndLocalSecret(_) => RecipientPolicy::FidoPresenceAndLocalSecret,
         }
     }
 
     pub(crate) const fn passphrase_parameters(&self) -> Option<PassphraseParameters> {
         match self {
             Self::Passphrase(record) => Some(record.kdf.parameters),
-            Self::RecoverySecret(_) | Self::Fido(_) => None,
+            Self::RecoverySecret(_) | Self::Fido(_) | Self::FidoAndLocalSecret(_) => None,
             Self::FidoAndPassphrase(record) => Some(record.kdf.parameters),
         }
     }
@@ -150,13 +166,14 @@ impl RecipientRecord {
             Self::Passphrase(_) | Self::RecoverySecret(_) => None,
             Self::Fido(record) => Some(&record.credential_id),
             Self::FidoAndPassphrase(record) => Some(&record.credential_id),
+            Self::FidoAndLocalSecret(record) => Some(&record.credential_id),
         }
     }
 
     fn passphrase_salt(&self) -> Option<&[u8; ARGON2_SALT_BYTES]> {
         match self {
             Self::Passphrase(record) => Some(&record.kdf.salt),
-            Self::RecoverySecret(_) | Self::Fido(_) => None,
+            Self::RecoverySecret(_) | Self::Fido(_) | Self::FidoAndLocalSecret(_) => None,
             Self::FidoAndPassphrase(record) => Some(&record.kdf.salt),
         }
     }
@@ -399,6 +416,16 @@ fn encode_recipient<W: minicbor::encode::Write>(
             encoder.bytes(&record.passphrase_nonce)?;
             encoder.bytes(&record.wrapped_root)?;
         }
+        RecipientRecord::FidoAndLocalSecret(record) => {
+            encoder.array(8)?.u8(FIDO_AND_LOCAL_SECRET_SUITE)?;
+            encoder.bytes(record.id.as_bytes())?;
+            encoder.str(&record.label)?;
+            encoder.bytes(&record.credential_id)?;
+            encoder.bytes(record.public_key.as_bytes())?;
+            encoder.bytes(&record.prf_nonce)?;
+            encoder.bytes(&record.wrap_nonce)?;
+            encoder.bytes(&record.wrapped_root)?;
+        }
     }
     Ok(())
 }
@@ -426,6 +453,9 @@ fn decode_recipient(decoder: &mut Decoder<'_>) -> Result<RecipientRecord> {
         FIDO_SUITE if length == 9 => decode_fido_recipient(decoder, FidoStorage::NonDiscoverable),
         MANAGED_FIDO_SUITE if length == 9 => decode_fido_recipient(decoder, FidoStorage::Managed),
         FIDO_AND_PASSPHRASE_SUITE if length == 11 => decode_fido_and_passphrase_recipient(decoder),
+        FIDO_AND_LOCAL_SECRET_SUITE if length == 8 => {
+            decode_fido_and_local_secret_recipient(decoder)
+        }
         _ => Err(Error::InvalidEnvelope),
     }
 }
@@ -505,6 +535,27 @@ fn decode_fido_and_passphrase_recipient(decoder: &mut Decoder<'_>) -> Result<Rec
             fido_nonce,
             kdf,
             passphrase_nonce,
+            wrapped_root,
+        },
+    ))
+}
+
+fn decode_fido_and_local_secret_recipient(decoder: &mut Decoder<'_>) -> Result<RecipientRecord> {
+    let id = RecipientId::from_bytes(exact_bytes::<RECIPIENT_ID_BYTES>(decoder)?);
+    let label = decode_label(decoder)?;
+    let credential_id = decode_credential_id(decoder)?;
+    let public_key = PublicKey64::new(exact_bytes::<PUBLIC_KEY_BYTES>(decoder)?)?;
+    let prf_nonce = exact_bytes::<PRF_NONCE_BYTES>(decoder)?;
+    let wrap_nonce = exact_bytes::<GCM_NONCE_BYTES>(decoder)?;
+    let wrapped_root = exact_bytes::<WRAPPED_ROOT_BYTES>(decoder)?;
+    Ok(RecipientRecord::FidoAndLocalSecret(
+        FidoAndLocalSecretRecipient {
+            id,
+            label,
+            credential_id,
+            public_key,
+            prf_nonce,
+            wrap_nonce,
             wrapped_root,
         },
     ))
@@ -646,13 +697,22 @@ mod tests {
                     id: RecipientId::from_bytes([0x30; RECIPIENT_ID_BYTES]),
                     label: "verified plus passphrase".to_owned(),
                     credential_id: vec![0x31; 96],
-                    public_key,
+                    public_key: public_key.clone(),
                     policy: FidoPolicy::UserVerification,
                     prf_nonce: [0x32; PRF_NONCE_BYTES],
                     fido_nonce: [0x33; GCM_NONCE_BYTES],
                     kdf: kdf(0x34),
                     passphrase_nonce: [0x35; GCM_NONCE_BYTES],
                     wrapped_root: [0x36; COMBINED_WRAPPED_ROOT_BYTES],
+                }),
+                RecipientRecord::FidoAndLocalSecret(FidoAndLocalSecretRecipient {
+                    id: RecipientId::from_bytes([0x40; RECIPIENT_ID_BYTES]),
+                    label: "presence plus local secret".to_owned(),
+                    credential_id: vec![0x41; 80],
+                    public_key,
+                    prf_nonce: [0x42; PRF_NONCE_BYTES],
+                    wrap_nonce: [0x43; GCM_NONCE_BYTES],
+                    wrapped_root: [0x44; WRAPPED_ROOT_BYTES],
                 }),
             ],
             mac: [0x55; ROOT_BYTES],
@@ -813,6 +873,16 @@ mod tests {
                     fixed_bytes!();
                     fixed_bytes!();
                 }
+                FIDO_AND_LOCAL_SECRET_SUITE => {
+                    assert_eq!(record_length, 8);
+                    fixed_bytes!();
+                    text!();
+                    dynamic_bytes!();
+                    fixed_bytes!();
+                    fixed_bytes!();
+                    fixed_bytes!();
+                    fixed_bytes!();
+                }
                 _ => unreachable!(),
             }
         }
@@ -840,7 +910,7 @@ mod tests {
         assert_eq!(decoded.encode(), encoded);
 
         let summaries = decoded.recipients();
-        assert_eq!(summaries.len(), 4);
+        assert_eq!(summaries.len(), 5);
         assert_eq!(summaries[0].policy(), RecipientPolicy::Passphrase);
         assert_eq!(summaries[1].policy(), RecipientPolicy::RecoverySecret);
         assert_eq!(
@@ -852,11 +922,20 @@ mod tests {
             RecipientPolicy::FidoAndPassphrase(FidoPolicy::UserVerification)
         );
         assert_eq!(
+            summaries[4].policy(),
+            RecipientPolicy::FidoPresenceAndLocalSecret
+        );
+        assert_eq!(
             summaries[0].passphrase_parameters(),
             Some(PassphraseParameters::DESKTOP)
         );
         assert_eq!(summaries[1].passphrase_parameters(), None);
         assert_eq!(summaries[2].passphrase_parameters(), None);
+        assert_eq!(
+            summaries[3].passphrase_parameters(),
+            Some(PassphraseParameters::DESKTOP)
+        );
+        assert_eq!(summaries[4].passphrase_parameters(), None);
     }
 
     #[test]
@@ -872,6 +951,7 @@ mod tests {
             include_str!(
                 "../../../test-vectors/format-1-fido-user-verification-plus-passphrase.txt"
             ),
+            include_str!("../../../test-vectors/format-1-fido-presence-plus-local-secret.txt"),
             include_str!("../../../test-vectors/format-1-mixed.txt"),
         ];
         for source in vectors {

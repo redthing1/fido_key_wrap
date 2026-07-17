@@ -16,6 +16,92 @@ pub struct RecoverySecret {
     bytes: Zeroizing<[u8; SECRET_BYTES]>,
 }
 
+/// uniformly random local factor for one fido recipient.
+pub struct LocalSecret {
+    bytes: Zeroizing<[u8; SECRET_BYTES]>,
+}
+
+impl LocalSecret {
+    /// imports an existing uniformly random local secret and clears the source.
+    ///
+    /// passwords, derived passwords, and other guessable values are not valid
+    /// local secrets.
+    #[must_use]
+    pub fn import(source: &mut [u8; SECRET_BYTES]) -> Self {
+        let mut bytes = Zeroizing::new([0u8; SECRET_BYTES]);
+        bytes.copy_from_slice(source);
+        source.zeroize();
+        Self { bytes }
+    }
+
+    /// borrows the local secret for one application-defined storage operation.
+    ///
+    /// the closure can copy or return these bytes. any such copy is owned and
+    /// must be cleared by the application.
+    pub fn expose<T>(&self, use_secret: impl FnOnce(&[u8; SECRET_BYTES]) -> T) -> T {
+        use_secret(&self.bytes)
+    }
+
+    pub(crate) fn random() -> Result<Self> {
+        let mut bytes = Zeroizing::new([0u8; SECRET_BYTES]);
+        getrandom::fill(bytes.as_mut()).map_err(|_| Error::RandomUnavailable)?;
+        Ok(Self { bytes })
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8; SECRET_BYTES] {
+        &self.bytes
+    }
+}
+
+impl fmt::Debug for LocalSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LocalSecret([REDACTED])")
+    }
+}
+
+/// newly created fido-and-local-secret route and its local factor.
+pub struct LocalSecretRecipient {
+    recipient_id: RecipientId,
+    secret: LocalSecret,
+}
+
+impl LocalSecretRecipient {
+    pub(crate) const fn new(recipient_id: RecipientId, secret: LocalSecret) -> Self {
+        Self {
+            recipient_id,
+            secret,
+        }
+    }
+
+    /// returns the recipient selected by this local secret.
+    #[must_use]
+    pub const fn recipient_id(&self) -> RecipientId {
+        self.recipient_id
+    }
+
+    /// borrows the newly generated local secret.
+    #[must_use]
+    pub const fn secret(&self) -> &LocalSecret {
+        &self.secret
+    }
+
+    /// consumes the enrollment result and returns its local secret.
+    #[must_use]
+    pub fn into_secret(self) -> LocalSecret {
+        self.secret
+    }
+}
+
+impl fmt::Debug for LocalSecretRecipient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalSecretRecipient")
+            .field("recipient_id", &self.recipient_id)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl RecoverySecret {
     /// imports an existing recovery secret and clears the source.
     #[must_use]
@@ -160,5 +246,19 @@ mod tests {
         let rendered = format!("{recipient:?}");
         assert!(rendered.contains("[REDACTED]"));
         assert!(!rendered.contains("RecoverySecret(["));
+    }
+
+    #[test]
+    fn local_import_clears_source_and_debug_is_redacted() {
+        let mut source = [0x36; SECRET_BYTES];
+        let secret = LocalSecret::import(&mut source);
+        assert_eq!(source, [0; SECRET_BYTES]);
+        assert_eq!(format!("{secret:?}"), "LocalSecret([REDACTED])");
+
+        let recipient =
+            LocalSecretRecipient::new(RecipientId::from_bytes([0x57; SECRET_BYTES]), secret);
+        let rendered = format!("{recipient:?}");
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("LocalSecret(["));
     }
 }

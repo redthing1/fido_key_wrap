@@ -10,8 +10,8 @@ use crate::{
     errors::{busy_error, map_error},
     interaction::PythonInteraction,
     types::{
-        Enrollment, FidoConfig, KeyEnvelope, PassphraseLimits, PassphraseParameters, RecipientId,
-        RecoverySecret, RecoverySecretRecipient, RootKey,
+        Enrollment, FidoConfig, KeyEnvelope, LocalSecret, LocalSecretRecipient, PassphraseLimits,
+        PassphraseParameters, RecipientId, RecoverySecret, RecoverySecretRecipient, RootKey,
     },
 };
 
@@ -398,6 +398,122 @@ impl KeyProtector {
                 })
         })
         .map_err(|error| map_error(py, &error))
+    }
+
+    /// generates a random root protected by a security key and local secret.
+    fn create_root_with_fido_and_local_secret(
+        &self,
+        py: Python<'_>,
+        label: String,
+        interaction: Py<PyAny>,
+    ) -> PyResult<(RootKey, KeyEnvelope, LocalSecretRecipient)> {
+        let _busy = BusyGuard::enter(py, &self.busy)?;
+        let application_id = self.application_id.clone();
+        let limits = self.limits;
+        let fido_config = self.fido_config;
+        let mut interaction = PythonInteraction::new(interaction);
+        let result = py.detach(|| {
+            let mut protector = protector(application_id, limits, fido_config);
+            protector
+                .create_root_with_fido_and_local_secret(label, &mut interaction)
+                .map(|(root, envelope, recipient)| {
+                    (
+                        RootKey::new(root),
+                        KeyEnvelope { core: envelope },
+                        LocalSecretRecipient::new(recipient),
+                    )
+                })
+        });
+        finish(py, &mut interaction, result)
+    }
+
+    /// protects a root with a security key and local secret.
+    fn protect_root_with_fido_and_local_secret(
+        &self,
+        py: Python<'_>,
+        root: &RootKey,
+        label: String,
+        interaction: Py<PyAny>,
+    ) -> PyResult<(KeyEnvelope, LocalSecretRecipient)> {
+        let _busy = BusyGuard::enter(py, &self.busy)?;
+        let application_id = self.application_id.clone();
+        let limits = self.limits;
+        let fido_config = self.fido_config;
+        let root = Arc::clone(&root.core);
+        let mut interaction = PythonInteraction::new(interaction);
+        let result = py.detach(|| {
+            let mut protector = protector(application_id, limits, fido_config);
+            protector
+                .protect_root_with_fido_and_local_secret(root.as_ref(), label, &mut interaction)
+                .map(|(envelope, recipient)| {
+                    (
+                        KeyEnvelope { core: envelope },
+                        LocalSecretRecipient::new(recipient),
+                    )
+                })
+        });
+        finish(py, &mut interaction, result)
+    }
+
+    /// returns a new envelope containing another security-key and local-secret route.
+    fn add_fido_and_local_secret(
+        &self,
+        py: Python<'_>,
+        envelope: &KeyEnvelope,
+        root: &RootKey,
+        label: String,
+        interaction: Py<PyAny>,
+    ) -> PyResult<(KeyEnvelope, LocalSecretRecipient)> {
+        let _busy = BusyGuard::enter(py, &self.busy)?;
+        let application_id = self.application_id.clone();
+        let limits = self.limits;
+        let fido_config = self.fido_config;
+        let mut envelope = envelope.core.clone();
+        let root = Arc::clone(&root.core);
+        let mut interaction = PythonInteraction::new(interaction);
+        let result = py.detach(|| {
+            let mut protector = protector(application_id, limits, fido_config);
+            protector
+                .add_fido_and_local_secret(&mut envelope, root.as_ref(), label, &mut interaction)
+                .map(|recipient| {
+                    (
+                        KeyEnvelope { core: envelope },
+                        LocalSecretRecipient::new(recipient),
+                    )
+                })
+        });
+        finish(py, &mut interaction, result)
+    }
+
+    /// recovers a root through one selected security-key and local-secret recipient.
+    fn unlock_with_fido_and_local_secret(
+        &self,
+        py: Python<'_>,
+        envelope: &KeyEnvelope,
+        recipient: &RecipientId,
+        secret: &LocalSecret,
+        interaction: Py<PyAny>,
+    ) -> PyResult<RootKey> {
+        let _busy = BusyGuard::enter(py, &self.busy)?;
+        let application_id = self.application_id.clone();
+        let limits = self.limits;
+        let fido_config = self.fido_config;
+        let envelope = envelope.core.clone();
+        let recipient = recipient.core;
+        let secret = Arc::clone(&secret.core);
+        let mut interaction = PythonInteraction::new(interaction);
+        let result = py.detach(|| {
+            let mut protector = protector(application_id, limits, fido_config);
+            protector
+                .unlock_with_fido_and_local_secret(
+                    &envelope,
+                    recipient,
+                    secret.as_ref(),
+                    &mut interaction,
+                )
+                .map(RootKey::new)
+        });
+        finish(py, &mut interaction, result)
     }
 
     fn __repr__(&self) -> String {
