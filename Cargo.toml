@@ -5,12 +5,14 @@ members = [
     "crates/fido-key-wrap-platform",
     "crates/fido-key-wrap-python",
     "crates/fkw-demo",
+    "crates/fkw-tool",
 ]
 default-members = [
     "crates/fido-key-wrap",
     "crates/fido-key-wrap-libfido2",
     "crates/fido-key-wrap-platform",
     "crates/fkw-demo",
+    "crates/fkw-tool",
 ]
 resolver = "3"
 
@@ -27,7 +29,6 @@ argon2 = { version = "0.5.3", default-features = false, features = ["zeroize"] }
 clap = { version = "4.6.1", features = ["derive"] }
 getrandom = "0.4.3"
 ghash = { version = "0.5.1", features = ["zeroize"] }
-fs2 = "0.4.3"
 hkdf = "0.13.0"
 hmac = { version = "0.13.0", features = ["zeroize"] }
 libc = "0.2.183"

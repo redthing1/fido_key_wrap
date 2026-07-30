@@ -81,8 +81,8 @@ DOMAIN_FIDO_LOCAL_COMBINED_KEY = (
 DOMAIN_FIDO_LOCAL_AAD = b"fido_key_wrap/format_1/fido_local_aad"
 DOMAIN_ENVELOPE_MAC_KEY = b"fido_key_wrap/format_1/envelope_mac_key"
 DOMAIN_ENVELOPE_MAC = b"fido_key_wrap/format_1/envelope_mac"
-DOMAIN_NOTE_KEY = b"fkw-demo/format_1/note_encryption_key"
-DOMAIN_NOTE_AAD = b"fkw-demo/format_1/note_aad"
+DOMAIN_SECRET_KEY = b"fkw-tool/format_1/secret_encryption_key"
+DOMAIN_SECRET_AAD = b"fkw-tool/format_1/secret_aad"
 
 Value: TypeAlias = bytes | str | int
 
@@ -855,50 +855,50 @@ def generate_envelope(
     return records, common
 
 
-def render_demo_vector(
+def render_tool_vector(
     passphrase_common: tuple[tuple[str, Value], ...]
 ) -> str:
     common = dict(passphrase_common)
     envelope = common["envelope"]
     assert isinstance(envelope, bytes)
-    note_plaintext = b"independent format-1 demo note\n"
-    note_nonce = sequence(0xE0, 12)
-    note_key_info = transcript(
-        DOMAIN_NOTE_KEY, APPLICATION_ID.encode("ascii")
+    secret_plaintext = b"independent format-1 tool secret\n"
+    secret_nonce = sequence(0xE0, 12)
+    secret_key_info = transcript(
+        DOMAIN_SECRET_KEY, APPLICATION_ID.encode("ascii")
     )
-    note_key = hkdf_sha256(ROOT_KEY, None, note_key_info)
-    note_aad = transcript(DOMAIN_NOTE_AAD, envelope)
-    note_ciphertext = AESGCM(note_key).encrypt(
-        note_nonce, note_plaintext, note_aad
+    secret_key = hkdf_sha256(ROOT_KEY, None, secret_key_info)
+    secret_aad = transcript(DOMAIN_SECRET_AAD, envelope)
+    secret_ciphertext = AESGCM(secret_key).encrypt(
+        secret_nonce, secret_plaintext, secret_aad
     )
     assert (
-        AESGCM(note_key).decrypt(note_nonce, note_ciphertext, note_aad)
-        == note_plaintext
+        AESGCM(secret_key).decrypt(secret_nonce, secret_ciphertext, secret_aad)
+        == secret_plaintext
     )
     container = (
-        b"FKD\0"
+        b"FKW\0"
         + bytes([FORMAT])
         + len(envelope).to_bytes(4, "big")
         + envelope
-        + note_nonce
-        + len(note_ciphertext).to_bytes(4, "big")
-        + note_ciphertext
+        + secret_nonce
+        + len(secret_ciphertext).to_bytes(4, "big")
+        + secret_ciphertext
     )
     values: tuple[tuple[str, Value], ...] = (
         ("format", FORMAT),
         ("application_id", APPLICATION_ID),
         ("root_key", ROOT_KEY),
         ("envelope", envelope),
-        ("note_plaintext", note_plaintext),
-        ("note_nonce", note_nonce),
-        ("note_key_info", note_key_info),
-        ("note_key", note_key),
-        ("note_aad", note_aad),
-        ("note_ciphertext", note_ciphertext),
+        ("secret_plaintext", secret_plaintext),
+        ("secret_nonce", secret_nonce),
+        ("secret_key_info", secret_key_info),
+        ("secret_key", secret_key),
+        ("secret_aad", secret_aad),
+        ("secret_ciphertext", secret_ciphertext),
         ("container", container),
     )
     lines = [
-        "# fkw-demo format-1 data-key, aead, and container vector",
+        "# fkw-tool format-1 data-key, aead, and container vector",
         "# deterministic correctness vector; byte values are lowercase hexadecimal.",
         "",
     ]
@@ -941,8 +941,8 @@ def main() -> None:
         newline="\n",
     )
 
-    (output_directory / "format-1-demo-container.txt").write_text(
-        render_demo_vector(single_results["passphrase"]),
+    (output_directory / "format-1-tool-container.txt").write_text(
+        render_tool_vector(single_results["passphrase"]),
         encoding="ascii",
         newline="\n",
     )

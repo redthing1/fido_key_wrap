@@ -42,10 +42,12 @@ the exact construction and wire format are in [protocol.md](protocol.md).
 ## recovery policies
 
 `recovery secret` requires the exact 32-byte secret returned when the recipient
-was created. the envelope contains no copy or verifier of that secret. the
-application must store it separately and treat it as sufficient to recover the
-root through this route. it is generated binary key material, not a passphrase
-or a human recovery code.
+was created. the envelope contains no copy of that secret. it contains enough
+authenticated material to test a candidate, but exhaustive guessing of a
+uniformly random 256-bit value is infeasible. the application must store the
+secret separately and treat it as sufficient to recover the root through this
+route. it is generated binary key material, not a passphrase or a human
+recovery code.
 
 `fido presence` requires the recorded credential and a signed assertion with
 user presence set and user verification clear. in ordinary use this means the
@@ -145,6 +147,29 @@ a copied envelope does not permit practical guessing of a uniformly random
 256-bit recovery secret. disclosure of the separately stored secret permits
 immediate recovery through that recipient. the library does not define its
 storage, encoding, export, or transfer policy.
+
+### macos user-presence storage
+
+the platform crate can place a generated recovery secret in the
+non-synchronizing data-protection keychain under `userPresence` access control.
+macos then requires accepted local user authentication, typically touch id or
+the account password, before returning the value. the entry is device-bound and
+requires a passcode to remain configured.
+
+this protects against recovery from the envelope alone and against an
+unauthorized process merely reading the keychain database. it is a local macos
+factor, not an independent physical factor: control of the mac and an accepted
+local authorization satisfy it. after authorization, the recovery secret and
+root exist in the calling process.
+
+the value is a random `RecoverySecret`, not the root. the secure enclave helps
+enforce the keychain access policy on supported systems, but the construction
+does not create a secure-enclave private key and does not claim that plaintext
+never leaves protected hardware.
+
+deleting the keychain entry disables copies that depend on that exact stored
+value only if no other copy exists. it is not managed-fido retirement or proof
+of global cryptographic erasure.
 
 ### fido recipient
 
@@ -296,7 +321,7 @@ a bounded blocking pool and limit simultaneous work.
 exposure methods can still let application code copy or print secrets.
 secret-bearing buffers and value types owned by this repository are cleared
 when dropped, including argon2 memory, kdf output, prf results, derived keys,
-decrypted layers, and transient root buffers. cryptographic dependencies may
+decrypted layers, and transient root buffers. dependencies and native apis may
 hold their own internal state outside that guarantee.
 
 zeroization reduces ordinary secret lifetime; it is not forensic erasure. it
@@ -309,7 +334,8 @@ application. it also cannot protect a compromised process.
 the security model excludes:
 
 - application data encryption or storage
-- recovery-secret persistence or application-specific local-secret stores
+- recovery-secret persistence outside the optional macos user-presence store
+- application-specific local-secret stores
 - protection from malware during a valid unlock
 - availability, backup, and rollback protection
 - global deletion or cryptographic erasure of copied or restored local secrets

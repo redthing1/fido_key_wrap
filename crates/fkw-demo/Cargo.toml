@@ -9,22 +9,12 @@ publish = false
 default = ["fido"]
 fido = ["fido-key-wrap/fido"]
 
-[[bin]]
-name = "fkw"
-path = "src/main.rs"
-
 [dependencies]
-aes-gcm = { workspace = true, features = ["alloc"] }
 anyhow.workspace = true
 clap.workspace = true
 fido-key-wrap = { path = "../fido-key-wrap", default-features = false }
-fs2.workspace = true
-getrandom.workspace = true
-hkdf.workspace = true
-libc.workspace = true
 rpassword.workspace = true
-sha2.workspace = true
-zeroize.workspace = true
+subtle.workspace = true
 
 [lints]
 workspace = true

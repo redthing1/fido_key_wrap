@@ -35,6 +35,11 @@ secret and a touch. `fido-key-wrap-platform` provides optional native storage
 on macos and linux. applications with another trusted store can keep the core
 crate independent of platform storage.
 
+on macos, the platform crate can also protect a generated recovery secret with
+the data-protection keychain and require local user authentication accepted by
+macos when it is read. this is a local recovery policy built from the existing
+typed recovery-secret route.
+
 ordinary security-key routes use non-discoverable credentials and consume no
 resident credential slot. each managed route uses one discoverable credential
 so the exact route can later be verified and retired from the selected key.
@@ -52,8 +57,8 @@ fido-key-wrap = { git = "https://github.com/redthing1/fido_key_wrap.git", defaul
 
 enable the `fido` feature for security-key support.
 
-paired-machine applications can add the companion crate from the same
-repository:
+applications using native factor storage can add the companion crate from the
+same repository:
 
 ```toml
 [dependencies]
@@ -86,12 +91,16 @@ python applications can install a thin native binding from the repository.
 the binding follows the same root, envelope, recipient, and interaction model;
 see the python guide for installation and use.
 
+the `fkw` tool seals one small secret behind one chosen recovery policy. the
+separate `fkw-demo` program performs a single in-memory library round trip.
+
 ## documentation
 
 - [integration guide](doc/integration.md)
-- [platform secret storage](doc/platform-storage.md)
+- [platform factor storage](doc/platform-storage.md)
 - [python integration](doc/python.md)
 - [security model](doc/security.md)
 - [protocol](doc/protocol.md)
-- [demo application](doc/demo.md)
-- [demo format](doc/demo-format.md)
+- [command-line tool](doc/tool.md)
+- [tool format](doc/tool-format.md)
+- [demo](doc/demo.md)

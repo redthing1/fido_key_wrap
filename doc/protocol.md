@@ -483,6 +483,6 @@ input is rejected before factor interaction.
 ## interoperability vectors
 
 `test-vectors/` contains deterministic format-1 fixtures for every recipient
-policy, a nine-recipient mixed envelope, and the demo container.
+policy, a nine-recipient mixed envelope, and the command-line tool container.
 `test-vectors/generate.py` implements transcript framing, hkdf, cbor, and
 envelope construction independently from the rust code.

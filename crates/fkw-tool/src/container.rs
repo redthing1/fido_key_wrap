@@ -7,33 +7,33 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-const MAGIC: &[u8; 4] = b"FKD\0";
+const MAGIC: &[u8; 4] = b"FKW\0";
 const FORMAT: u8 = 1;
 const NONCE_BYTES: usize = 12;
 const TAG_BYTES: usize = 16;
 const MAX_ENVELOPE_BYTES: usize = 65_536;
-pub(crate) const MAX_NOTE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_SECRET_BYTES: usize = 1024 * 1024;
 const MAX_CONTAINER_BYTES: usize =
-    MAGIC.len() + 1 + 4 + MAX_ENVELOPE_BYTES + NONCE_BYTES + 4 + MAX_NOTE_BYTES + TAG_BYTES;
+    MAGIC.len() + 1 + 4 + MAX_ENVELOPE_BYTES + NONCE_BYTES + 4 + MAX_SECRET_BYTES + TAG_BYTES;
 
-const NOTE_KEY_DOMAIN: &[u8] = b"fkw-demo/format_1/note_encryption_key";
-const NOTE_AAD_DOMAIN: &[u8] = b"fkw-demo/format_1/note_aad";
+const SECRET_KEY_DOMAIN: &[u8] = b"fkw-tool/format_1/secret_encryption_key";
+const SECRET_AAD_DOMAIN: &[u8] = b"fkw-tool/format_1/secret_aad";
 
 #[derive(Debug)]
-pub(crate) struct EncryptedNote {
+pub(crate) struct EncryptedSecret {
     nonce: [u8; NONCE_BYTES],
     ciphertext: Vec<u8>,
 }
 
-impl EncryptedNote {
+impl EncryptedSecret {
     pub(crate) fn encrypt(
         root: &RootKey,
         application_id: &ApplicationId,
         envelope: &[u8],
         plaintext: &[u8],
     ) -> Result<Self> {
-        if plaintext.is_empty() || plaintext.len() > MAX_NOTE_BYTES {
-            bail!("the note must contain between 1 byte and 1 MiB");
+        if plaintext.is_empty() || plaintext.len() > MAX_SECRET_BYTES {
+            bail!("the secret must contain between 1 byte and 1 MiB");
         }
         let mut nonce = [0u8; NONCE_BYTES];
         getrandom::fill(&mut nonce).context("secure randomness is unavailable")?;
@@ -48,13 +48,13 @@ impl EncryptedNote {
         nonce: [u8; NONCE_BYTES],
     ) -> Result<Self> {
         validate_envelope_len(envelope)?;
-        if plaintext.is_empty() || plaintext.len() > MAX_NOTE_BYTES {
-            bail!("the note must contain between 1 byte and 1 MiB");
+        if plaintext.is_empty() || plaintext.len() > MAX_SECRET_BYTES {
+            bail!("the secret must contain between 1 byte and 1 MiB");
         }
-        let key = derive_note_key(root, application_id)?;
+        let key = derive_secret_key(root, application_id)?;
         let cipher = Aes256Gcm::new_from_slice(key.as_ref())
-            .map_err(|_| anyhow::anyhow!("failed to initialize note encryption"))?;
-        let aad = note_aad(envelope)?;
+            .map_err(|_| anyhow::anyhow!("failed to initialize secret encryption"))?;
+        let aad = secret_aad(envelope)?;
         let ciphertext = cipher
             .encrypt(
                 &Nonce::from(nonce),
@@ -63,7 +63,7 @@ impl EncryptedNote {
                     aad: &aad,
                 },
             )
-            .map_err(|_| anyhow::anyhow!("failed to encrypt the note"))?;
+            .map_err(|_| anyhow::anyhow!("failed to encrypt the secret"))?;
         Ok(Self { nonce, ciphertext })
     }
 
@@ -75,10 +75,10 @@ impl EncryptedNote {
     ) -> Result<Zeroizing<Vec<u8>>> {
         validate_envelope_len(envelope)?;
         validate_ciphertext_len(self.ciphertext.len())?;
-        let key = derive_note_key(root, application_id)?;
+        let key = derive_secret_key(root, application_id)?;
         let cipher = Aes256Gcm::new_from_slice(key.as_ref())
-            .map_err(|_| anyhow::anyhow!("failed to initialize note decryption"))?;
-        let aad = note_aad(envelope)?;
+            .map_err(|_| anyhow::anyhow!("failed to initialize secret decryption"))?;
+        let aad = secret_aad(envelope)?;
         let plaintext = cipher
             .decrypt(
                 &Nonce::from(self.nonce),
@@ -87,13 +87,14 @@ impl EncryptedNote {
                     aad: &aad,
                 },
             )
-            .map_err(|_| anyhow::anyhow!("the encrypted note failed authentication"))?;
-        if plaintext.is_empty() || plaintext.len() > MAX_NOTE_BYTES {
-            bail!("the encrypted note is invalid");
+            .map_err(|_| anyhow::anyhow!("the encrypted secret failed authentication"))?;
+        if plaintext.is_empty() || plaintext.len() > MAX_SECRET_BYTES {
+            bail!("the encrypted secret is invalid");
         }
         Ok(Zeroizing::new(plaintext))
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn nonce(&self) -> [u8; NONCE_BYTES] {
         self.nonce
@@ -101,25 +102,25 @@ impl EncryptedNote {
 }
 
 #[derive(Debug)]
-pub(crate) struct NoteFile {
+pub(crate) struct SecretFile {
     envelope: Vec<u8>,
-    note: EncryptedNote,
+    secret: EncryptedSecret,
 }
 
-impl NoteFile {
-    pub(crate) fn new(envelope: Vec<u8>, note: EncryptedNote) -> Result<Self> {
+impl SecretFile {
+    pub(crate) fn new(envelope: Vec<u8>, secret: EncryptedSecret) -> Result<Self> {
         validate_envelope_len(&envelope)?;
-        validate_ciphertext_len(note.ciphertext.len())?;
-        Ok(Self { envelope, note })
+        validate_ciphertext_len(secret.ciphertext.len())?;
+        Ok(Self { envelope, secret })
     }
 
     pub(crate) fn decode(input: &[u8]) -> Result<Self> {
         if input.len() > MAX_CONTAINER_BYTES {
-            bail!("the encrypted note file is too large");
+            bail!("the encrypted secret file is too large");
         }
         let mut cursor = ByteCursor::new(input);
         if cursor.take(MAGIC.len())? != MAGIC || cursor.take_u8()? != FORMAT {
-            bail!("this is not a supported fkw note file");
+            bail!("this is not a supported fkw secret file");
         }
         let envelope_len =
             usize::try_from(cursor.take_u32()?).context("invalid key-envelope length")?;
@@ -130,15 +131,15 @@ impl NoteFile {
             .try_into()
             .expect("the cursor returned exactly one nonce");
         let ciphertext_len =
-            usize::try_from(cursor.take_u32()?).context("invalid encrypted-note length")?;
+            usize::try_from(cursor.take_u32()?).context("invalid encrypted-secret length")?;
         validate_ciphertext_len(ciphertext_len)?;
         let ciphertext = cursor.take(ciphertext_len)?.to_vec();
         if !cursor.is_empty() {
-            bail!("the encrypted note has trailing data");
+            bail!("the encrypted secret has trailing data");
         }
         Ok(Self {
             envelope,
-            note: EncryptedNote { nonce, ciphertext },
+            secret: EncryptedSecret { nonce, ciphertext },
         })
     }
 
@@ -150,15 +151,15 @@ impl NoteFile {
             + self.envelope.len()
             + NONCE_BYTES
             + 4
-            + self.note.ciphertext.len();
+            + self.secret.ciphertext.len();
         let mut output = Vec::with_capacity(capacity);
         output.extend_from_slice(MAGIC);
         output.push(FORMAT);
         output.extend_from_slice(&length_u32(self.envelope.len()).to_be_bytes());
         output.extend_from_slice(&self.envelope);
-        output.extend_from_slice(&self.note.nonce);
-        output.extend_from_slice(&length_u32(self.note.ciphertext.len()).to_be_bytes());
-        output.extend_from_slice(&self.note.ciphertext);
+        output.extend_from_slice(&self.secret.nonce);
+        output.extend_from_slice(&length_u32(self.secret.ciphertext.len()).to_be_bytes());
+        output.extend_from_slice(&self.secret.ciphertext);
         output
     }
 
@@ -168,27 +169,30 @@ impl NoteFile {
     }
 
     #[must_use]
-    pub(crate) const fn note(&self) -> &EncryptedNote {
-        &self.note
+    pub(crate) const fn secret(&self) -> &EncryptedSecret {
+        &self.secret
     }
 }
 
-fn derive_note_key(root: &RootKey, application_id: &ApplicationId) -> Result<Zeroizing<[u8; 32]>> {
+fn derive_secret_key(
+    root: &RootKey,
+    application_id: &ApplicationId,
+) -> Result<Zeroizing<[u8; 32]>> {
     root.expose(|bytes| {
         let (prk, hkdf) = Hkdf::<Sha256>::extract(None, bytes);
         let prk = Zeroizing::new(prk);
-        let info = transcript(&[NOTE_KEY_DOMAIN, application_id.as_str().as_bytes()])?;
+        let info = transcript(&[SECRET_KEY_DOMAIN, application_id.as_str().as_bytes()])?;
         let mut key = Zeroizing::new([0u8; 32]);
         hkdf.expand(&info, key.as_mut())
-            .map_err(|_| anyhow::anyhow!("failed to derive the note-encryption key"))?;
+            .map_err(|_| anyhow::anyhow!("failed to derive the secret-encryption key"))?;
         drop(hkdf);
         drop(prk);
         Ok(key)
     })
 }
 
-fn note_aad(envelope: &[u8]) -> Result<Vec<u8>> {
-    transcript(&[NOTE_AAD_DOMAIN, envelope])
+fn secret_aad(envelope: &[u8]) -> Result<Vec<u8>> {
+    transcript(&[SECRET_AAD_DOMAIN, envelope])
 }
 
 fn transcript(fields: &[&[u8]]) -> Result<Vec<u8>> {
@@ -219,18 +223,18 @@ fn validate_envelope_len(envelope: &[u8]) -> Result<()> {
 }
 
 fn validate_ciphertext_len(len: usize) -> Result<()> {
-    validate_length(len, TAG_BYTES + 1, MAX_NOTE_BYTES + TAG_BYTES)
+    validate_length(len, TAG_BYTES + 1, MAX_SECRET_BYTES + TAG_BYTES)
 }
 
 fn validate_length(len: usize, min: usize, max: usize) -> Result<()> {
     if !(min..=max).contains(&len) {
-        bail!("the encrypted note is invalid");
+        bail!("the encrypted secret is invalid");
     }
     Ok(())
 }
 
 fn length_u32(len: usize) -> u32 {
-    u32::try_from(len).expect("validated demo lengths fit in u32")
+    u32::try_from(len).expect("validated tool lengths fit in u32")
 }
 
 struct ByteCursor<'a> {
@@ -252,7 +256,7 @@ impl<'a> ByteCursor<'a> {
             .context("invalid container length")?;
         let value = input
             .get(position..end)
-            .context("the encrypted note file is truncated")?;
+            .context("the encrypted secret file is truncated")?;
         self.inner
             .set_position(u64::try_from(end).expect("bounded container position"));
         Ok(value)
@@ -280,23 +284,25 @@ mod tests {
     use super::*;
 
     fn application() -> ApplicationId {
-        ApplicationId::new("demo.fido-key-wrap.example").unwrap()
+        ApplicationId::new("tool.fido-key-wrap.example").unwrap()
     }
 
     #[test]
-    fn note_crypto_authenticates_exact_envelope_and_uses_fresh_nonces() {
+    fn secret_crypto_authenticates_exact_envelope_and_uses_fresh_nonces() {
         let root = RootKey::import(&mut [0x42; 32]);
         let first =
-            EncryptedNote::encrypt(&root, &application(), b"envelope-a", b"secret note").unwrap();
+            EncryptedSecret::encrypt(&root, &application(), b"envelope-a", b"secret secret")
+                .unwrap();
         let second =
-            EncryptedNote::encrypt(&root, &application(), b"envelope-b", b"secret note").unwrap();
+            EncryptedSecret::encrypt(&root, &application(), b"envelope-b", b"secret secret")
+                .unwrap();
         assert_ne!(first.nonce(), second.nonce());
         assert_eq!(
             first
                 .decrypt(&root, &application(), b"envelope-a")
                 .unwrap()
                 .as_slice(),
-            b"secret note"
+            b"secret secret"
         );
         assert!(first.decrypt(&root, &application(), b"envelope-b").is_err());
         let wrong = RootKey::import(&mut [0x24; 32]);
@@ -308,26 +314,26 @@ mod tests {
     }
 
     #[test]
-    fn container_is_strict_fkd_nul_format_one() {
+    fn container_is_strict_fkw_nul_format_one() {
         let root = RootKey::import(&mut [0x42; 32]);
         let encrypted =
-            EncryptedNote::encrypt(&root, &application(), b"opaque envelope", b"note").unwrap();
-        let encoded = NoteFile::new(b"opaque envelope".to_vec(), encrypted)
+            EncryptedSecret::encrypt(&root, &application(), b"opaque envelope", b"secret").unwrap();
+        let encoded = SecretFile::new(b"opaque envelope".to_vec(), encrypted)
             .unwrap()
             .encode();
-        assert_eq!(&encoded[..5], b"FKD\0\x01");
-        assert_eq!(NoteFile::decode(&encoded).unwrap().encode(), encoded);
+        assert_eq!(&encoded[..5], b"FKW\0\x01");
+        assert_eq!(SecretFile::decode(&encoded).unwrap().encode(), encoded);
         for end in 0..encoded.len() {
-            assert!(NoteFile::decode(&encoded[..end]).is_err());
+            assert!(SecretFile::decode(&encoded[..end]).is_err());
         }
         let mut trailing = encoded;
         trailing.push(0);
-        assert!(NoteFile::decode(&trailing).is_err());
+        assert!(SecretFile::decode(&trailing).is_err());
     }
 
     #[test]
-    fn independent_demo_vector_matches_every_application_layer() {
-        let vector = include_str!("../../../test-vectors/format-1-demo-container.txt");
+    fn independent_tool_vector_matches_every_application_layer() {
+        let vector = include_str!("../../../test-vectors/format-1-tool-container.txt");
         let get = |name: &str| {
             let prefix = format!("{name}=");
             vector
@@ -339,18 +345,21 @@ mod tests {
         let root = RootKey::import(&mut root_bytes);
         let application = ApplicationId::new(get("application_id").to_owned()).unwrap();
         let envelope = decode_hex(get("envelope"));
-        let plaintext = decode_hex(get("note_plaintext"));
-        let nonce: [u8; 12] = decode_hex(get("note_nonce")).try_into().unwrap();
+        let plaintext = decode_hex(get("secret_plaintext"));
+        let nonce: [u8; 12] = decode_hex(get("secret_nonce")).try_into().unwrap();
         let encrypted =
-            EncryptedNote::encrypt_with_nonce(&root, &application, &envelope, &plaintext, nonce)
+            EncryptedSecret::encrypt_with_nonce(&root, &application, &envelope, &plaintext, nonce)
                 .unwrap();
-        assert_eq!(encrypted.ciphertext, decode_hex(get("note_ciphertext")));
+        assert_eq!(encrypted.ciphertext, decode_hex(get("secret_ciphertext")));
         assert_eq!(
-            derive_note_key(&root, &application).unwrap().as_slice(),
-            decode_hex(get("note_key"))
+            derive_secret_key(&root, &application).unwrap().as_slice(),
+            decode_hex(get("secret_key"))
         );
-        assert_eq!(note_aad(&envelope).unwrap(), decode_hex(get("note_aad")));
-        let container = NoteFile::new(envelope, encrypted).unwrap();
+        assert_eq!(
+            secret_aad(&envelope).unwrap(),
+            decode_hex(get("secret_aad"))
+        );
+        let container = SecretFile::new(envelope, encrypted).unwrap();
         assert_eq!(container.encode(), decode_hex(get("container")));
     }
 
