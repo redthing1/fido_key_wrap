@@ -11,7 +11,7 @@ type Result<T> = std::result::Result<T, Box<dyn StdError>>;
 
 fn main() -> Result<()> {
     let application = ApplicationId::new("live-test.fido-key-wrap.local")?;
-    let mut protector = KeyProtector::system(application.clone());
+    let mut protector = KeyProtector::new(application.clone());
     let mut interaction = TerminalInteraction;
 
     eprintln!("creating a disposable paired-machine recipient");

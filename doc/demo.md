@@ -3,13 +3,13 @@
 `fkw-demo` performs one create, encode, decode, and unlock round trip in memory.
 it does not persist the envelope or root.
 
-run a passphrase round trip without fido support:
+run a passphrase round trip:
 
 ```console
-cargo run -p fkw-demo --release --no-default-features -- passphrase
+cargo run -p fkw-demo --release -- passphrase
 ```
 
-security-key policies are available in fido builds:
+run a security-key round trip:
 
 ```console
 cargo run -p fkw-demo --release -- fido-presence

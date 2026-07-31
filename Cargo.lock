@@ -689,7 +689,7 @@ name = "fido-key-wrap-libfido2"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
- "pkg-config",
+ "libloading",
  "thiserror",
  "zeroize",
 ]
@@ -739,7 +739,6 @@ dependencies = [
  "anyhow",
  "clap",
  "fido-key-wrap",
- "fido-key-wrap-platform",
  "getrandom 0.4.3",
  "hkdf 0.13.0",
  "libc",
@@ -973,6 +972,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1143,12 +1152,6 @@ dependencies = [
  "der",
  "spki",
 ]
-
-[[package]]
-name = "pkg-config"
-version = "0.3.33"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "polling"

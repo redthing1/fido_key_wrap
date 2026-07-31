@@ -189,8 +189,6 @@ pub struct Capabilities {
     pub es256: bool,
     pub client_pin_supported: bool,
     pub client_pin_configured: bool,
-    pub internal_uv_supported: bool,
-    pub internal_uv_configured: bool,
     pub always_uv: bool,
 }
 
@@ -268,15 +266,9 @@ pub enum DeviceStatus {
     Unavailable(Error),
 }
 
-/// ephemeral presentation information from discovery.
-///
-/// these fields are not stable device identity and must not be
-/// persisted as credential selectors. manufacturer and product are untrusted
-/// device metadata and must be escaped for the output context.
+/// read-only result for one discovered device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceReport {
-    pub manufacturer: Option<String>,
-    pub product: Option<String>,
     pub status: DeviceStatus,
 }
 
@@ -494,8 +486,8 @@ impl Backend {
     ///
     /// returns an allocation or sanitized native discovery error. errors for
     /// individual devices are retained in [`DeviceStatus::Unavailable`].
-    pub fn doctor(&self) -> Result<Vec<DeviceReport>> {
-        initialize_thread();
+    pub fn inspect_authenticators(&self) -> Result<Vec<DeviceReport>> {
+        initialize_thread()?;
         let candidates = manifest(self.config.max_devices)?;
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -504,7 +496,6 @@ impl Backend {
         Ok(candidates
             .into_iter()
             .map(|candidate| {
-                let presentation = candidate.presentation();
                 let status = match RawDevice::open(&candidate, self.config) {
                     Ok(mut device) => match device.capabilities() {
                         Ok(capabilities) => status_for_capabilities(capabilities),
@@ -512,11 +503,7 @@ impl Backend {
                     },
                     Err(error) => DeviceStatus::Unavailable(error),
                 };
-                DeviceReport {
-                    manufacturer: presentation.manufacturer,
-                    product: presentation.product,
-                    status,
-                }
+                DeviceReport { status }
             })
             .collect())
     }
@@ -549,7 +536,7 @@ impl Backend {
         &self,
         supports: impl Fn(&Capabilities) -> bool,
     ) -> Result<PreparedSelection> {
-        initialize_thread();
+        initialize_thread()?;
         let candidates = manifest(self.config.max_devices)?;
         if candidates.is_empty() {
             return Err(Error::NoAuthenticators);
@@ -1101,8 +1088,10 @@ fn retirement_outcome(delete: Result<()>, presence: Result<ManagedPresence>) -> 
     }
 }
 
-fn initialize_thread() {
+fn initialize_thread() -> Result<()> {
+    ffi::ensure_loaded()?;
     unsafe { ffi::fido_init(ffi::FIDO_DISABLE_U2F_FALLBACK) };
+    Ok(())
 }
 
 fn random_array() -> Result<[u8; SECRET_BYTES]> {
@@ -1158,22 +1147,6 @@ fn c_string(value: &str, message: &'static str) -> Result<CString> {
 
 struct Candidate {
     path: CString,
-    manufacturer: Option<String>,
-    product: Option<String>,
-}
-
-impl Candidate {
-    fn presentation(&self) -> DeviceReportPresentation {
-        DeviceReportPresentation {
-            manufacturer: self.manufacturer.clone(),
-            product: self.product.clone(),
-        }
-    }
-}
-
-struct DeviceReportPresentation {
-    manufacturer: Option<String>,
-    product: Option<String>,
 }
 
 struct DeviceInfoList {
@@ -1217,39 +1190,9 @@ fn manifest(max_devices: usize) -> Result<Vec<Candidate>> {
             continue;
         }
         let path = unsafe { CStr::from_ptr(path) }.to_owned();
-        let manufacturer = unsafe {
-            sanitized_optional_string(ffi::fido_dev_info_manufacturer_string(info.as_ptr()))
-        };
-        let product =
-            unsafe { sanitized_optional_string(ffi::fido_dev_info_product_string(info.as_ptr())) };
-        candidates.push(Candidate {
-            path,
-            manufacturer,
-            product,
-        });
+        candidates.push(Candidate { path });
     }
     Ok(candidates)
-}
-
-unsafe fn sanitized_optional_string(pointer: *const core::ffi::c_char) -> Option<String> {
-    if pointer.is_null() {
-        return None;
-    }
-    let bytes = unsafe { CStr::from_ptr(pointer) }.to_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    let value: String = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_NAME_BYTES)])
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                '\u{fffd}'
-            } else {
-                character
-            }
-        })
-        .collect();
-    Some(value)
 }
 
 struct RawDevice {
@@ -1328,8 +1271,6 @@ impl RawDevice {
             es256,
             client_pin_supported: unsafe { ffi::fido_dev_supports_pin(self.raw.as_ptr()) },
             client_pin_configured: unsafe { ffi::fido_dev_has_pin(self.raw.as_ptr()) },
-            internal_uv_supported: unsafe { ffi::fido_dev_supports_uv(self.raw.as_ptr()) },
-            internal_uv_configured: unsafe { ffi::fido_dev_has_uv(self.raw.as_ptr()) },
             always_uv,
         })
     }
@@ -2249,8 +2190,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a compatible libfido2 runtime"]
     fn hmac_secret_extension_bytes_are_covered_by_the_assertion_signature() {
-        initialize_thread();
+        initialize_thread().unwrap();
         let public_key = Es256PublicKey::from_bytes(&SIGNED_EXTENSION_PUBLIC_KEY).unwrap();
         let assertion = signed_extension_assertion(
             &SIGNED_EXTENSION_AUTHDATA,
@@ -2288,8 +2230,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a compatible libfido2 runtime"]
     fn signed_assertion_replay_and_altered_valid_public_key_are_rejected() {
-        initialize_thread();
+        initialize_thread().unwrap();
         let public_key = Es256PublicKey::from_bytes(&SIGNED_EXTENSION_PUBLIC_KEY).unwrap();
         let mut fresh_challenge = SIGNED_EXTENSION_CLIENT_DATA_HASH;
         fresh_challenge[0] ^= 1;
@@ -2370,8 +2313,6 @@ mod tests {
             es256: true,
             client_pin_supported: true,
             client_pin_configured: true,
-            internal_uv_supported: false,
-            internal_uv_configured: false,
             always_uv: false,
         };
         assert!(capabilities.compatible());
@@ -2707,8 +2648,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a compatible libfido2 runtime"]
     fn managed_credential_container_starts_empty() {
-        initialize_thread();
+        initialize_thread().unwrap();
         let credentials = ManagedCredentials::new().unwrap();
         assert_eq!(
             unsafe { ffi::fido_credman_rk_count(credentials.as_ptr()) },
@@ -2852,8 +2794,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a compatible libfido2 runtime"]
     fn serialized_es256_key_uses_the_native_opaque_type() {
-        initialize_thread();
+        initialize_thread().unwrap();
         let bytes: [u8; ES256_PUBLIC_KEY_BYTES] = [
             0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c, 0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4,
             0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb, 0x33, 0xa0, 0xf4, 0xa1, 0x39, 0x45,

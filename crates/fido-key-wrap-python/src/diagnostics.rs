@@ -1,9 +1,6 @@
 use pyo3::{prelude::*, types::PyTuple};
 
-#[cfg(feature = "fido")]
 use crate::errors::map_error;
-#[cfg(not(feature = "fido"))]
-use crate::errors::unavailable_error;
 
 /// a bounded reason an authenticator cannot satisfy the required protocol.
 #[pyclass(
@@ -38,7 +35,6 @@ pub enum AuthenticatorIssue {
     CredentialManagementUnavailable = 10,
 }
 
-#[cfg(feature = "fido")]
 impl From<fido_key_wrap::AuthenticatorIssue> for AuthenticatorIssue {
     fn from(value: fido_key_wrap::AuthenticatorIssue) -> Self {
         match value {
@@ -87,22 +83,21 @@ impl AuthenticatorReport {
 #[pyfunction]
 /// inspects connected authenticators without returning device identity.
 pub fn inspect_authenticators(py: Python<'_>) -> PyResult<Vec<AuthenticatorReport>> {
-    #[cfg(feature = "fido")]
-    {
-        py.detach(fido_key_wrap::inspect_authenticators)
-            .map(|reports| {
-                reports
-                    .into_iter()
-                    .map(|report| AuthenticatorReport {
-                        compatible: report.compatible(),
-                        issues: report.issues().iter().copied().map(Into::into).collect(),
-                    })
-                    .collect()
-            })
-            .map_err(|error| map_error(py, &error))
-    }
-    #[cfg(not(feature = "fido"))]
-    {
-        Err(unavailable_error(py))
-    }
+    py.detach(fido_key_wrap::inspect_authenticators)
+        .map(|reports| {
+            reports
+                .into_iter()
+                .map(|report| AuthenticatorReport {
+                    compatible: report.compatible(),
+                    issues: report.issues().iter().copied().map(Into::into).collect(),
+                })
+                .collect()
+        })
+        .map_err(|error| map_error(py, &error))
+}
+
+#[pyfunction]
+/// reports whether a compatible system fido runtime can be loaded.
+pub fn fido_runtime_available() -> bool {
+    fido_key_wrap::fido_runtime_available()
 }

@@ -5,14 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
-[features]
-default = ["fido"]
-fido = ["fido-key-wrap/fido"]
-
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-fido-key-wrap = { path = "../fido-key-wrap", default-features = false }
+fido-key-wrap = { path = "../fido-key-wrap" }
 rpassword.workspace = true
 subtle.workspace = true
 

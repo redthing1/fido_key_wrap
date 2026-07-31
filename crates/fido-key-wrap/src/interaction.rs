@@ -20,7 +20,6 @@ pub enum InteractionError {
 }
 
 /// zeroizing security-key pin.
-#[cfg_attr(not(feature = "fido"), allow(dead_code))]
 pub struct Pin(Zeroizing<String>);
 
 impl Pin {
@@ -41,7 +40,6 @@ impl Pin {
         Ok(Self(value))
     }
 
-    #[cfg(feature = "fido")]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -143,7 +141,6 @@ pub struct SelectionPrompt {
 }
 
 impl SelectionPrompt {
-    #[cfg(any(feature = "fido", feature = "testing", test))]
     pub(crate) fn new(operation: Operation, label: &str, policy: FidoPolicy) -> Self {
         Self {
             operation,
@@ -180,7 +177,6 @@ pub struct PinPrompt {
 }
 
 impl PinPrompt {
-    #[cfg(any(feature = "fido", feature = "testing", test))]
     pub(crate) fn new(operation: Operation, label: &str, ceremony: FidoCeremony) -> Self {
         Self {
             operation,
@@ -254,7 +250,6 @@ pub struct TouchPrompt {
 }
 
 impl TouchPrompt {
-    #[cfg(any(feature = "fido", feature = "testing", test))]
     pub(crate) fn new(
         operation: Operation,
         label: &str,

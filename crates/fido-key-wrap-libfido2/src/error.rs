@@ -8,6 +8,12 @@ use thiserror::Error;
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
+    #[error("the libfido2 runtime is unavailable")]
+    LibraryUnavailable,
+
+    #[error("the libfido2 runtime is incompatible")]
+    LibraryIncompatible,
+
     #[error("invalid backend input: {0}")]
     InvalidInput(&'static str),
 

@@ -1,6 +1,6 @@
 from typing import ClassVar, Final
 
-FIDO_SUPPORT: Final[bool]
+def fido_runtime_available() -> bool: ...
 
 class ErrorCode:
     INVALID_APPLICATION_ID: Final[ErrorCode]

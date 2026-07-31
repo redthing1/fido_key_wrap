@@ -37,10 +37,6 @@ impl KeyProtector {
     ) -> PyResult<Self> {
         let application_id =
             core::ApplicationId::new(application_id).map_err(|error| map_error(py, &error))?;
-        #[cfg(not(feature = "fido"))]
-        if fido_config.is_some() {
-            return Err(crate::errors::unavailable_error(py));
-        }
         Ok(Self {
             application_id,
             limits: passphrase_limits.map_or(core::PassphraseLimits::DESKTOP, |limits| limits.core),
@@ -529,14 +525,9 @@ fn protector(
     limits: core::PassphraseLimits,
     fido_config: core::FidoConfig,
 ) -> core::KeyProtector {
-    #[cfg(feature = "fido")]
-    let protector = core::KeyProtector::system_with_config(application_id, fido_config);
-    #[cfg(not(feature = "fido"))]
-    let protector = {
-        let _ = fido_config;
-        core::KeyProtector::new(application_id)
-    };
-    protector.with_passphrase_limits(limits)
+    core::KeyProtector::new(application_id)
+        .with_fido_config(fido_config)
+        .with_passphrase_limits(limits)
 }
 
 fn finish<T>(

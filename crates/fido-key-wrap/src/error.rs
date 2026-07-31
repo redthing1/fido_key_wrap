@@ -111,7 +111,7 @@ pub enum Error {
     /// memory for the admitted argon2 operation could not be reserved.
     #[error("memory for passphrase derivation is unavailable")]
     KdfResourceUnavailable,
-    /// this build or protector has no security-key backend.
+    /// the system fido runtime is absent, incompatible, or unsupported.
     #[error("security-key support is unavailable")]
     FidoSupportUnavailable,
     /// no connected authenticator can satisfy the operation.

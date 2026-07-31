@@ -7,15 +7,11 @@ use crate::{
     ApplicationId, Error, Interaction, Operation, Result, envelope::PublicKey64, policy::FidoPolicy,
 };
 
-#[cfg(any(feature = "fido", feature = "testing", test))]
 use crate::AuthenticatorFailure;
-#[cfg(feature = "fido")]
 use crate::FidoConfig;
 
-#[cfg(any(feature = "fido", feature = "testing", test))]
 use crate::interaction::{FidoCeremony, PinPrompt, SelectionPrompt, TouchPrompt};
 
-#[cfg(feature = "fido")]
 use fido_key_wrap_libfido2 as native;
 
 const PRF_RESULT_BYTES: usize = 32;
@@ -26,10 +22,6 @@ pub(crate) struct CredentialMaterial {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(
-    not(any(feature = "fido", feature = "testing", test)),
-    allow(dead_code)
-)]
 pub(crate) struct CredentialBinding<'a> {
     pub(crate) application_id: &'a ApplicationId,
     pub(crate) recipient_id: RecipientId,
@@ -39,10 +31,6 @@ pub(crate) struct CredentialBinding<'a> {
     pub(crate) label: &'a str,
 }
 
-#[cfg_attr(
-    not(any(feature = "fido", feature = "testing", test)),
-    allow(dead_code)
-)]
 pub(crate) struct ManagedRequest<'a> {
     pub(crate) credential: CredentialBinding<'a>,
     pub(crate) operation: Operation,
@@ -55,7 +43,6 @@ pub(crate) struct ManagedEnrollment {
 }
 
 enum ManagedSession {
-    #[cfg(feature = "fido")]
     Native {
         authenticator: native::Authenticator,
         pin: native::Pin,
@@ -65,10 +52,6 @@ enum ManagedSession {
     Fake { device: usize },
 }
 
-#[cfg_attr(
-    not(any(feature = "fido", feature = "testing", test)),
-    allow(dead_code)
-)]
 pub(crate) struct PrfRequest<'a> {
     pub(crate) credential: CredentialBinding<'a>,
     pub(crate) input: &'a [u8; PRF_RESULT_BYTES],
@@ -76,20 +59,13 @@ pub(crate) struct PrfRequest<'a> {
 }
 
 pub(crate) enum AuthenticatorBackend {
-    Unavailable,
-    #[cfg(feature = "fido")]
     Native(NativeBackend),
     #[cfg(any(feature = "testing", test))]
     Fake(fake::FakeBackend),
 }
 
 impl AuthenticatorBackend {
-    pub(crate) const fn unavailable() -> Self {
-        Self::Unavailable
-    }
-
-    #[cfg(feature = "fido")]
-    pub(crate) fn system(config: FidoConfig) -> Self {
+    pub(crate) fn native(config: FidoConfig) -> Self {
         Self::Native(NativeBackend::new(config))
     }
 
@@ -106,11 +82,7 @@ impl AuthenticatorBackend {
         operation: Operation,
         interaction: &mut dyn Interaction,
     ) -> Result<CredentialMaterial> {
-        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
-        let _ = (application_id, policy, label, operation, &interaction);
         match self {
-            Self::Unavailable => Err(Error::FidoSupportUnavailable),
-            #[cfg(feature = "fido")]
             Self::Native(backend) => {
                 backend.enroll(application_id, policy, label, operation, interaction)
             }
@@ -130,18 +102,7 @@ impl AuthenticatorBackend {
         operation: Operation,
         interaction: &mut dyn Interaction,
     ) -> Result<ManagedEnrollment> {
-        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
-        let _ = (
-            application_id,
-            recipient_id,
-            policy,
-            label,
-            operation,
-            &interaction,
-        );
         match self {
-            Self::Unavailable => Err(Error::FidoSupportUnavailable),
-            #[cfg(feature = "fido")]
             Self::Native(backend) => backend.enroll_managed(
                 application_id,
                 recipient_id,
@@ -167,11 +128,7 @@ impl AuthenticatorBackend {
         request: &PrfRequest<'_>,
         interaction: &mut dyn Interaction,
     ) -> Result<Zeroizing<[u8; PRF_RESULT_BYTES]>> {
-        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
-        let _ = (request, &interaction);
         match self {
-            Self::Unavailable => Err(Error::FidoSupportUnavailable),
-            #[cfg(feature = "fido")]
             Self::Native(backend) => backend.evaluate(request, interaction),
             #[cfg(any(feature = "testing", test))]
             Self::Fake(backend) => backend.evaluate(request, interaction),
@@ -183,11 +140,7 @@ impl AuthenticatorBackend {
         request: &ManagedRequest<'_>,
         interaction: &mut dyn Interaction,
     ) -> Result<()> {
-        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
-        let _ = (request, &interaction);
         match self {
-            Self::Unavailable => Err(Error::FidoSupportUnavailable),
-            #[cfg(feature = "fido")]
             Self::Native(backend) => backend.verify_managed(request, interaction),
             #[cfg(any(feature = "testing", test))]
             Self::Fake(backend) => backend.verify_managed(request, interaction),
@@ -199,11 +152,7 @@ impl AuthenticatorBackend {
         request: &ManagedRequest<'_>,
         interaction: &mut dyn Interaction,
     ) -> Result<()> {
-        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
-        let _ = (request, &interaction);
         match self {
-            Self::Unavailable => Err(Error::FidoSupportUnavailable),
-            #[cfg(feature = "fido")]
             Self::Native(backend) => backend.retire_managed(request, interaction),
             #[cfg(any(feature = "testing", test))]
             Self::Fake(backend) => backend.retire_managed(request, interaction),
@@ -216,10 +165,7 @@ impl AuthenticatorBackend {
         request: &PrfRequest<'_>,
         interaction: &mut dyn Interaction,
     ) -> Result<Zeroizing<[u8; PRF_RESULT_BYTES]>> {
-        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
-        let _ = (request, interaction);
         match (&mut enrollment.session, self) {
-            #[cfg(feature = "fido")]
             (
                 ManagedSession::Native {
                     authenticator, pin, ..
@@ -241,10 +187,7 @@ impl AuthenticatorBackend {
         request: &ManagedRequest<'_>,
         interaction: &mut dyn Interaction,
     ) -> Result<()> {
-        #[cfg(not(any(feature = "fido", feature = "testing", test)))]
-        let _ = (request, interaction);
         match (&mut enrollment.session, self) {
-            #[cfg(feature = "fido")]
             (
                 ManagedSession::Native {
                     authenticator,
@@ -268,19 +211,15 @@ impl AuthenticatorBackend {
     pub(crate) fn fake_mut(&mut self) -> &mut fake::FakeBackend {
         match self {
             Self::Fake(backend) => backend,
-            Self::Unavailable => panic!("backend is unavailable, not fake"),
-            #[cfg(feature = "fido")]
             Self::Native(_) => panic!("backend is native, not fake"),
         }
     }
 }
 
-#[cfg(feature = "fido")]
 pub(crate) struct NativeBackend {
     backend: native::Backend,
 }
 
-#[cfg(feature = "fido")]
 impl NativeBackend {
     fn new(config: FidoConfig) -> Self {
         let native_config = native::Config::new(
@@ -589,7 +528,6 @@ impl NativeBackend {
     }
 }
 
-#[cfg(feature = "fido")]
 fn cleanup_native_pending(
     authenticator: &mut native::Authenticator,
     pin: &native::Pin,
@@ -614,7 +552,6 @@ fn cleanup_native_pending(
         && cleanup.finish().is_ok()
 }
 
-#[cfg(feature = "fido")]
 fn reject_created_managed(
     authenticator: &mut native::Authenticator,
     pin: &native::Pin,
@@ -638,7 +575,6 @@ fn reject_created_managed(
     )
 }
 
-#[cfg(feature = "fido")]
 fn reject_pending_managed(
     authenticator: &mut native::Authenticator,
     pin: &native::Pin,
@@ -655,7 +591,6 @@ fn reject_pending_managed(
     }
 }
 
-#[cfg(feature = "fido")]
 fn request_native_pin(
     request: &ManagedRequest<'_>,
     interaction: &mut dyn Interaction,
@@ -670,7 +605,6 @@ fn request_native_pin(
     Ok(native_pin)
 }
 
-#[cfg(feature = "fido")]
 fn touch_managed(request: &ManagedRequest<'_>, interaction: &mut dyn Interaction) -> Result<()> {
     interaction.touch_required(&TouchPrompt::new(
         request.operation,
@@ -681,7 +615,6 @@ fn touch_managed(request: &ManagedRequest<'_>, interaction: &mut dyn Interaction
     Ok(())
 }
 
-#[cfg(feature = "fido")]
 fn native_managed_credential<'a>(request: &'a ManagedRequest<'a>) -> native::ManagedCredential<'a> {
     native::ManagedCredential {
         relying_party_id: request.credential.application_id.as_str(),
@@ -692,7 +625,6 @@ fn native_managed_credential<'a>(request: &'a ManagedRequest<'a>) -> native::Man
     }
 }
 
-#[cfg(feature = "fido")]
 fn evaluate_native_managed(
     authenticator: &mut native::Authenticator,
     pin: &native::Pin,
@@ -724,7 +656,6 @@ fn evaluate_native_managed(
         .map_err(|error| map_native_error(&error))
 }
 
-#[cfg(feature = "fido")]
 fn retire_native_managed(
     authenticator: &mut native::Authenticator,
     pin: &native::Pin,
@@ -737,7 +668,6 @@ fn retire_native_managed(
         .map_err(|error| map_native_error(&error))
 }
 
-#[cfg(feature = "fido")]
 fn cleanup_native_managed_enrollment(
     authenticator: &mut native::Authenticator,
     pin: &native::Pin,
@@ -755,7 +685,6 @@ fn cleanup_native_managed_enrollment(
     cleanup.finish().map_err(|error| map_native_error(&error))
 }
 
-#[cfg(feature = "fido")]
 const fn native_policy(policy: FidoPolicy) -> native::ExactPolicy {
     match policy {
         FidoPolicy::Presence => native::ExactPolicy::Presence,
@@ -763,7 +692,6 @@ const fn native_policy(policy: FidoPolicy) -> native::ExactPolicy {
     }
 }
 
-#[cfg(feature = "fido")]
 const fn native_protection(policy: FidoPolicy) -> native::CredentialProtection {
     match policy {
         FidoPolicy::Presence => native::CredentialProtection::OptionalWithCredentialId,
@@ -771,9 +699,11 @@ const fn native_protection(policy: FidoPolicy) -> native::CredentialProtection {
     }
 }
 
-#[cfg(feature = "fido")]
-fn map_native_error(error: &native::Error) -> Error {
+pub(crate) fn map_native_error(error: &native::Error) -> Error {
     match error {
+        native::Error::LibraryUnavailable | native::Error::LibraryIncompatible => {
+            Error::FidoSupportUnavailable
+        }
         native::Error::NoAuthenticators | native::Error::NoCompatibleAuthenticators => {
             Error::NoCompatibleAuthenticator
         }
@@ -1454,9 +1384,17 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "fido")]
     #[test]
     fn native_errors_map_to_curated_identity_free_failures() {
+        for error in [
+            native::Error::LibraryUnavailable,
+            native::Error::LibraryIncompatible,
+        ] {
+            assert!(matches!(
+                map_native_error(&error),
+                Error::FidoSupportUnavailable
+            ));
+        }
         assert!(matches!(
             map_native_error(&native::Error::PinInvalid { retries: Some(3) }),
             Error::Authenticator(AuthenticatorFailure::PinInvalid { retries: Some(3) })
@@ -1523,9 +1461,10 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_backend_fails_before_interaction() {
+    #[ignore = "requires libfido2 to be unavailable"]
+    fn missing_runtime_fails_before_interaction() {
         let application_id = ApplicationId::new("org.example.backend-test").unwrap();
-        let mut backend = AuthenticatorBackend::unavailable();
+        let mut backend = AuthenticatorBackend::native(FidoConfig::default());
         let mut interaction = ScriptedInteraction::default();
         assert!(matches!(
             backend.enroll(

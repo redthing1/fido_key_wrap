@@ -13,18 +13,10 @@ source installation requires python 3.11 or later and rust 1.85 or later:
 uv add "fido-key-wrap @ git+https://github.com/redthing1/fido_key_wrap.git"
 ```
 
-security-key support is a native build feature. add this setting to the
-consuming project's `pyproject.toml` before running the same `uv add` command:
-
-```toml
-[tool.uv]
-config-settings-package = { fido-key-wrap = { "maturin.build-args" = "--features fido" } }
-```
-
-the fido build supports macos and linux with pkg-config and the libfido2
-development files for version 1.14 or later in the 1.x series. both builds
-expose the same python module. `FIDO_SUPPORT` reports which capability was
-compiled, without discovering a device.
+the same installation supports every recovery policy. security-key operations
+load `libfido2.so.1` on linux or `libfido2.1.dylib` on macos when used;
+development headers and pkg-config are not required. `fido_runtime_available()`
+reports whether that runtime can be loaded, without discovering a device.
 
 ## basic use
 
@@ -93,10 +85,11 @@ explicit parameters are supplied. the desktop profile uses 256 mib, three
 passes, and four lanes. `PassphraseLimits` controls the maximum work this
 process will accept from an envelope.
 
-fido policies use the system backend in a fido-capable build. they fail with
-`ErrorCode.FIDO_SUPPORT_UNAVAILABLE` before interaction in a passphrase-only
-build. `inspect_authenticators()` returns bounded capability reports without
-device identity.
+fido policies use the system backend. if libfido2 is absent or incompatible,
+they fail with `ErrorCode.FIDO_SUPPORT_UNAVAILABLE` before interaction.
+passphrase and recovery-secret policies remain available.
+`inspect_authenticators()` returns bounded capability reports without device
+identity.
 
 each managed policy uses one discoverable credential slot. presence recovery
 requires a touch; user-verification recovery requires the authenticator pin and
@@ -176,8 +169,7 @@ replacement envelope before deleting the secret.
 
 `FidoConfig` supplies trusted operation timeout, selection timeout, and device
 count limits. pass it as the `fido_config` keyword when constructing a
-fido-capable protector. supplying it to a passphrase-only build fails before
-any interaction.
+protector. it affects only security-key operations.
 
 ## interaction
 

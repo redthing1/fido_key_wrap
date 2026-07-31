@@ -44,18 +44,15 @@ ordinary security-key routes use non-discoverable credentials and consume no
 resident credential slot. each managed route uses one discoverable credential
 so the exact route can later be verified and retired from the selected key.
 
-passphrase support requires no security key or native fido library. the `fido`
-crate feature supports macos and linux with libfido2 1.14 or later in the 1.x
-series.
+passphrase and recovery-secret routes require no security key or native fido
+library. security-key routes load the platform libfido2 runtime when first used.
 
 add the rust crate directly from the repository:
 
 ```toml
 [dependencies]
-fido-key-wrap = { git = "https://github.com/redthing1/fido_key_wrap.git", default-features = false }
+fido-key-wrap = { git = "https://github.com/redthing1/fido_key_wrap.git" }
 ```
-
-enable the `fido` feature for security-key support.
 
 applications using native factor storage can add the companion crate from the
 same repository:
@@ -83,9 +80,9 @@ interface. recovery-secret operations are explicit and require no interaction.
 `RootKey`, `RecoverySecret`, `LocalSecret`, `Passphrase`, and `Pin` are opaque,
 non-cloneable, zeroizing values with redacted debug output.
 
-with the `fido` feature, `KeyProtector::system` uses the same surface for
-security-key routes. applications encrypt their own data and authenticate the
-exact encoded envelope with it.
+`KeyProtector::new` supports every route and loads native fido support only when
+needed. applications encrypt their own data and authenticate the exact encoded
+envelope with it.
 
 python applications can install a thin native binding from the repository.
 the binding follows the same root, envelope, recipient, and interaction model;

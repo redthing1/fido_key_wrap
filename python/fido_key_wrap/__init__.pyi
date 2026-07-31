@@ -4,7 +4,6 @@ from ._native import Cancelled as Cancelled
 from ._native import Enrollment as Enrollment
 from ._native import Error as Error
 from ._native import ErrorCode as ErrorCode
-from ._native import FIDO_SUPPORT as FIDO_SUPPORT
 from ._native import FidoCeremony as FidoCeremony
 from ._native import FidoConfig as FidoConfig
 from ._native import FidoPolicy as FidoPolicy
@@ -26,4 +25,5 @@ from ._native import RecoverySecretRecipient as RecoverySecretRecipient
 from ._native import RootKey as RootKey
 from ._native import SelectionPrompt as SelectionPrompt
 from ._native import TouchPrompt as TouchPrompt
+from ._native import fido_runtime_available as fido_runtime_available
 from ._native import inspect_authenticators as inspect_authenticators

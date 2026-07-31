@@ -6,14 +6,17 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-#[cfg(test)]
-#[path = "../build_policy.rs"]
-mod build_policy;
 mod error;
 mod ffi;
 mod native;
 
 pub use error::{Error, Result};
+
+/// reports whether a complete compatible libfido2 runtime is available.
+#[must_use]
+pub fn runtime_available() -> bool {
+    ffi::runtime_available()
+}
 pub use native::{
     Authenticator, Backend, Capabilities, Config, CredentialProtection, CredentialStorage,
     DeviceReport, DeviceStatus, EnrolledCredential, Enrollment, EnrollmentFailure,

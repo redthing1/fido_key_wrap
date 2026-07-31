@@ -1,7 +1,6 @@
 """protect application root keys with passphrases, recovery secrets, and security keys."""
 
 from ._native import (
-    FIDO_SUPPORT,
     AuthenticatorIssue,
     AuthenticatorReport,
     Cancelled,
@@ -29,12 +28,12 @@ from ._native import (
     RootKey,
     SelectionPrompt,
     TouchPrompt,
+    fido_runtime_available,
     inspect_authenticators,
 )
 
 
 __all__ = (
-    "FIDO_SUPPORT",
     "AuthenticatorIssue",
     "AuthenticatorReport",
     "Cancelled",
@@ -62,5 +61,6 @@ __all__ = (
     "RootKey",
     "SelectionPrompt",
     "TouchPrompt",
+    "fido_runtime_available",
     "inspect_authenticators",
 )

@@ -9,7 +9,6 @@ use pyo3::prelude::*;
 
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add("FIDO_SUPPORT", cfg!(feature = "fido"))?;
     module.add("Error", module.py().get_type::<errors::Error>())?;
     module.add("Cancelled", module.py().get_type::<errors::Cancelled>())?;
     module.add_class::<errors::ErrorCode>()?;
@@ -54,6 +53,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<diagnostics::AuthenticatorReport>()?;
     module.add_function(wrap_pyfunction!(
         diagnostics::inspect_authenticators,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        diagnostics::fido_runtime_available,
         module
     )?)?;
     Ok(())

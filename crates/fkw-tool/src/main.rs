@@ -12,7 +12,6 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use fido_key_wrap::{ApplicationId, KeyProtector};
-use fido_key_wrap_platform::RecoverySecretStore;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -33,30 +32,11 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     let application_id = ApplicationId::new(APPLICATION_ID)?;
-    let protector = protector(application_id.clone());
+    let protector = KeyProtector::new(application_id.clone());
     let mut interaction = TerminalInteraction;
 
-    #[cfg(all(target_os = "macos", feature = "macos-user-presence"))]
-    let recovery_store =
-        fido_key_wrap_platform::MacosUserPresenceStore::new(application_id.clone());
-    #[cfg(all(target_os = "macos", feature = "macos-user-presence"))]
-    let recovery_store: Option<&dyn RecoverySecretStore> = Some(&recovery_store);
-    #[cfg(not(all(target_os = "macos", feature = "macos-user-presence")))]
-    let recovery_store: Option<&dyn RecoverySecretStore> = None;
-
-    let mut application =
-        Application::new(application_id, protector, &mut interaction, recovery_store);
+    let mut application = Application::new(application_id, protector, &mut interaction);
     dispatch(cli.command, &mut application, &mut io::stdout().lock())
-}
-
-#[cfg(feature = "fido")]
-fn protector(application: ApplicationId) -> KeyProtector {
-    KeyProtector::system(application)
-}
-
-#[cfg(not(feature = "fido"))]
-fn protector(application: ApplicationId) -> KeyProtector {
-    KeyProtector::new(application)
 }
 
 fn dispatch(
@@ -65,10 +45,10 @@ fn dispatch(
     output: &mut dyn Write,
 ) -> Result<()> {
     match command {
-        Command::Seal { file, access, kdf } => {
+        Command::Seal { file, access } => {
             storage::ensure_absent(&file)?;
             let plaintext = read_plaintext(&mut io::stdin().lock())?;
-            application.seal(&file, access, kdf, &plaintext)?;
+            application.seal(&file, access, &plaintext)?;
             writeln!(output, "sealed")?;
         }
         Command::Unseal { file } => {
@@ -94,11 +74,6 @@ fn dispatch(
                 output,
                 "metadata is unauthenticated until the secret is unsealed"
             )?;
-        }
-        #[cfg(all(target_os = "macos", feature = "macos-user-presence"))]
-        Command::Forget { file } => {
-            application.forget(&file)?;
-            writeln!(output, "removed this mac's user-presence factor")?;
         }
     }
     Ok(())

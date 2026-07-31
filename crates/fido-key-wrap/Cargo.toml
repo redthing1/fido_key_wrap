@@ -6,8 +6,6 @@ rust-version.workspace = true
 publish = false
 
 [features]
-default = []
-fido = ["dep:fido-key-wrap-libfido2"]
 testing = []
 
 [dependencies]
@@ -16,7 +14,7 @@ aes-gcm.workspace = true
 aes.workspace = true
 ghash.workspace = true
 argon2.workspace = true
-fido-key-wrap-libfido2 = { version = "0.1.0", path = "../fido-key-wrap-libfido2", optional = true }
+fido-key-wrap-libfido2 = { path = "../fido-key-wrap-libfido2" }
 getrandom.workspace = true
 hkdf.workspace = true
 hmac.workspace = true

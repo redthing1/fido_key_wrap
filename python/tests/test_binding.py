@@ -356,9 +356,9 @@ class BindingTests(unittest.TestCase):
         )
         interaction.assert_cleared()
 
-    def test_fido_disabled_build_fails_before_interaction(self) -> None:
-        if fkw.FIDO_SUPPORT:
-            self.skipTest("the extension was built with fido support")
+    def test_missing_fido_runtime_fails_before_interaction(self) -> None:
+        if fkw.fido_runtime_available():
+            self.skipTest("a compatible fido runtime is available")
 
         class Unexpected:
             def __getattr__(self, _name):
@@ -367,7 +367,7 @@ class BindingTests(unittest.TestCase):
         for policy in FIDO_POLICIES:
             enrollment = fkw.Enrollment("security key", policy)
             with self.assertRaises(fkw.Error) as caught:
-                fkw.KeyProtector("fido-disabled.example").create_root(
+                fkw.KeyProtector("fido-unavailable.example").create_root(
                     enrollment, Unexpected()
                 )
             self.assertEqual(
@@ -378,7 +378,7 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, fkw.ErrorCode.FIDO_SUPPORT_UNAVAILABLE)
         with self.assertRaises(fkw.Error) as caught:
             fkw.KeyProtector(
-                "local-secret-disabled.example"
+                "local-secret-unavailable.example"
             ).create_root_with_fido_and_local_secret("primary", Unexpected())
         self.assertEqual(caught.exception.code, fkw.ErrorCode.FIDO_SUPPORT_UNAVAILABLE)
 
@@ -505,21 +505,10 @@ class BindingTests(unittest.TestCase):
             maximum_timeout,
         )
 
-        if fkw.FIDO_SUPPORT:
-            self.assertEqual(
-                fkw.KeyProtector(
-                    "fido-config.example", fido_config=config
-                ).fido_config,
-                config,
-            )
-        else:
-            with self.assertRaises(fkw.Error) as caught:
-                fkw.KeyProtector(
-                    "fido-config.example", fido_config=config
-                )
-            self.assertEqual(
-                caught.exception.code, fkw.ErrorCode.FIDO_SUPPORT_UNAVAILABLE
-            )
+        self.assertEqual(
+            fkw.KeyProtector("fido-config.example", fido_config=config).fido_config,
+            config,
+        )
         for values in (
             (0, 1, 1),
             (1, 0, 1),

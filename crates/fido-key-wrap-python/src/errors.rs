@@ -176,16 +176,6 @@ pub fn busy_error(py: Python<'_>) -> PyErr {
     new_error(py, ErrorCode::Busy, None, "the protector is already in use")
 }
 
-#[cfg(not(feature = "fido"))]
-pub fn unavailable_error(py: Python<'_>) -> PyErr {
-    new_error(
-        py,
-        ErrorCode::FidoSupportUnavailable,
-        None,
-        "security-key support is unavailable",
-    )
-}
-
 fn new_error(
     py: Python<'_>,
     code: ErrorCode,

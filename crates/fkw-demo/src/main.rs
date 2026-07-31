@@ -2,7 +2,6 @@ use std::process::ExitCode;
 
 use anyhow::{Result, ensure};
 use clap::{Parser, ValueEnum};
-#[cfg(feature = "fido")]
 use fido_key_wrap::FidoPolicy;
 use fido_key_wrap::{
     ApplicationId, Enrollment, FidoCeremony, Interaction, InteractionError, KeyProtector,
@@ -25,13 +24,9 @@ struct Cli {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Access {
     Passphrase,
-    #[cfg(feature = "fido")]
     FidoPresence,
-    #[cfg(feature = "fido")]
     FidoUserVerification,
-    #[cfg(feature = "fido")]
     FidoPresencePlusPassphrase,
-    #[cfg(feature = "fido")]
     FidoUserVerificationPlusPassphrase,
 }
 
@@ -47,19 +42,15 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> Result<()> {
     let application = ApplicationId::new("demo.fido-key-wrap.local")?;
-    let mut protector = protector(application);
+    let mut protector = KeyProtector::new(application);
     let mut interaction = TerminalInteraction;
     let enrollment = match cli.access {
         Access::Passphrase => Enrollment::passphrase("demo")?,
-        #[cfg(feature = "fido")]
         Access::FidoPresence => Enrollment::fido("demo", FidoPolicy::Presence)?,
-        #[cfg(feature = "fido")]
         Access::FidoUserVerification => Enrollment::fido("demo", FidoPolicy::UserVerification)?,
-        #[cfg(feature = "fido")]
         Access::FidoPresencePlusPassphrase => {
             Enrollment::fido_and_passphrase("demo", FidoPolicy::Presence)?
         }
-        #[cfg(feature = "fido")]
         Access::FidoUserVerificationPlusPassphrase => {
             Enrollment::fido_and_passphrase("demo", FidoPolicy::UserVerification)?
         }
@@ -73,16 +64,6 @@ fn run(cli: &Cli) -> Result<()> {
     ensure!(matches, "the recovered root did not match");
     println!("round trip succeeded");
     Ok(())
-}
-
-#[cfg(feature = "fido")]
-fn protector(application: ApplicationId) -> KeyProtector {
-    KeyProtector::system(application)
-}
-
-#[cfg(not(feature = "fido"))]
-fn protector(application: ApplicationId) -> KeyProtector {
-    KeyProtector::new(application)
 }
 
 struct TerminalInteraction;

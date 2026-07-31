@@ -11,36 +11,6 @@ use anyhow::{Context, Result, bail};
 const PRIVATE_MODE: u32 = 0o600;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
-#[derive(Debug)]
-pub(crate) struct CreateError {
-    error: anyhow::Error,
-    may_be_published: bool,
-}
-
-impl CreateError {
-    pub(crate) const fn may_be_published(&self) -> bool {
-        self.may_be_published
-    }
-
-    pub(crate) fn into_error(self) -> anyhow::Error {
-        self.error
-    }
-
-    pub(crate) fn unpublished(error: anyhow::Error) -> Self {
-        Self {
-            error,
-            may_be_published: false,
-        }
-    }
-
-    pub(crate) fn uncertain(error: anyhow::Error) -> Self {
-        Self {
-            error,
-            may_be_published: true,
-        }
-    }
-}
-
 pub(crate) fn ensure_absent(path: &Path) -> Result<()> {
     path.file_name()
         .context("the destination path has no file name")?;
@@ -86,7 +56,7 @@ pub(crate) fn read_private(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(crate) fn create_atomic(path: &Path, bytes: &[u8]) -> Result<(), CreateError> {
+pub(crate) fn create_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     create_atomic_with_sync(path, bytes, sync_parent)
 }
 
@@ -94,17 +64,15 @@ fn create_atomic_with_sync(
     path: &Path,
     bytes: &[u8],
     sync: impl FnOnce(&Path) -> Result<()>,
-) -> Result<(), CreateError> {
-    ensure_size(bytes).map_err(CreateError::unpublished)?;
-    let temporary = write_temporary(path, bytes).map_err(CreateError::unpublished)?;
+) -> Result<()> {
+    ensure_size(bytes)?;
+    let temporary = write_temporary(path, bytes)?;
     if let Err(error) = fs::hard_link(&temporary, path).context("failed to save the new secret") {
         let _ = fs::remove_file(&temporary);
-        return Err(CreateError::unpublished(error));
+        return Err(error);
     }
     let _ = fs::remove_file(&temporary);
-    sync(path)
-        .context("the secret was saved, but its directory sync failed")
-        .map_err(CreateError::uncertain)
+    sync(path).context("the secret was saved, but its directory sync failed")
 }
 
 fn write_temporary(destination: &Path, bytes: &[u8]) -> Result<PathBuf> {
@@ -216,15 +184,14 @@ mod tests {
     }
 
     #[test]
-    fn post_publication_sync_failure_is_distinct() {
+    fn sync_failure_leaves_the_published_file_intact() {
         let directory = TestDirectory::new();
         let secret = directory.0.join("secret.fkw");
-        let error = create_atomic_with_sync(&secret, b"sealed", |_| {
+        create_atomic_with_sync(&secret, b"sealed", |_| {
             Err(anyhow::anyhow!("injected sync failure"))
         })
         .expect_err("the injected sync failed");
 
-        assert!(error.may_be_published());
         assert_eq!(read_private(&secret).unwrap(), b"sealed");
     }
 

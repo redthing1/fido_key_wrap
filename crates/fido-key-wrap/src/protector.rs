@@ -20,7 +20,6 @@ use crate::{
     policy::{FidoStorage, RecipientPolicy, validate_label},
 };
 
-#[cfg(feature = "fido")]
 use crate::FidoConfig;
 
 const ROOT_BYTES: usize = 32;
@@ -64,39 +63,25 @@ pub struct KeyProtector {
 }
 
 impl KeyProtector {
-    /// constructs a protector without security-key support.
+    /// constructs a protector using the default passphrase limits and native
+    /// operation limits.
     ///
-    /// passphrase operations are fully functional. selecting a security-key
-    /// policy returns [`Error::FidoSupportUnavailable`] before interaction.
+    /// construction performs no native loading, device discovery, or
+    /// interaction.
     #[must_use]
-    pub const fn new(application_id: ApplicationId) -> Self {
+    pub fn new(application_id: ApplicationId) -> Self {
         Self {
             application_id,
             passphrase_limits: PassphraseLimits::DESKTOP,
-            backend: AuthenticatorBackend::unavailable(),
+            backend: AuthenticatorBackend::native(FidoConfig::default()),
         }
     }
 
-    /// constructs a protector backed by the system fido transport.
-    ///
-    /// construction performs no device discovery or interaction.
-    #[cfg(feature = "fido")]
+    /// replaces the trusted native-operation limits.
     #[must_use]
-    pub fn system(application_id: ApplicationId) -> Self {
-        Self::system_with_config(application_id, FidoConfig::default())
-    }
-
-    /// constructs a protector with trusted native-operation limits.
-    ///
-    /// construction performs no device discovery or interaction.
-    #[cfg(feature = "fido")]
-    #[must_use]
-    pub fn system_with_config(application_id: ApplicationId, config: FidoConfig) -> Self {
-        Self {
-            application_id,
-            passphrase_limits: PassphraseLimits::DESKTOP,
-            backend: AuthenticatorBackend::system(config),
-        }
+    pub fn with_fido_config(mut self, config: FidoConfig) -> Self {
+        self.backend = AuthenticatorBackend::native(config);
+        self
     }
 
     /// replaces this process's immutable passphrase-work admission ceiling.
@@ -2218,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn limit_and_backend_refusals_precede_interaction() {
+    fn limit_refusal_precedes_interaction() {
         let expensive = PassphraseParameters::new(262_144, 6, 4).unwrap();
         let mut protector = KeyProtector::new(application());
         let mut interaction = ScriptedInteraction::new(&[]);
@@ -2228,21 +2213,6 @@ mod tests {
                 &mut interaction
             ),
             Err(Error::PassphraseLimitExceeded)
-        ));
-        assert!(interaction.events.is_empty());
-
-        assert!(matches!(
-            protector.create_root(
-                Enrollment::fido("key", FidoPolicy::Presence).unwrap(),
-                &mut interaction
-            ),
-            Err(Error::FidoSupportUnavailable)
-        ));
-        assert!(interaction.events.is_empty());
-
-        assert!(matches!(
-            protector.create_root_with_fido_and_local_secret("paired machine", &mut interaction),
-            Err(Error::FidoSupportUnavailable)
         ));
         assert!(interaction.events.is_empty());
     }

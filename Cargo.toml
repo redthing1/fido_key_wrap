@@ -32,6 +32,7 @@ ghash = { version = "0.5.1", features = ["zeroize"] }
 hkdf = "0.13.0"
 hmac = { version = "0.13.0", features = ["zeroize"] }
 libc = "0.2.183"
+libloading = "0.8.9"
 minicbor = { version = "2.2.2", features = ["std"] }
 p256 = { version = "0.14.0", default-features = false, features = ["arithmetic", "std"] }
 pyo3 = "=0.29.0"

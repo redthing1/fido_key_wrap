@@ -5,11 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
-[features]
-default = ["fido"]
-fido = ["fido-key-wrap/fido"]
-macos-user-presence = []
-
 [[bin]]
 name = "fkw"
 path = "src/main.rs"
@@ -18,17 +13,13 @@ path = "src/main.rs"
 aes-gcm = { workspace = true, features = ["alloc"] }
 anyhow.workspace = true
 clap.workspace = true
-fido-key-wrap = { path = "../fido-key-wrap", default-features = false }
-fido-key-wrap-platform = { path = "../fido-key-wrap-platform", default-features = false }
+fido-key-wrap = { path = "../fido-key-wrap" }
 getrandom.workspace = true
 hkdf.workspace = true
 libc.workspace = true
 rpassword.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
-
-[dev-dependencies]
-fido-key-wrap-platform = { path = "../fido-key-wrap-platform", default-features = false, features = ["testing"] }
 
 [lints]
 workspace = true

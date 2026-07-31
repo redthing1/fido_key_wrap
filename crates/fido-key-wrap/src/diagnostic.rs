@@ -1,6 +1,9 @@
 use fido_key_wrap_libfido2 as native;
 
-use crate::{AuthenticatorFailure, Error, Result};
+use crate::{Result, backend::map_native_error};
+
+#[cfg(test)]
+use crate::Error;
 
 /// one bounded read-only authenticator capability report.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,12 +61,11 @@ pub enum AuthenticatorIssue {
 ///
 /// # errors
 ///
-/// returns [`Error::Authenticator`] when discovery itself
-/// cannot complete.
+/// returns a bounded native error when discovery itself cannot complete.
 pub fn inspect_authenticators() -> Result<Vec<AuthenticatorReport>> {
     Ok(native::Backend::default()
-        .doctor()
-        .map_err(|_| Error::Authenticator(AuthenticatorFailure::OperationFailed))?
+        .inspect_authenticators()
+        .map_err(|error| map_native_error(&error))?
         .into_iter()
         .map(|report| match report.status {
             native::DeviceStatus::Compatible(capabilities)
@@ -124,10 +126,17 @@ mod tests {
             es256: true,
             client_pin_supported: true,
             client_pin_configured: true,
-            internal_uv_supported: false,
-            internal_uv_configured: false,
             always_uv: false,
         }
+    }
+
+    #[test]
+    #[ignore = "requires libfido2 to be unavailable"]
+    fn missing_runtime_is_reported_as_unavailable_support() {
+        assert!(matches!(
+            inspect_authenticators(),
+            Err(Error::FidoSupportUnavailable)
+        ));
     }
 
     #[test]

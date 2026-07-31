@@ -51,48 +51,21 @@
 //! # }
 //! ```
 //!
-//! # optional security-key support
+//! # security-key support
 //!
-//! a consuming application can forward the native capability without making
-//! it part of passphrase-only builds:
+//! the native fido library is loaded only when a security-key operation begins.
+//! passphrase and recovery-secret operations do not require the library or a
+//! connected authenticator.
 //!
-//! ```toml
-//! [features]
-//! fido = ["fido-key-wrap/fido"]
-//!
-//! [dependencies]
-//! fido-key-wrap = { git = "https://github.com/redthing1/fido_key_wrap.git", default-features = false }
-//! ```
-//!
-//! the application chooses the constructor at compile time. both branches use
-//! the same public facade:
+//! enrollment selects one exact ceremony:
 //!
 //! ```no_run
-//! use fido_key_wrap::{ApplicationId, KeyProtector};
-//!
-//! fn protector(application: ApplicationId) -> KeyProtector {
-//!     #[cfg(feature = "fido")]
-//!     {
-//!         KeyProtector::system(application)
-//!     }
-//!
-//!     #[cfg(not(feature = "fido"))]
-//!     {
-//!         KeyProtector::new(application)
-//!     }
-//! }
-//! ```
-//!
-//! with the capability enabled, enrollment selects one exact ceremony:
-//!
-//! ```no_run
-//! # #[cfg(feature = "fido")]
 //! # fn example(interaction: &mut dyn fido_key_wrap::Interaction)
 //! #     -> fido_key_wrap::Result<()> {
 //! use fido_key_wrap::{ApplicationId, Enrollment, FidoPolicy, KeyProtector};
 //!
 //! let trusted_id = ApplicationId::new("vault.example")?;
-//! let mut protector = KeyProtector::system(trusted_id);
+//! let mut protector = KeyProtector::new(trusted_id);
 //! let enrollment = Enrollment::fido_and_passphrase(
 //!     "primary",
 //!     FidoPolicy::UserVerification,
@@ -110,7 +83,6 @@
 mod backend;
 mod config;
 mod crypto;
-#[cfg(feature = "fido")]
 mod diagnostic;
 mod envelope;
 mod error;
@@ -124,7 +96,6 @@ pub mod testing;
 mod transcript;
 
 pub use config::FidoConfig;
-#[cfg(feature = "fido")]
 pub use diagnostic::{AuthenticatorIssue, AuthenticatorReport, inspect_authenticators};
 pub use envelope::{KeyEnvelope, RecipientSummary};
 pub use error::{AuthenticatorFailure, Error, Result};
@@ -138,3 +109,11 @@ pub use protector::KeyProtector;
 pub use secret::{
     LocalSecret, LocalSecretRecipient, RecoverySecret, RecoverySecretRecipient, RootKey,
 };
+
+/// reports whether the system fido library can be loaded.
+///
+/// this performs no device discovery or user interaction.
+#[must_use]
+pub fn fido_runtime_available() -> bool {
+    fido_key_wrap_libfido2::runtime_available()
+}

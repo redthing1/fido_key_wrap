@@ -59,9 +59,7 @@ passphrase-only recovery recipient to an envelope with a combined recipient
 makes the root recoverable by the passphrase-only route. the application should
 present this consequence when it offers recovery choices.
 
-## passphrase-only applications
-
-use `KeyProtector::new` when the build has no fido capability:
+## constructing a protector
 
 ```rust,ignore
 let application = ApplicationId::new("vault.example")?;
@@ -71,9 +69,15 @@ let (root, envelope, recipient) =
     protector.create_root(enrollment, &mut interaction)?;
 ```
 
-passphrase and recovery-secret creation, unlock, add, and remove are complete in
-this mode. passphrase rewrap is also available. selecting a fido policy returns
-`FidoSupportUnavailable` before user interaction.
+the system backend loads libfido2 only when a security-key operation begins.
+passphrase and recovery-secret routes therefore work without libfido2 or a
+connected key. `fido_runtime_available()` reports whether a complete compatible
+runtime can be loaded; it performs no device discovery or interaction.
+
+fido routes require `libfido2.so.1` on linux or `libfido2.1.dylib` on macos to
+be visible to the platform loader. development headers and pkg-config are not
+required. a hardened macos application should bundle and sign libfido2 and its
+native dependencies under an application rpath.
 
 `PassphraseParameters::DESKTOP` uses 256 mib, three passes, and four lanes.
 applications can record another permitted profile with the explicit enrollment
@@ -84,34 +88,12 @@ argon2 and native fido ceremonies are synchronous. a server or asynchronous
 program should run operations involving either in a bounded blocking context
 and limit concurrent derivations.
 
-## applications with optional security-key support
-
-enable the crate's `fido` feature where native security-key support is wanted
-and construct `KeyProtector::system`. passphrase routes still work without a
-connected device and make no security-key request.
-
-a small compile-time factory keeps both builds on the same application code:
-
-```rust,ignore
-fn protector(application: ApplicationId) -> KeyProtector {
-    #[cfg(feature = "fido")]
-    {
-        KeyProtector::system(application)
-    }
-
-    #[cfg(not(feature = "fido"))]
-    {
-        KeyProtector::new(application)
-    }
-}
-```
-
-`inspect_authenticators` is available only with the `fido` feature. it performs
-read-only capability inspection and requests neither a pin nor a touch.
+`inspect_authenticators` performs read-only capability inspection and requests
+neither a pin nor a touch.
 
 `FidoConfig` sets operation timeout, selection timeout, and the maximum number
-of discovered devices from trusted local configuration. pass it to
-`KeyProtector::system_with_config`; never derive it from an envelope.
+of discovered devices. pass trusted local configuration through
+`KeyProtector::with_fido_config`; never derive it from an envelope.
 
 native failures are returned as bounded `AuthenticatorFailure` values. wrong
 pin retries, blocked pin states, timeout, busy, unavailable credential, and
@@ -309,8 +291,8 @@ publication order.
 
 ## testing without a security key
 
-passphrase and recovery-secret flows remain available through the production
-library without fido support or a connected authenticator.
+passphrase and recovery-secret flows remain available without libfido2 or a
+connected authenticator.
 
 rust tests can enable the non-default `testing` feature and use
 `testing::FakeAuthenticator`. it owns an ordinary `KeyProtector` and provides
